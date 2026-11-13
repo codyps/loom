@@ -134,7 +134,34 @@ impl Builder {
     }
 
     /// Check the provided model.
+    ///
+    /// Unless a [`tracing`] subscriber is already active for the calling
+    /// thread, loom installs its own for the duration of the check, filtered
+    /// by the `LOOM_LOG` environment variable. A subscriber set up by the
+    /// caller is left in place and receives loom's events instead.
     pub fn check<F>(&self, f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        let has_subscriber =
+            tracing::dispatcher::get_default(|current| !current.is::<subscriber::NoSubscriber>());
+
+        if has_subscriber {
+            return self.check_inner(f);
+        }
+
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(EnvFilter::from_env("LOOM_LOG"))
+            .with_test_writer()
+            .without_time()
+            .finish();
+
+        subscriber::with_default(subscriber, || {
+            self.check_inner(f);
+        });
+    }
+
+    fn check_inner<F>(&self, f: F)
     where
         F: Fn() + Sync + Send + 'static,
     {
@@ -232,15 +259,7 @@ pub fn model<F>(f: F)
 where
     F: Fn() + Sync + Send + 'static,
 {
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::from_env("LOOM_LOG"))
-        .with_test_writer()
-        .without_time()
-        .finish();
-
-    subscriber::with_default(subscriber, || {
-        Builder::new().check(f);
-    });
+    Builder::new().check(f)
 }
 
 #[cfg(feature = "checkpoint")]
