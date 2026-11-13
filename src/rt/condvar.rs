@@ -52,19 +52,22 @@ impl Condvar {
         // Release the lock
         mutex.release_lock();
 
-        // Disable the current thread
-        rt::park(location);
-
-        // `park` may return without a notification, e.g. when it consumes an
-        // unpark token banked by an earlier `Thread::unpark`. Such a thread is
-        // no longer waiting: if it stayed queued, a later `notify_one` would
-        // be spent on it instead of on a thread that is actually waiting.
-        rt::execution(|execution| {
+        // Wait to be taken off the waiter list by a notification. This is the
+        // condvar's own wait: it does not go through `thread::park`, so it
+        // neither consumes an unpark token nor is it ended by `unpark`.
+        //
+        // Nothing can run between queueing above and blocking here, so the
+        // thread is still queued, but there is no reason to rely on that.
+        let queued = rt::execution(|execution| {
             let thread = execution.threads.active_id();
-            let state = self.state.get_mut(&mut execution.objects);
+            let state = self.state.get(&execution.objects);
 
-            state.waiters.retain(|waiter| *waiter != thread);
+            state.waiters.contains(&thread)
         });
+
+        if queued {
+            rt::block(location);
+        }
 
         // Acquire the lock again
         mutex.acquire_lock(location);
@@ -83,7 +86,7 @@ impl Condvar {
             trace!(state = ?self.state, ?thread, %location, "Condvar::notify_one");
 
             if let Some(thread) = thread {
-                execution.threads.unpark(thread);
+                execution.threads.wake(thread);
             }
         })
     }
@@ -98,7 +101,7 @@ impl Condvar {
             trace!(state = ?self.state, threads = ?state.waiters, %location, "Condvar::notify_all");
 
             for thread in state.waiters.drain(..) {
-                execution.threads.unpark(thread);
+                execution.threads.wake(thread);
             }
         })
     }

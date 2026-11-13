@@ -128,6 +128,28 @@ pub(crate) fn park(location: Location) {
     }
 }
 
+/// Blocks the current thread until another thread makes it runnable again
+/// (see `thread::Set::wake`).
+///
+/// Unlike `park`, this has nothing to do with the thread's unpark token: a
+/// `Thread::unpark` neither prevents nor ends the wait.
+pub(crate) fn block(location: Location) {
+    let switch = execution(|execution| {
+        let thread = execution.threads.active_id();
+        let active = execution.threads.active_mut();
+
+        trace!(?thread, ?active.state, %location, "block");
+
+        active.set_blocked(location);
+        active.operation = None;
+        execution.schedule()
+    });
+
+    if switch {
+        Scheduler::switch();
+    }
+}
+
 /// Add an execution branch point.
 fn branch<F, R>(f: F) -> R
 where

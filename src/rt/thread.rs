@@ -346,6 +346,14 @@ impl Set {
         }
     }
 
+    /// Wakes a thread blocked with `rt::block`, which the caller must know
+    /// to be waiting for it. The woken thread continues after the waker's
+    /// current point.
+    pub(crate) fn wake(&mut self, id: Id) {
+        let (active, th) = self.active2_mut(id);
+        th.wake(active);
+    }
+
     /// Insert a point of sequential consistency
     /// TODO
     /// - Deprecate SeqCst accesses and allow SeqCst fences only. The semantics of SeqCst accesses
