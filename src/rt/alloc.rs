@@ -1,5 +1,5 @@
 use crate::rt;
-use crate::rt::{object, Location};
+use crate::rt::{object, Location, Scheduler};
 
 use tracing::trace;
 
@@ -68,13 +68,25 @@ impl Allocation {
 impl Drop for Allocation {
     #[track_caller]
     fn drop(&mut self) {
-        let location = location!();
-        rt::execution(|execution| {
-            let state = self.state.get_mut(&mut execution.objects);
+        let caller = std::panic::Location::caller();
 
-            trace!(state = ?self.state, drop.location = %location, "Allocation::drop");
+        // The tracker may be dropped when there is no execution to report to
+        // anymore. In particular, the trackers of raw allocations that were
+        // leaked are owned by the execution itself and are dropped along with
+        // it, which happens while unwinding from the "leaked" panic: failing
+        // here would abort the process and hide that report.
+        let _ = Scheduler::try_with_execution(|execution| {
+            let location = if execution.location {
+                Location::from(caller)
+            } else {
+                Location::disabled()
+            };
 
-            state.is_dropped = true;
+            if let Some(state) = self.state.try_get_mut(&mut execution.objects) {
+                trace!(state = ?self.state, drop.location = %location, "Allocation::drop");
+
+                state.is_dropped = true;
+            }
         });
     }
 }

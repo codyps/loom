@@ -347,6 +347,15 @@ impl<T: Object> Ref<T> {
         store.entries.get(self.index).and_then(T::get_ref)
     }
 
+    /// Like `get_mut`, but returns `None` where `try_get` does.
+    pub(super) fn try_get_mut(self, store: &mut Store<T::Entry>) -> Option<&mut T> {
+        if self.store_id != store.id {
+            return None;
+        }
+
+        store.entries.get_mut(self.index).and_then(T::get_mut)
+    }
+
     /// Get a mutable reference to the object associated with this reference
     /// from the store
     pub(super) fn get_mut(self, store: &mut Store<T::Entry>) -> &mut T {
