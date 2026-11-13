@@ -474,3 +474,93 @@ fn unsafe_cell_dropped_after_model() {
 
     drop(slot);
 }
+
+/// A flag is published from inside a mutable access, which then continues.
+/// A thread that sees the flag and reads the cell races with that access,
+/// whatever else the writer does (or does not do) before the access ends.
+fn publish_inside_mutable_access(extra_op: bool) {
+    use loom::sync::atomic::AtomicBool;
+    use loom::sync::atomic::Ordering::Relaxed;
+
+    loom::model(move || {
+        let s = Arc::new((UnsafeCell::new(0usize), AtomicBool::new(false)));
+        let s2 = s.clone();
+
+        let th = thread::spawn(move || {
+            s2.0.with_mut(|p| {
+                unsafe { *p = 1 };
+                s2.1.store(true, Release);
+                if extra_op {
+                    s2.1.load(Relaxed);
+                }
+                unsafe { *p = 2 };
+            });
+        });
+
+        if s.1.load(Acquire) {
+            s.0.with(|p| unsafe { *p });
+        }
+
+        th.join().unwrap();
+    });
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn race_with_open_mutable_access() {
+    publish_inside_mutable_access(false);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn race_with_open_mutable_access_extra_op() {
+    publish_inside_mutable_access(true);
+}
+
+/// Same shape for a shared access raced by a writer.
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn race_with_open_shared_access() {
+    use loom::sync::atomic::AtomicBool;
+
+    loom::model(|| {
+        let s = Arc::new((UnsafeCell::new(0usize), AtomicBool::new(false)));
+        let s2 = s.clone();
+
+        let th = thread::spawn(move || {
+            s2.0.with(|p| {
+                let _ = unsafe { *p };
+                s2.1.store(true, Release);
+                let _ = unsafe { *p };
+            });
+        });
+
+        if s.1.load(Acquire) {
+            s.0.with_mut(|p| unsafe { *p = 1 });
+        }
+
+        th.join().unwrap();
+    });
+}
+
+/// Publishing after the access has ended is fine.
+#[test]
+fn publish_after_mutable_access() {
+    use loom::sync::atomic::AtomicBool;
+
+    loom::model(|| {
+        let s = Arc::new((UnsafeCell::new(0usize), AtomicBool::new(false)));
+        let s2 = s.clone();
+
+        let th = thread::spawn(move || {
+            s2.0.with_mut(|p| unsafe { *p = 1 });
+            s2.1.store(true, Release);
+        });
+
+        if s.1.load(Acquire) {
+            assert_eq!(s.0.with(|p| unsafe { *p }), 1);
+        }
+
+        th.join().unwrap();
+    });
+}

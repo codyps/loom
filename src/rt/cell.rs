@@ -201,6 +201,10 @@ impl Drop for Reading {
             state.is_reading -= 1;
 
             if !std::thread::panicking() {
+                // The end of the access is its own point in the thread's
+                // history, after anything the thread published while the
+                // access was open (see `Writing::drop`).
+                execution.threads.active_causality_inc();
                 state.track_read(&execution.threads);
             }
         })
@@ -220,6 +224,14 @@ impl Drop for Writing {
             state.is_writing = false;
 
             if !std::thread::panicking() {
+                // The end of the access is its own point in the thread's
+                // history. Without advancing the clock here, a `Release`
+                // store made from inside the access as the thread's last
+                // synchronizing operation would carry the same clock value as
+                // the end of the access, and a thread acquiring that store
+                // would appear to have observed the whole access, when in
+                // fact the access was still open.
+                execution.threads.active_causality_inc();
                 state.track_write(&execution.threads);
             }
         })
