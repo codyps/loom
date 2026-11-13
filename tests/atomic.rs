@@ -448,7 +448,10 @@ fn unsync_load_then_release_then_successful_cas() {
             .map(|_| {
                 let owned = owned.clone();
                 thread::spawn(move || {
-                    if owned.compare_exchange(false, true, Acquire, Relaxed).is_ok() {
+                    if owned
+                        .compare_exchange(false, true, Acquire, Relaxed)
+                        .is_ok()
+                    {
                         let _ = unsafe { owned.unsync_load() };
                         owned.store(false, Release);
                     }
@@ -480,5 +483,89 @@ fn unsync_load_races_with_successful_cas() {
         let _ = unsafe { flag.unsync_load() };
 
         th.join().unwrap();
+    });
+}
+
+/// All threads agree on one modification order per atomic. If a thread sees
+/// `LOCK` go `1` then `2`, the swap that wrote `2` came after the store of
+/// `1`, so it acquired that store and with it the write of `DATA`.
+#[test]
+fn modification_order_is_shared_between_threads() {
+    use loom::sync::atomic::AtomicU32;
+
+    loom::model(|| {
+        loom::lazy_static! {
+            static ref LOCK: AtomicU32 = AtomicU32::new(0);
+            static ref DATA: AtomicU32 = AtomicU32::new(0);
+            static ref OBSERVED: AtomicU32 = AtomicU32::new(21);
+        }
+
+        let t1 = thread::spawn(|| {
+            DATA.store(42, Relaxed);
+            LOCK.store(1, Release);
+        });
+
+        let t2 = thread::spawn(|| {
+            LOCK.swap(2, AcqRel);
+            OBSERVED.store(DATA.load(Relaxed), Release);
+        });
+
+        let t3 = thread::spawn(|| {
+            let lock1 = LOCK.load(Relaxed);
+            let lock2 = LOCK.load(Relaxed);
+            let observed = OBSERVED.load(Acquire);
+
+            if lock1 == 1 && lock2 == 2 && observed != 21 {
+                assert_eq!(observed, 42);
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+    });
+}
+
+/// A swap either sees the other thread's store, or is followed by it. With a
+/// mutex ordering the rest, the two values checked below always agree.
+#[test]
+fn swap_does_not_lose_concurrent_store() {
+    use loom::sync::Mutex;
+
+    struct Pair {
+        a: Mutex<bool>,
+        b: AtomicBool,
+    }
+
+    loom::model(|| {
+        let pair = Arc::new(Pair {
+            a: Mutex::new(true),
+            b: AtomicBool::new(true),
+        });
+
+        let t1 = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                let mut a = pair.a.lock().unwrap();
+                pair.b.store(false, Relaxed);
+                *a = false;
+            })
+        };
+
+        let t2 = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                if !pair.b.swap(true, Relaxed) {
+                    return;
+                }
+
+                let a = pair.a.lock().unwrap();
+                let b = pair.b.load(Relaxed);
+                assert!(*a == b);
+            })
+        };
+
+        t1.join().unwrap();
+        t2.join().unwrap();
     });
 }
