@@ -130,7 +130,8 @@ where
     F: 'static,
     T: 'static,
 {
-    spawn_internal(f, None, None, location!())
+    // Safety: everything is `'static`, there is nothing to outlive.
+    unsafe { spawn_internal(f, None, None, None, location!()) }
 }
 
 /// Mock implementation of `std::thread::park`.
@@ -144,32 +145,57 @@ pub fn park() {
     rt::park(location!());
 }
 
-fn spawn_internal<F, T>(
+/// Spawns a thread whose closure and result may borrow from the caller.
+///
+/// # Safety
+///
+/// As for `std::thread::Builder::spawn_unchecked`: the caller must make sure
+/// the spawned thread does not outlive anything `f` or its result borrow, by
+/// waiting for the thread before those borrows end. Waiting on `scope_done`,
+/// if given, is sufficient: it is notified once the thread no longer holds
+/// on to `f` or to its result.
+unsafe fn spawn_internal<'a, F, T>(
     f: F,
     name: Option<String>,
     stack_size: Option<usize>,
+    scope_done: Option<rt::Notify>,
     location: Location,
 ) -> JoinHandle<T>
 where
     F: FnOnce() -> T,
-    F: 'static,
-    T: 'static,
+    F: 'a,
+    T: 'a,
 {
     let result = Arc::new(Mutex::new(None));
     let notify = rt::Notify::new(true, false);
 
-    let id = {
+    let body: Box<dyn FnOnce() + 'a> = {
         let name = name.clone();
         let result = result.clone();
-        rt::spawn(stack_size, move || {
+        Box::new(move || {
             rt::execution(|execution| {
                 init_current(execution, name);
             });
 
             *result.lock().unwrap() = Some(Ok(f()));
             notify.notify(location);
+
+            // Let go of the result slot before telling a scope that the
+            // thread is finished: if the join handle is already gone, this
+            // is where the result gets dropped, and that has to happen
+            // before the scope lets its borrows end.
+            drop(result);
+
+            if let Some(scope_done) = scope_done {
+                scope_done.notify(location);
+            }
         })
     };
+
+    // Erase the lifetime, which the caller is responsible for upholding.
+    let body = std::mem::transmute::<Box<dyn FnOnce() + 'a>, Box<dyn FnOnce() + 'static>>(body);
+
+    let id = rt::spawn(stack_size, body);
 
     JoinHandle {
         result,
@@ -224,7 +250,37 @@ impl Builder {
         F: Send + 'static,
         T: Send + 'static,
     {
-        Ok(spawn_internal(f, self.name, self.stack_size, location!()))
+        // Safety: everything is `'static`, there is nothing to outlive.
+        Ok(unsafe { spawn_internal(f, self.name, self.stack_size, None, location!()) })
+    }
+
+    /// Spawns a new scoped thread using the settings set through this
+    /// `Builder`.
+    ///
+    /// Mock implementation of `std::thread::Builder::spawn_scoped`.
+    #[track_caller]
+    pub fn spawn_scoped<'scope, 'env, F, T>(
+        self,
+        scope: &'scope Scope<'scope, 'env>,
+        f: F,
+    ) -> io::Result<ScopedJoinHandle<'scope, T>>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        let done = rt::Notify::new(true, false);
+        scope.pending.lock().unwrap().push(done);
+
+        // Safety: a `&'scope Scope` only exists inside a call to `scope()`,
+        // which does not return (ending `'scope`) before it has waited for
+        // `done`, registered above.
+        let handle =
+            unsafe { spawn_internal(f, self.name, self.stack_size, Some(done), location!()) };
+
+        Ok(ScopedJoinHandle {
+            handle,
+            _scope: PhantomData,
+        })
     }
 }
 
@@ -252,6 +308,121 @@ impl<T> JoinHandle<T> {
     }
 }
 
+/// A scope to spawn scoped threads in.
+///
+/// Mock implementation of `std::thread::Scope`. See [`scope`] for details.
+pub struct Scope<'scope, 'env: 'scope> {
+    /// Notified by each thread spawned in the scope when it has finished;
+    /// holds the ones `scope()` has not waited for yet.
+    pending: Mutex<Vec<rt::Notify>>,
+    // Invariance over both lifetimes, as in `std`.
+    _scope: PhantomData<&'scope mut &'scope ()>,
+    _env: PhantomData<&'env mut &'env ()>,
+}
+
+/// An owned permission to join on a scoped thread (block on its termination).
+///
+/// Mock implementation of `std::thread::ScopedJoinHandle`. See
+/// [`Scope::spawn`] for details.
+pub struct ScopedJoinHandle<'scope, T> {
+    handle: JoinHandle<T>,
+    _scope: PhantomData<&'scope ()>,
+}
+
+/// Creates a scope for spawning scoped threads.
+///
+/// Mock implementation of `std::thread::scope`.
+///
+/// Threads spawned through the [`Scope`] passed to `f` may borrow non-`'static`
+/// data from outside the scope. All of them are waited for before this
+/// function returns, whether or not they were joined explicitly.
+///
+/// As everywhere in loom, a panic on any thread fails the model rather than
+/// being reported through `join`, so unlike `std` this never has to turn a
+/// panicked scoped thread into a panic of its own.
+#[track_caller]
+pub fn scope<'env, F, T>(f: F) -> T
+where
+    F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
+{
+    let location = location!();
+
+    let scope = Scope {
+        pending: Mutex::new(Vec::new()),
+        _scope: PhantomData,
+        _env: PhantomData,
+    };
+
+    // Run `f`, but catch panics so that the scoped threads are waited for in
+    // that case as well.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&scope)));
+
+    // Wait for every thread spawned in the scope. A scoped thread can itself
+    // spawn into the scope, so keep going until nothing is left: a thread
+    // registers the threads it spawns before it reports itself as finished.
+    loop {
+        let next = scope.pending.lock().unwrap().pop();
+
+        match next {
+            Some(done) => done.wait(location),
+            None => break,
+        }
+    }
+
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+impl<'scope, 'env> Scope<'scope, 'env> {
+    /// Spawns a new thread within a scope, returning a [`ScopedJoinHandle`]
+    /// for it.
+    ///
+    /// Mock implementation of `std::thread::Scope::spawn`.
+    #[track_caller]
+    pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        Builder::new()
+            .spawn_scoped(self, f)
+            .expect("failed to spawn thread")
+    }
+}
+
+impl fmt::Debug for Scope<'_, '_> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("Scope").finish_non_exhaustive()
+    }
+}
+
+impl<T> ScopedJoinHandle<'_, T> {
+    /// Extracts a handle to the underlying thread.
+    pub fn thread(&self) -> &Thread {
+        self.handle.thread()
+    }
+
+    /// Waits for the associated thread to finish.
+    #[track_caller]
+    pub fn join(self) -> std::thread::Result<T> {
+        self.handle.join()
+    }
+
+    /// Checks if the associated thread has finished running its main function.
+    #[track_caller]
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+impl<T> fmt::Debug for ScopedJoinHandle<'_, T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("ScopedJoinHandle").finish_non_exhaustive()
+    }
+}
+
 impl<T: fmt::Debug> fmt::Debug for JoinHandle<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("JoinHandle").finish()
@@ -262,6 +433,8 @@ fn _assert_traits() {
     fn assert<T: Send + Sync>() {}
 
     assert::<JoinHandle<()>>();
+    assert::<ScopedJoinHandle<'_, ()>>();
+    assert::<Scope<'_, '_>>();
 }
 
 impl<T: 'static> LocalKey<T> {
