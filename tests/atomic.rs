@@ -405,3 +405,32 @@ fn fetch_add_and_compare_exchange() {
         n3.store(0, SeqCst);
     });
 }
+
+/// An atomic operation performed by a destructor that runs while the model is
+/// being torn down after a panic must not abort the process.
+#[test]
+#[should_panic(expected = "explicit panic")]
+fn atomic_load_on_drop_after_panic() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    struct AtomicLoadOnDrop(AtomicUsize);
+
+    impl Drop for AtomicLoadOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.load(SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let a = AtomicLoadOnDrop(AtomicUsize::new(0));
+
+        // Moving the value into a thread that never gets to run means it is
+        // dropped together with the thread, during teardown.
+        thread::spawn(move || {
+            let _a = a;
+        });
+
+        // Panic the parent thread.
+        panic!();
+    });
+}
