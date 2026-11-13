@@ -134,6 +134,71 @@ impl<T> AtomicPtr<T> {
     ) -> *mut T {
         self.0.update(set_order, fetch_order, f)
     }
+
+    /// Offsets the pointer's address by adding `val` (in units of `T`),
+    /// returning the previous pointer.
+    #[track_caller]
+    pub fn fetch_ptr_add(&self, val: usize, order: Ordering) -> *mut T {
+        self.0.rmw(|ptr| ptr.wrapping_add(val), order)
+    }
+
+    /// Offsets the pointer's address by subtracting `val` (in units of `T`),
+    /// returning the previous pointer.
+    #[track_caller]
+    pub fn fetch_ptr_sub(&self, val: usize, order: Ordering) -> *mut T {
+        self.0.rmw(|ptr| ptr.wrapping_sub(val), order)
+    }
+
+    /// Offsets the pointer's address by adding `val` *bytes*, returning the
+    /// previous pointer.
+    #[track_caller]
+    pub fn fetch_byte_add(&self, val: usize, order: Ordering) -> *mut T {
+        self.0
+            .rmw(|ptr| ptr.cast::<u8>().wrapping_add(val).cast(), order)
+    }
+
+    /// Offsets the pointer's address by subtracting `val` *bytes*, returning the
+    /// previous pointer.
+    #[track_caller]
+    pub fn fetch_byte_sub(&self, val: usize, order: Ordering) -> *mut T {
+        self.0
+            .rmw(|ptr| ptr.cast::<u8>().wrapping_sub(val).cast(), order)
+    }
+
+    /// Performs a bitwise "and" operation on the address of the current
+    /// pointer, and the argument `val`, and stores a pointer with provenance of
+    /// the current pointer and the resulting address.
+    #[track_caller]
+    pub fn fetch_and(&self, val: usize, order: Ordering) -> *mut T {
+        self.0.rmw(|ptr| map_addr(ptr, |a| a & val), order)
+    }
+
+    /// Performs a bitwise "or" operation on the address of the current pointer,
+    /// and the argument `val`, and stores a pointer with provenance of the
+    /// current pointer and the resulting address.
+    #[track_caller]
+    pub fn fetch_or(&self, val: usize, order: Ordering) -> *mut T {
+        self.0.rmw(|ptr| map_addr(ptr, |a| a | val), order)
+    }
+
+    /// Performs a bitwise "xor" operation on the address of the current pointer,
+    /// and the argument `val`, and stores a pointer with provenance of the
+    /// current pointer and the resulting address.
+    #[track_caller]
+    pub fn fetch_xor(&self, val: usize, order: Ordering) -> *mut T {
+        self.0.rmw(|ptr| map_addr(ptr, |a| a ^ val), order)
+    }
+}
+
+/// Changes the address of `ptr` while keeping its provenance.
+///
+/// Equivalent to `<*mut T>::map_addr`, which is newer than loom's minimum
+/// supported Rust version.
+fn map_addr<T>(ptr: *mut T, f: impl FnOnce(usize) -> usize) -> *mut T {
+    let addr = ptr as usize;
+    let offset = f(addr).wrapping_sub(addr);
+
+    ptr.cast::<u8>().wrapping_add(offset).cast()
 }
 
 impl<T> Default for AtomicPtr<T> {
