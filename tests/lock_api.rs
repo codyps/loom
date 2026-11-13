@@ -247,3 +247,29 @@ fn mutex_try_lock_inside_empty_critical_section() {
     assert!(saw_some.load(SeqCst));
     assert!(saw_none.load(SeqCst));
 }
+
+/// `parking_lot` style downgrade of a write guard.
+#[test]
+fn rwlock_downgrade() {
+    use loom::lock_api::RwLockWriteGuard;
+
+    loom::model(|| {
+        let lock = Arc::new(RwLock::new(0));
+
+        let mut write = lock.write();
+        *write = 1;
+        let read = RwLockWriteGuard::downgrade(write);
+
+        assert_eq!(*lock.try_read().unwrap(), 1);
+        assert!(lock.try_write().is_none());
+
+        let th = {
+            let lock = lock.clone();
+            thread::spawn(move || *lock.read())
+        };
+        assert_eq!(th.join().unwrap(), 1);
+
+        drop(read);
+        assert!(lock.try_write().is_some());
+    });
+}

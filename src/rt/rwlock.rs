@@ -116,6 +116,52 @@ impl RwLock {
         self.release_write_lock();
     }
 
+    /// Turn the write lock held by the current thread into a read lock,
+    /// without letting a writer in between.
+    pub(crate) fn downgrade(&self, location: Location) {
+        // Like a release, this is a point at which other threads may run
+        // while the write lock is still held.
+        self.branch_release(location);
+
+        super::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            let thread_id = execution.threads.active_id();
+
+            assert!(
+                state.lock == Some(Locked::Write(thread_id)),
+                "[loom internal bug] downgrade without holding the write lock"
+            );
+
+            let mut readers = HashMap::new();
+            readers.insert(thread_id, 1);
+            state.lock = Some(Locked::Read(readers));
+
+            // What was written under the lock is visible to the readers that
+            // are let in now.
+            state
+                .synchronize
+                .sync_store(&mut execution.threads, Release);
+
+            // Establish sequential consistency between the lock's operations.
+            execution.threads.seq_cst();
+
+            // Readers no longer have to wait. Writers still do.
+            for (id, thread) in execution.threads.iter_mut() {
+                if id == thread_id {
+                    continue;
+                }
+
+                if let Some(operation) = thread.operation.as_ref() {
+                    if operation.object() == self.state.erase()
+                        && operation.action() == Action::Read
+                    {
+                        thread.set_runnable();
+                    }
+                }
+            }
+        });
+    }
+
     fn branch_release(&self, location: Location) {
         let can_branch = !std::thread::panicking()
             && super::execution(|execution| execution.threads.is_active());

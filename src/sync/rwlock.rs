@@ -154,6 +154,32 @@ impl<'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, T> {
     }
 }
 
+impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
+    /// Downgrades a write-locked `RwLockWriteGuard` into a read-locked
+    /// [`RwLockReadGuard`].
+    ///
+    /// Mock implementation of `std::sync::RwLockWriteGuard::downgrade`. The
+    /// lock is never released in between: no writer can acquire it before
+    /// the returned read guard is dropped, while readers that were waiting
+    /// are let in.
+    #[track_caller]
+    pub fn downgrade(mut s: Self) -> RwLockReadGuard<'a, T> {
+        let lock = s.lock;
+
+        lock.object.downgrade(location!());
+
+        // Swap the real write guard for a read guard. Nothing else runs
+        // between these two steps, so the read lock is always available.
+        s.data = None;
+        std::mem::forget(s);
+
+        RwLockReadGuard {
+            lock,
+            data: Some(lock.data.try_read().expect("loom::RwLock state corrupt")),
+        }
+    }
+}
+
 impl<T: fmt::Debug> fmt::Debug for RwLockWriteGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)

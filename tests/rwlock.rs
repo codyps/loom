@@ -325,3 +325,82 @@ fn rwlock_try_write_inside_empty_write_hold() {
     assert!(succeeded, "try_write never succeeded");
     assert!(failed, "try_write never failed");
 }
+
+/// Downgrading keeps the lock held: readers get in, writers do not, and what
+/// was written before the downgrade is what every reader sees.
+#[test]
+fn rwlock_downgrade() {
+    use loom::sync::RwLockWriteGuard;
+
+    loom::model(|| {
+        let lock = Arc::new(RwLock::new(0));
+
+        let mut write = lock.write().unwrap();
+        *write = 1;
+
+        let read = RwLockWriteGuard::downgrade(write);
+        assert_eq!(*read, 1);
+
+        // Shared with other readers ...
+        assert_eq!(*lock.try_read().unwrap(), 1);
+        // ... but still locked against writers.
+        assert!(lock.try_write().is_err());
+
+        drop(read);
+        assert!(lock.try_write().is_ok());
+    });
+}
+
+/// A writer on another thread can never get in between the write and the
+/// downgraded read: the value written is still there under the read guard.
+#[test]
+fn rwlock_downgrade_is_atomic() {
+    use loom::sync::RwLockWriteGuard;
+
+    loom::model(|| {
+        let lock = Arc::new(RwLock::new(0));
+
+        let th = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                *lock.write().unwrap() = 100;
+            })
+        };
+
+        let mut write = lock.write().unwrap();
+        *write = 1;
+        let read = RwLockWriteGuard::downgrade(write);
+
+        // Had the lock been released in between, the other writer could
+        // have replaced the value.
+        assert_eq!(*read, 1);
+        thread::yield_now();
+        assert_eq!(*read, 1);
+        drop(read);
+
+        th.join().unwrap();
+    });
+}
+
+/// A reader blocked behind the writer is woken by the downgrade.
+#[test]
+fn rwlock_downgrade_wakes_readers() {
+    use loom::sync::RwLockWriteGuard;
+
+    loom::model(|| {
+        let lock = Arc::new(RwLock::new(0));
+
+        let write = lock.write().unwrap();
+
+        let th = {
+            let lock = lock.clone();
+            thread::spawn(move || *lock.read().unwrap())
+        };
+
+        let read = RwLockWriteGuard::downgrade(write);
+
+        // The reader has to be able to finish while the read guard is held.
+        assert_eq!(th.join().unwrap(), 0);
+        drop(read);
+    });
+}

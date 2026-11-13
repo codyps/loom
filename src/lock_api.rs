@@ -130,6 +130,13 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     }
 }
 
+unsafe impl lock_api::RawRwLockDowngrade for RawRwLock {
+    #[track_caller]
+    unsafe fn downgrade(&self) {
+        self.object().downgrade(location!())
+    }
+}
+
 /// Mock implementation of `lock_api::Mutex` (and `parking_lot::Mutex`).
 pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
 
