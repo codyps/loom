@@ -128,3 +128,47 @@ fn try_unwrap_multithreaded() {
         let _ = Arc::try_unwrap(num).unwrap();
     });
 }
+
+#[test]
+fn into_inner_unique() {
+    loom::model(|| {
+        let arc = Arc::new(String::from("hello"));
+        assert_eq!(Arc::into_inner(arc).as_deref(), Some("hello"));
+    });
+}
+
+/// When every handle is consumed with `into_inner`, exactly one caller gets
+/// the value, no matter how the calls interleave (this is the guarantee that
+/// distinguishes `into_inner` from `try_unwrap`).
+#[test]
+fn into_inner_exactly_one_winner() {
+    loom::model(|| {
+        let a = Arc::new(String::from("hello"));
+        let b = a.clone();
+
+        let th = thread::spawn(move || Arc::into_inner(b));
+
+        let mine = Arc::into_inner(a);
+        let theirs = th.join().unwrap();
+
+        match (mine, theirs) {
+            (Some(v), None) | (None, Some(v)) => assert_eq!(v, "hello"),
+            other => panic!("expected exactly one winner, got {:?}", other),
+        }
+    });
+}
+
+/// `into_inner` on a non-unique handle releases that handle without dropping
+/// the value; the remaining handle stays usable.
+#[test]
+fn into_inner_shared_keeps_value_alive() {
+    loom::model(|| {
+        let a = Arc::new(7usize);
+        let b = a.clone();
+
+        assert_eq!(Arc::into_inner(a), None);
+        assert_eq!(Arc::strong_count(&b), 1);
+        assert_eq!(*b, 7);
+        assert_eq!(Arc::into_inner(b), Some(7));
+    });
+}
