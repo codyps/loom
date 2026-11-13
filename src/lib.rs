@@ -203,6 +203,11 @@
 //! to the file. If the execution fails on the 10,000,000th permutation, it is faster to write to a
 //! file every 10,000 iterations instead of every single one.
 //!
+//! A checkpoint only makes sense for the model that wrote it, so run one test at a time when
+//! pointing `LOOM_CHECKPOINT_FILE` at a file. To checkpoint several tests in one run, point it
+//! at a directory instead (an existing one, or a path ending in `/`): each model then gets its
+//! own file in there. A checkpoint that belongs to another model is ignored.
+//!
 //! To isolate the exact failing path, first run the following command to generate the checkpoint
 //! for the failing scenario:
 //!

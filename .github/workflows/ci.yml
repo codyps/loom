@@ -61,8 +61,8 @@ jobs:
         run: cargo +nightly update -Z direct-minimal-versions
       - name: Test
         run: cargo test
-      - name: Check --features checkpoint
-        run: cargo check --features checkpoint
+      - name: Test --features checkpoint
+        run: cargo test --features checkpoint
       - name: Test --features futures
         run: cargo test --features futures
       - name: Test --features lock_api
@@ -78,8 +78,8 @@ jobs:
         run: rustup update stable && rustup default stable
       - name: Test
         run: cargo test
-      - name: Check --features checkpoint
-        run: cargo check --features checkpoint
+      - name: Test --features checkpoint
+        run: cargo test --features checkpoint
       - name: Test --features futures
         run: cargo test --features futures
       - name: Test --features lock_api

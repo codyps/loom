@@ -64,6 +64,16 @@ pub struct Builder {
     /// When doing an exhaustive check, uses the file to store and load the
     /// check progress
     ///
+    /// A checkpoint records which model it belongs to (identified by the
+    /// type of the closure passed to [`check`](Builder::check)), and a
+    /// checkpoint left behind by a different model is ignored rather than
+    /// replayed against a model it does not fit.
+    ///
+    /// If the path is an existing directory, or ends with a path separator,
+    /// each model gets its own file in that directory. This is what to use
+    /// when several tests run with checkpointing enabled, since with a single
+    /// file each test overwrites the checkpoint of the previous one.
+    ///
     /// Defaults to `LOOM_CHECKPOINT_FILE` environment variable.
     pub checkpoint_file: Option<PathBuf>,
 
@@ -264,10 +274,20 @@ impl Builder {
         );
         let mut scheduler = Scheduler::new(self.max_threads);
 
-        if let Some(ref path) = self.checkpoint_file {
+        // Identifies the model a checkpoint belongs to.
+        let model = std::any::type_name::<F>();
+
+        let checkpoint_file = self
+            .checkpoint_file
+            .as_ref()
+            .map(|path| checkpoint::file_for(path, model));
+
+        if let Some(ref path) = checkpoint_file {
             if path.exists() {
-                execution.path = checkpoint::load_execution_path(path);
-                execution.path.set_max_branches(self.max_branches);
+                if let Some(checkpoint) = checkpoint::load_execution_path(path, model) {
+                    execution.path = checkpoint;
+                    execution.path.set_max_branches(self.max_branches);
+                }
             }
         }
 
@@ -286,8 +306,8 @@ impl Builder {
                 );
                 info!(parent: None, "");
 
-                if let Some(ref path) = self.checkpoint_file {
-                    checkpoint::store_execution_path(&execution.path, path);
+                if let Some(ref path) = checkpoint_file {
+                    checkpoint::store_execution_path(&execution.path, path, model);
                 }
 
                 if let Some(max_permutations) = self.max_permutations {
@@ -386,19 +406,71 @@ where
 
 #[cfg(feature = "checkpoint")]
 mod checkpoint {
-    use std::fs::File;
+    use serde::{Deserialize, Serialize};
+    use std::fs::{self, File};
     use std::io::prelude::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 
-    pub(crate) fn load_execution_path(fs_path: &Path) -> crate::rt::Path {
+    #[derive(Serialize)]
+    struct Store<'a> {
+        model: &'a str,
+        path: &'a crate::rt::Path,
+    }
+
+    #[derive(Deserialize)]
+    struct Load {
+        model: String,
+        path: crate::rt::Path,
+    }
+
+    /// Returns the file to use for `model`'s checkpoint: `path` itself, or a
+    /// file named after the model if `path` is a directory.
+    pub(crate) fn file_for(path: &Path, model: &str) -> PathBuf {
+        let is_dir = path.is_dir() || path.to_string_lossy().ends_with(['/', MAIN_SEPARATOR]);
+
+        if !is_dir {
+            return path.to_path_buf();
+        }
+
+        let name: String = model
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+
+        path.join(format!("{}.json", name))
+    }
+
+    /// Loads the execution path stored at `fs_path`, unless it was stored by
+    /// a different model.
+    pub(crate) fn load_execution_path(fs_path: &Path, model: &str) -> Option<crate::rt::Path> {
         let mut file = File::open(fs_path).unwrap();
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
-        serde_json::from_str(&contents).unwrap()
+
+        match serde_json::from_str::<Load>(&contents) {
+            Ok(load) if load.model == model => Some(load.path),
+            Ok(load) => {
+                // Replaying another model's path makes no sense: at best it
+                // fails right away, at worst it explores something arbitrary.
+                eprintln!(
+                    "loom: ignoring checkpoint `{}`: it belongs to `{}`, not to `{}`",
+                    fs_path.display(),
+                    load.model,
+                    model
+                );
+                None
+            }
+            // A checkpoint from before the model was recorded.
+            Err(_) => Some(serde_json::from_str(&contents).unwrap()),
+        }
     }
 
-    pub(crate) fn store_execution_path(path: &crate::rt::Path, fs_path: &Path) {
-        let serialized = serde_json::to_string(path).unwrap();
+    pub(crate) fn store_execution_path(path: &crate::rt::Path, fs_path: &Path, model: &str) {
+        let serialized = serde_json::to_string(&Store { model, path }).unwrap();
+
+        if let Some(dir) = fs_path.parent() {
+            fs::create_dir_all(dir).unwrap();
+        }
 
         let mut file = File::create(fs_path).unwrap();
         file.write_all(serialized.as_bytes()).unwrap();
@@ -407,13 +479,17 @@ mod checkpoint {
 
 #[cfg(not(feature = "checkpoint"))]
 mod checkpoint {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    pub(crate) fn load_execution_path(_fs_path: &Path) -> crate::rt::Path {
+    pub(crate) fn file_for(path: &Path, _model: &str) -> PathBuf {
+        path.to_path_buf()
+    }
+
+    pub(crate) fn load_execution_path(_fs_path: &Path, _model: &str) -> Option<crate::rt::Path> {
         panic!("not compiled with `checkpoint` feature")
     }
 
-    pub(crate) fn store_execution_path(_path: &crate::rt::Path, _fs_path: &Path) {
+    pub(crate) fn store_execution_path(_path: &crate::rt::Path, _fs_path: &Path, _model: &str) {
         panic!("not compiled with `checkpoint` feature")
     }
 }
