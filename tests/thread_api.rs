@@ -201,5 +201,8 @@ fn is_finished_explores_both_outcomes() {
     }
 
     assert!(saw_running.load(SeqCst), "never observed a running thread");
-    assert!(saw_finished.load(SeqCst), "never observed a finished thread");
+    assert!(
+        saw_finished.load(SeqCst),
+        "never observed a finished thread"
+    );
 }

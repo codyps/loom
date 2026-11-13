@@ -1,6 +1,6 @@
 #![deny(warnings, rust_2018_idioms)]
 use loom::thread;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
@@ -106,4 +106,109 @@ fn drop() {
     // Finally, when the model's "main thread" completes, its copy of the local
     // should also be dropped.
     assert_eq!(DROPS.load(Ordering::Acquire), 3);
+}
+
+/// Counts how often a lazy initializer ran, so tests can check that `set`
+/// on an uninitialized key skips it (as `std` does).
+fn bump(counter: &'static AtomicUsize) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[test]
+fn local_key_cell() {
+    static INITS: AtomicUsize = AtomicUsize::new(0);
+
+    loom::thread_local! {
+        static LOCAL: Cell<usize> = { bump(&INITS); Cell::new(1) };
+        static UNSET: Cell<usize> = { bump(&INITS); Cell::new(10) };
+    }
+
+    INITS.store(0, Ordering::Relaxed);
+
+    loom::model(|| {
+        let before = INITS.load(Ordering::Relaxed);
+
+        // `set` on an uninitialized key must not run the initializer.
+        LOCAL.set(2);
+        assert_eq!(INITS.load(Ordering::Relaxed), before);
+        assert_eq!(LOCAL.get(), 2);
+
+        // ... and on an initialized key it overwrites.
+        LOCAL.set(3);
+        assert_eq!(LOCAL.replace(4), 3);
+        assert_eq!(LOCAL.take(), 4);
+        assert_eq!(LOCAL.get(), 0);
+
+        // `get` on an uninitialized key runs the initializer.
+        assert_eq!(UNSET.get(), 10);
+        assert_eq!(INITS.load(Ordering::Relaxed), before + 1);
+
+        // Each thread has its own value.
+        thread::spawn(|| {
+            assert_eq!(LOCAL.get(), 1);
+            LOCAL.set(7);
+            assert_eq!(LOCAL.get(), 7);
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(LOCAL.get(), 0);
+    });
+}
+
+#[test]
+fn local_key_loom_cell() {
+    loom::thread_local! {
+        static LOCAL: loom::cell::Cell<usize> = loom::cell::Cell::new(1);
+        static UNSET: loom::cell::Cell<usize> = loom::cell::Cell::new(10);
+    }
+
+    loom::model(|| {
+        // `set` before first use; this constructs a loom object and so must
+        // not happen while the runtime is borrowed.
+        LOCAL.set(2);
+        assert_eq!(LOCAL.get(), 2);
+        LOCAL.set(3);
+        assert_eq!(LOCAL.replace(4), 3);
+        assert_eq!(LOCAL.take(), 4);
+        assert_eq!(LOCAL.get(), 0);
+        assert_eq!(UNSET.get(), 10);
+
+        thread::spawn(|| {
+            assert_eq!(LOCAL.get(), 1);
+        })
+        .join()
+        .unwrap();
+    });
+}
+
+#[test]
+fn local_key_ref_cell() {
+    static INITS: AtomicUsize = AtomicUsize::new(0);
+
+    loom::thread_local! {
+        static LOCAL: RefCell<Vec<usize>> = { bump(&INITS); RefCell::new(vec![1]) };
+    }
+
+    INITS.store(0, Ordering::Relaxed);
+
+    loom::model(|| {
+        let before = INITS.load(Ordering::Relaxed);
+
+        LOCAL.set(vec![2]);
+        assert_eq!(INITS.load(Ordering::Relaxed), before);
+
+        LOCAL.with_borrow(|v| assert_eq!(v, &[2]));
+        LOCAL.with_borrow_mut(|v| v.push(3));
+        assert_eq!(LOCAL.replace(vec![4]), vec![2, 3]);
+        LOCAL.set(vec![5]);
+        assert_eq!(LOCAL.take(), vec![5]);
+        assert!(LOCAL.with_borrow(Vec::is_empty));
+
+        thread::spawn(|| {
+            LOCAL.with_borrow(|v| assert_eq!(v, &[1]));
+        })
+        .join()
+        .unwrap();
+    });
 }

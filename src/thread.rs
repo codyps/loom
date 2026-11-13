@@ -7,6 +7,7 @@ use crate::rt::{self, Execution, Location};
 #[doc(no_inline)]
 pub use std::thread::panicking;
 
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
@@ -272,7 +273,7 @@ impl<T: 'static> LocalKey<T> {
     where
         F: FnOnce(&T) -> R,
     {
-        let value = match unsafe { self.get() } {
+        let value = match unsafe { self.get_inner() } {
             Some(v) => v?,
             None => {
                 // Init the value out of the `rt::execution`
@@ -284,19 +285,19 @@ impl<T: 'static> LocalKey<T> {
                     execution.threads.local_init(self, value);
                 });
 
-                unsafe { self.get() }.expect("bug")?
+                unsafe { self.get_inner() }.expect("bug")?
             }
         };
         Ok(f(value))
     }
 
-    unsafe fn get(&'static self) -> Option<Result<&'static T, AccessError>> {
+    unsafe fn get_inner(&'static self) -> Option<Result<&'static T, AccessError>> {
         unsafe fn transmute_lt<'a, 'b, T>(t: &'a T) -> &'b T {
             std::mem::transmute::<&'a T, &'b T>(t)
         }
 
         rt::execution(|execution| {
-            trace!("LocalKey::get");
+            trace!("LocalKey::get_inner");
 
             let res = execution.threads.local(self)?;
 
@@ -314,6 +315,128 @@ impl<T: 'static> LocalKey<T> {
             // it's executing, by construction --- it's just kind of unfortunate.
             Some(Ok(transmute_lt(local)))
         })
+    }
+}
+
+impl<T: 'static> LocalKey<T> {
+    /// Runs `f` with the thread local, initializing it with `value` rather
+    /// than the key's lazy initializer if it has not been initialized yet.
+    ///
+    /// `f` is handed `value` back if the key was already initialized.
+    fn with_init_value<F, R>(&'static self, value: T, f: F) -> R
+    where
+        F: FnOnce(Option<T>, &T) -> R,
+    {
+        const DESTROYED: &str = "cannot access a (mock) TLS value during or after it is destroyed";
+
+        match unsafe { self.get_inner() } {
+            Some(current) => f(Some(value), current.expect(DESTROYED)),
+            None => {
+                rt::execution(|execution| {
+                    trace!("LocalKey::with_init_value");
+
+                    execution.threads.local_init(self, value);
+                });
+
+                f(
+                    None,
+                    unsafe { self.get_inner() }.expect("bug").expect(DESTROYED),
+                )
+            }
+        }
+    }
+}
+
+macro_rules! local_key_cell {
+    ($cell:ty, $name:literal) => {
+        #[doc = concat!("Convenience methods for thread locals holding a [`", $name, "`].")]
+        impl<T: 'static> LocalKey<$cell> {
+            /// Mock implementation of `std::thread::LocalKey::<Cell<T>>::set`.
+            ///
+            /// Sets the contained value. Like `std`, this does not run the
+            /// lazy initializer if the key has not been initialized yet.
+            #[track_caller]
+            pub fn set(&'static self, value: T) {
+                self.with_init_value(<$cell>::new(value), |value, cell| {
+                    if let Some(value) = value {
+                        cell.set(value.into_inner());
+                    }
+                })
+            }
+
+            /// Mock implementation of `std::thread::LocalKey::<Cell<T>>::get`.
+            #[track_caller]
+            pub fn get(&'static self) -> T
+            where
+                T: Copy,
+            {
+                self.with(|cell| cell.get())
+            }
+
+            /// Mock implementation of `std::thread::LocalKey::<Cell<T>>::take`.
+            #[track_caller]
+            pub fn take(&'static self) -> T
+            where
+                T: Default,
+            {
+                self.with(|cell| cell.take())
+            }
+
+            /// Mock implementation of
+            /// `std::thread::LocalKey::<Cell<T>>::replace`.
+            #[track_caller]
+            pub fn replace(&'static self, value: T) -> T {
+                self.with(|cell| cell.replace(value))
+            }
+        }
+    };
+}
+
+local_key_cell!(std::cell::Cell<T>, "std::cell::Cell");
+local_key_cell!(crate::cell::Cell<T>, "crate::cell::Cell");
+
+impl<T: 'static> LocalKey<RefCell<T>> {
+    /// Mock implementation of
+    /// `std::thread::LocalKey::<RefCell<T>>::with_borrow`.
+    pub fn with_borrow<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R,
+    {
+        self.with(|cell| f(&cell.borrow()))
+    }
+
+    /// Mock implementation of
+    /// `std::thread::LocalKey::<RefCell<T>>::with_borrow_mut`.
+    pub fn with_borrow_mut<F, R>(&'static self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        self.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    /// Mock implementation of `std::thread::LocalKey::<RefCell<T>>::set`.
+    ///
+    /// Sets the contained value. Like `std`, this does not run the lazy
+    /// initializer if the key has not been initialized yet.
+    pub fn set(&'static self, value: T) {
+        self.with_init_value(RefCell::new(value), |value, cell| {
+            if let Some(value) = value {
+                *cell.borrow_mut() = value.into_inner();
+            }
+        })
+    }
+
+    /// Mock implementation of `std::thread::LocalKey::<RefCell<T>>::take`.
+    pub fn take(&'static self) -> T
+    where
+        T: Default,
+    {
+        self.with(RefCell::take)
+    }
+
+    /// Mock implementation of `std::thread::LocalKey::<RefCell<T>>::replace`.
+    pub fn replace(&'static self, value: T) -> T {
+        self.with(|cell| cell.replace(value))
     }
 }
 
