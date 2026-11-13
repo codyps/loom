@@ -423,7 +423,11 @@ impl State {
             cnt: 0,
         };
 
-        // All subsequent accesses must happen-after.
+        // All subsequent accesses must happen-after. Creating the atomic is
+        // its first unsynchronized mutable access; remember where it happened
+        // so that an access racing with the creation can be reported with a
+        // location.
+        state.unsync_mut_locations.track(location, threads);
         state.track_unsync_mut(threads);
 
         // Store the initial thread
