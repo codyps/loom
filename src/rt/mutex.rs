@@ -21,6 +21,9 @@ pub(super) struct State {
     /// Tracks access to the mutex
     last_access: Option<Access>,
 
+    /// Tracks the last time the mutex was released
+    last_release_access: Option<Access>,
+
     /// Causality transfers between threads
     synchronize: Synchronize,
 }
@@ -32,6 +35,7 @@ impl Mutex {
                 seq_cst,
                 lock: None,
                 last_access: None,
+                last_release_access: None,
                 synchronize: Synchronize::new(),
             });
 
@@ -49,6 +53,23 @@ impl Mutex {
     pub(crate) fn try_acquire_lock(&self, location: Location) -> bool {
         self.state.branch_opaque_non_blocking(location);
         self.post_acquire()
+    }
+
+    /// Release the lock, as a point at which other threads may be scheduled
+    /// while the lock is still held.
+    ///
+    /// Acquiring the lock branches *before* it is taken, so without a branch
+    /// here nothing could ever run between a thread's acquire and its
+    /// release, unless the holder happened to do something else in between.
+    pub(crate) fn unlock(&self, location: Location) {
+        let can_branch = !std::thread::panicking()
+            && super::execution(|execution| execution.threads.is_active());
+
+        if can_branch {
+            self.state.branch_release(location);
+        }
+
+        self.release_lock();
     }
 
     pub(crate) fn release_lock(&self) {
@@ -122,7 +143,7 @@ impl Mutex {
                     // A thread about to `try_lock` does not wait for the
                     // mutex; it will simply observe that it is locked.
                     if operation.object() == self.state.erase()
-                        && operation.action() != object::Action::OpaqueNonBlocking
+                        && operation.action() == object::Action::Opaque
                     {
                         let location = operation.location();
                         trace!(state = ?self.state, thread = ?id, %location,
@@ -149,11 +170,47 @@ impl Mutex {
 }
 
 impl State {
-    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
-        self.last_access.as_ref()
+    /// Returns the previous accesses that `action` is dependent with.
+    ///
+    /// Releasing the lock is tracked separately from acquiring it. A thread
+    /// that *waits* for the lock cannot run between another thread's acquire
+    /// and release, so with `racing` set a blocking acquire does not report
+    /// the last release: there is nothing to reorder. An attempt (`try_*`)
+    /// can run there, and observes the lock as held if it does.
+    pub(super) fn dependent_accesses(
+        &self,
+        action: object::Action,
+        racing: bool,
+    ) -> impl Iterator<Item = &Access> {
+        let release = if racing && !Self::is_attempt(action) {
+            None
+        } else {
+            self.last_release_access.as_ref()
+        };
+
+        self.last_access.iter().chain(release)
     }
 
-    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
-        Access::set_or_create(&mut self.last_access, path_id, version);
+    pub(crate) fn set_last_access(
+        &mut self,
+        action: object::Action,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        let access = if Self::is_release(action) {
+            &mut self.last_release_access
+        } else {
+            &mut self.last_access
+        };
+
+        Access::set_or_create(access, path_id, version);
+    }
+
+    fn is_attempt(action: object::Action) -> bool {
+        action == object::Action::OpaqueNonBlocking
+    }
+
+    fn is_release(action: object::Action) -> bool {
+        action == object::Action::Release
     }
 }

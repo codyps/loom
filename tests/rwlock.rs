@@ -261,3 +261,67 @@ fn rwlock_try_write_no_block_against_write() {
         drop(guard)
     })
 }
+
+/// Outcomes of an attempt racing with a holder that does nothing between
+/// acquiring and releasing: the attempt can land inside the hold.
+fn try_inside_empty_hold(
+    hold: fn(&RwLock<usize>),
+    attempt: fn(&RwLock<usize>) -> bool,
+) -> (bool, bool) {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    let saw = std::sync::Arc::new((AtomicBool::new(false), AtomicBool::new(false)));
+
+    {
+        let saw = saw.clone();
+        loom::model(move || {
+            let lock = Rc::new(RwLock::new(0));
+            let lock2 = lock.clone();
+
+            let th = thread::spawn(move || hold(&lock2));
+
+            if attempt(&lock) {
+                saw.0.store(true, SeqCst);
+            } else {
+                saw.1.store(true, SeqCst);
+            }
+
+            th.join().unwrap();
+        });
+    }
+
+    (saw.0.load(SeqCst), saw.1.load(SeqCst))
+}
+
+#[test]
+fn rwlock_try_read_inside_empty_write_hold() {
+    let (succeeded, failed) = try_inside_empty_hold(
+        |lock| drop(lock.write().unwrap()),
+        |lock| lock.try_read().is_ok(),
+    );
+
+    assert!(succeeded, "try_read never succeeded");
+    assert!(failed, "try_read never failed");
+}
+
+#[test]
+fn rwlock_try_write_inside_empty_read_hold() {
+    let (succeeded, failed) = try_inside_empty_hold(
+        |lock| drop(lock.read().unwrap()),
+        |lock| lock.try_write().is_ok(),
+    );
+
+    assert!(succeeded, "try_write never succeeded");
+    assert!(failed, "try_write never failed");
+}
+
+#[test]
+fn rwlock_try_write_inside_empty_write_hold() {
+    let (succeeded, failed) = try_inside_empty_hold(
+        |lock| drop(lock.write().unwrap()),
+        |lock| lock.try_write().is_ok(),
+    );
+
+    assert!(succeeded, "try_write never succeeded");
+    assert!(failed, "try_write never failed");
+}

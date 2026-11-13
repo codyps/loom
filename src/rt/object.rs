@@ -86,6 +86,12 @@ pub(super) enum Action {
     /// (e.g. `Mutex::try_lock`). A thread about to take such an action must
     /// not be blocked when another thread acquires the object first.
     OpaqueNonBlocking,
+
+    /// Giving up an object held by the thread (e.g. unlocking a `Mutex`).
+    /// This never blocks either. It only exists as an action so that an
+    /// attempt on the object by another thread can be scheduled *before* it,
+    /// i.e. while the object is still held.
+    Release,
 }
 
 macro_rules! objects {
@@ -238,9 +244,14 @@ impl<T> Store<T> {
 impl Store {
     /// Calls `f` with every previous access that `operation` is dependent
     /// with and that could still be unordered with respect to it.
+    ///
+    /// With `racing` set, accesses that `operation` depends on but can never
+    /// be reordered with are left out. Those matter for tracking what the
+    /// operation is ordered after, but are not places to backtrack to.
     pub(super) fn for_each_dependent_access(
         &self,
         operation: Operation,
+        racing: bool,
         mut f: impl FnMut(&Access),
     ) {
         let last = match &self.entries[operation.obj.index] {
@@ -250,11 +261,21 @@ impl Store {
                     .for_each(f);
                 return;
             }
+            Entry::Mutex(entry) => {
+                entry
+                    .dependent_accesses(operation.action, racing)
+                    .for_each(f);
+                return;
+            }
+            Entry::RwLock(entry) => {
+                entry
+                    .dependent_accesses(operation.action, racing)
+                    .for_each(f);
+                return;
+            }
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
-            Entry::Mutex(entry) => entry.last_dependent_access(),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
-            Entry::RwLock(entry) => entry.last_dependent_access(),
             Entry::Channel(entry) => entry.last_dependent_access(operation.action.into()),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
@@ -279,10 +300,10 @@ impl Store {
             Entry::Atomic(entry) => {
                 entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
             }
-            Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::Mutex(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
-            Entry::RwLock(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::RwLock(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), path_id, dpor_vv)
             }
@@ -475,6 +496,10 @@ impl<T: Object<Entry = Entry>> Ref<T> {
 
     pub(super) fn branch_opaque_non_blocking(self, location: Location) {
         self.branch_action(Action::OpaqueNonBlocking, location)
+    }
+
+    pub(super) fn branch_release(self, location: Location) {
+        self.branch_action(Action::Release, location)
     }
 
     fn set_action(self, execution: &mut Execution, action: Action, location: Location) {

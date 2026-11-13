@@ -166,3 +166,72 @@ fn try_lock_explores_both_outcomes() {
     assert!(saw_ok.load(SeqCst), "try_lock never succeeded");
     assert!(saw_err.load(SeqCst), "try_lock never failed");
 }
+
+/// A `try_lock` can land between another thread's `lock` and its unlock even
+/// when the holder does nothing else in between: releasing the lock is a
+/// point where other threads get to run.
+#[test]
+fn try_lock_inside_empty_critical_section() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    let saw_ok = Arc::new(AtomicBool::new(false));
+    let saw_err = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_ok = saw_ok.clone();
+        let saw_err = saw_err.clone();
+        loom::model(move || {
+            let lock = Rc::new(Mutex::new(0));
+            let lock2 = lock.clone();
+
+            let th = thread::spawn(move || {
+                let guard = lock2.lock().unwrap();
+                drop(guard);
+            });
+
+            match lock.try_lock() {
+                Ok(_) => saw_ok.store(true, SeqCst),
+                Err(_) => saw_err.store(true, SeqCst),
+            }
+
+            th.join().unwrap();
+        });
+    }
+
+    assert!(saw_ok.load(SeqCst), "try_lock never succeeded");
+    assert!(saw_err.load(SeqCst), "try_lock never failed");
+}
+
+/// The consequence of the above: a thread that gives up for good when its
+/// `try_lock` fails is a bug loom has to find.
+#[test]
+#[should_panic(expected = "deadlock")]
+fn park_behind_failed_try_lock_is_reported() {
+    loom::model(|| {
+        let lock = Rc::new(Mutex::new(()));
+
+        let holder = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                let guard = lock.lock().unwrap();
+                drop(guard);
+            })
+        };
+
+        let waiter = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                if lock.try_lock().is_err() {
+                    // Nobody will ever unpark this thread.
+                    loop {
+                        thread::park();
+                    }
+                }
+            })
+        };
+
+        holder.join().unwrap();
+        waiter.join().unwrap();
+    });
+}

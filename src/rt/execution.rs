@@ -150,15 +150,16 @@ impl Execution {
             // be explored as well.
             let mut point = None;
 
-            self.objects.for_each_dependent_access(operation, |access| {
-                if access.happens_before(&th.dpor_vv) {
-                    // The previous access happened before this access, thus
-                    // there is no race.
-                    return;
-                }
+            self.objects
+                .for_each_dependent_access(operation, true, |access| {
+                    if access.happens_before(&th.dpor_vv) {
+                        // The previous access happened before this access, thus
+                        // there is no race.
+                        return;
+                    }
 
-                point = point.max(Some(access.path_id()));
-            });
+                    point = point.max(Some(access.path_id()));
+                });
 
             if let Some(point) = point {
                 // Track backtracking point
@@ -254,9 +255,10 @@ impl Execution {
 
             let mut dpor_vv = threads.active().dpor_vv;
 
-            self.objects.for_each_dependent_access(operation, |access| {
-                dpor_vv.join(access.version());
-            });
+            self.objects
+                .for_each_dependent_access(operation, false, |access| {
+                    dpor_vv.join(access.version());
+                });
 
             dpor_vv[th_id] += 1;
             threads.active_mut().dpor_vv = dpor_vv;

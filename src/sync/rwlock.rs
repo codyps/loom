@@ -150,7 +150,7 @@ impl<'a, T: ?Sized> ops::Deref for RwLockReadGuard<'a, T> {
 impl<'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, T> {
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.release_read_lock()
+        self.lock.object.unlock_read(location!())
     }
 }
 
@@ -177,6 +177,6 @@ impl<'a, T: ?Sized> ops::DerefMut for RwLockWriteGuard<'a, T> {
 impl<'a, T: ?Sized + 'a> Drop for RwLockWriteGuard<'a, T> {
     fn drop(&mut self) {
         self.data = None;
-        self.lock.object.release_write_lock()
+        self.lock.object.unlock_write(location!())
     }
 }

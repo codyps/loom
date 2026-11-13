@@ -29,6 +29,9 @@ pub(super) enum Action {
 
     /// Write lock attempt (`try_write`); never waits for the lock.
     TryWrite,
+
+    /// Releasing a read or write lock.
+    Release,
 }
 
 #[derive(Debug)]
@@ -39,6 +42,9 @@ pub(super) struct State {
 
     /// Tracks write access to the rwlock.
     last_access: Option<Access>,
+
+    /// Tracks the last time the rwlock was released
+    last_release_access: Option<Access>,
 
     /// Causality transfers between threads
     synchronize: Synchronize,
@@ -51,6 +57,7 @@ impl RwLock {
             let state = execution.objects.insert(State {
                 lock: None,
                 last_access: None,
+                last_release_access: None,
                 synchronize: Synchronize::new(),
             });
 
@@ -93,6 +100,29 @@ impl RwLock {
     pub(crate) fn try_acquire_write_lock(&self, location: Location) -> bool {
         self.state.branch_action(Action::TryWrite, location);
         self.post_acquire_write_lock()
+    }
+
+    /// Release a read lock, as a point at which other threads may be
+    /// scheduled while the lock is still held. See `rt::Mutex::unlock`.
+    pub(crate) fn unlock_read(&self, location: Location) {
+        self.branch_release(location);
+        self.release_read_lock();
+    }
+
+    /// Release the write lock, as a point at which other threads may be
+    /// scheduled while the lock is still held. See `rt::Mutex::unlock`.
+    pub(crate) fn unlock_write(&self, location: Location) {
+        self.branch_release(location);
+        self.release_write_lock();
+    }
+
+    fn branch_release(&self, location: Location) {
+        let can_branch = !std::thread::panicking()
+            && super::execution(|execution| execution.threads.is_active());
+
+        if can_branch {
+            self.state.branch_action(Action::Release, location);
+        }
     }
 
     pub(crate) fn release_read_lock(&self) {
@@ -277,11 +307,47 @@ impl RwLock {
 }
 
 impl State {
-    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
-        self.last_access.as_ref()
+    /// Returns the previous accesses that `action` is dependent with.
+    ///
+    /// Releasing the lock is tracked separately from acquiring it. A thread
+    /// that *waits* for the lock cannot run between another thread's acquire
+    /// and release, so with `racing` set a blocking acquire does not report
+    /// the last release: there is nothing to reorder. An attempt (`try_*`)
+    /// can run there, and observes the lock as held if it does.
+    pub(super) fn dependent_accesses(
+        &self,
+        action: object::Action,
+        racing: bool,
+    ) -> impl Iterator<Item = &Access> {
+        let release = if racing && !Self::is_attempt(action) {
+            None
+        } else {
+            self.last_release_access.as_ref()
+        };
+
+        self.last_access.iter().chain(release)
     }
 
-    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
-        Access::set_or_create(&mut self.last_access, path_id, version)
+    pub(crate) fn set_last_access(
+        &mut self,
+        action: object::Action,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        let access = if Self::is_release(action) {
+            &mut self.last_release_access
+        } else {
+            &mut self.last_access
+        };
+
+        Access::set_or_create(access, path_id, version);
+    }
+
+    fn is_attempt(action: object::Action) -> bool {
+        action == Action::TryRead || action == Action::TryWrite
+    }
+
+    fn is_release(action: object::Action) -> bool {
+        action == Action::Release
     }
 }

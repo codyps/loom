@@ -58,7 +58,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
     }
 
     unsafe fn unlock(&self) {
-        self.object().release_lock()
+        self.object().unlock(location!())
     }
 
     fn is_locked(&self) -> bool {
@@ -103,7 +103,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     }
 
     unsafe fn unlock_shared(&self) {
-        self.object().release_read_lock()
+        self.object().unlock_read(location!())
     }
 
     #[track_caller]
@@ -117,7 +117,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     }
 
     unsafe fn unlock_exclusive(&self) {
-        self.object().release_write_lock()
+        self.object().unlock_write(location!())
     }
 
     fn is_locked(&self) -> bool {

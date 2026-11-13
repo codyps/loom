@@ -214,3 +214,36 @@ fn mapped_guards() {
         assert_eq!(*rwlock.read(), (5, 6));
     });
 }
+
+/// As for the `std` style mutex: an attempt can land inside a hold during
+/// which the holder does nothing else.
+#[test]
+fn mutex_try_lock_inside_empty_critical_section() {
+    use std::sync::atomic::AtomicBool;
+
+    let saw_some = Arc::new(AtomicBool::new(false));
+    let saw_none = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_some = saw_some.clone();
+        let saw_none = saw_none.clone();
+        loom::model(move || {
+            let lock = Rc::new(Mutex::new(0));
+            let lock2 = lock.clone();
+
+            let th = thread::spawn(move || {
+                drop(lock2.lock());
+            });
+
+            match lock.try_lock() {
+                Some(_) => saw_some.store(true, SeqCst),
+                None => saw_none.store(true, SeqCst),
+            }
+
+            th.join().unwrap();
+        });
+    }
+
+    assert!(saw_some.load(SeqCst));
+    assert!(saw_none.load(SeqCst));
+}
