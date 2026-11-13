@@ -33,6 +33,7 @@ pub fn spin_loop_hint() {
 }
 
 /// An atomic fence.
+#[track_caller]
 pub fn fence(order: Ordering) {
-    crate::rt::fence(order);
+    crate::rt::fence(order, location!());
 }

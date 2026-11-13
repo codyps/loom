@@ -215,3 +215,67 @@ fn w_rwc() {
         }
     });
 }
+
+/// `SeqCst` fences are totally ordered, and loom has to try both orders. Here
+/// the reader's fence may come first, in which case it does not see the
+/// writer's store to `counter`, although it can later see `flag`.
+#[test]
+#[should_panic(expected = "counter was not published")]
+fn fence_seqcst_order_is_explored() {
+    use loom::sync::atomic::AtomicUsize;
+
+    loom::model(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let writer = {
+            let (flag, counter) = (flag.clone(), counter.clone());
+            thread::spawn(move || {
+                counter.store(1, Relaxed);
+                fence(SeqCst);
+                flag.store(true, Relaxed);
+            })
+        };
+
+        let reader = {
+            let (flag, counter) = (flag.clone(), counter.clone());
+            thread::spawn(move || {
+                fence(SeqCst);
+                if flag.load(Relaxed) {
+                    assert!(counter.load(Relaxed) == 1, "counter was not published");
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+/// With the reader's fence placed after it has seen the flag, the fences can
+/// only be ordered one way where it matters, and the read is safe.
+#[test]
+fn fence_seqcst_after_flag() {
+    use loom::sync::atomic::AtomicUsize;
+
+    loom::model(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let writer = {
+            let (flag, counter) = (flag.clone(), counter.clone());
+            thread::spawn(move || {
+                counter.store(1, Relaxed);
+                fence(SeqCst);
+                flag.store(true, Relaxed);
+            })
+        };
+
+        if flag.load(Relaxed) {
+            fence(SeqCst);
+            assert_eq!(counter.load(Relaxed), 1);
+        }
+
+        writer.join().unwrap();
+    });
+}

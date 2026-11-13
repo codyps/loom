@@ -164,6 +164,9 @@ objects! {
 
     // Tracks access to a memory cell
     Cell(rt::cell::State),
+
+    // The order of `SeqCst` fences
+    SeqCstFences(rt::atomic::SeqCstFences),
 }
 
 impl<T> Store<T> {
@@ -282,6 +285,7 @@ impl Store {
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
+            Entry::SeqCstFences(entry) => entry.last_dependent_access(),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
@@ -308,6 +312,7 @@ impl Store {
             Entry::Mutex(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::SeqCstFences(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::RwLock(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), path_id, dpor_vv)

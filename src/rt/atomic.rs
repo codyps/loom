@@ -178,8 +178,40 @@ struct Store {
 #[derive(Debug)]
 struct FirstSeen([u16; MAX_THREADS]);
 
+/// The order of `SeqCst` fences.
+///
+/// `SeqCst` fences are totally ordered, and that order is observable: a fence
+/// sees what the fences before it published, and not what the ones after it
+/// did. This object exists so that fences are operations the scheduler knows
+/// to be dependent on one another, and explores in both orders. There is one
+/// per execution, created by the first `SeqCst` fence.
+#[derive(Debug)]
+pub(super) struct SeqCstFences {
+    last_access: Option<Access>,
+}
+
+impl SeqCstFences {
+    pub(super) fn last_dependent_access(&self) -> Option<&Access> {
+        self.last_access.as_ref()
+    }
+
+    pub(super) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
+        Access::set_or_create(&mut self.last_access, path_id, version);
+    }
+}
+
 /// Implements atomic fence behavior
-pub(crate) fn fence(ordering: Ordering) {
+pub(crate) fn fence(ordering: Ordering, location: Location) {
+    if let Ordering::SeqCst = ordering {
+        let fences = rt::execution(|execution| {
+            let existing = execution.objects.iter_ref::<SeqCstFences>().next();
+
+            existing.unwrap_or_else(|| execution.objects.insert(SeqCstFences { last_access: None }))
+        });
+
+        fences.branch_opaque(location);
+    }
+
     rt::synchronize(|execution| match ordering {
         Ordering::Acquire => fence_acq(execution),
         Ordering::Release => fence_rel(execution),
