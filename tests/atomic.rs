@@ -347,3 +347,61 @@ fn rmw_after_relaxed_load_of_concurrent_store() {
         assert!(solutions.iter().any(|&(_, s, _)| s == swapped));
     }
 }
+
+/// Once a thread's RMW has observed the low bit clear, the only operation
+/// that could set it (a compare-exchange from 0) can no longer succeed.
+#[test]
+fn multiple_compare_exchange() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    loom::model(|| {
+        let n1 = Arc::new(AtomicUsize::new(0));
+        let n2 = n1.clone();
+        let n3 = n1.clone();
+
+        thread::spawn(move || {
+            n1.store(2, SeqCst);
+        });
+
+        thread::spawn(move || {
+            let prev = match n2.compare_exchange(0, 2, SeqCst, SeqCst) {
+                Ok(prev) | Err(prev) => prev,
+            };
+
+            if (prev & 1) == 0 {
+                // We observed 0 or 2, so the compare-exchange below either
+                // already failed or will fail: the low bit stays clear.
+                assert_eq!(0, n2.load(SeqCst) & 1);
+            }
+        });
+
+        // This only succeeds in setting the low bit if it observes 0.
+        let _ = n3.compare_exchange(0, 1, SeqCst, SeqCst);
+    });
+}
+
+/// Variant of `multiple_compare_exchange` using `fetch_add`.
+#[test]
+fn fetch_add_and_compare_exchange() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    loom::model(|| {
+        let n1 = Arc::new(AtomicUsize::new(0));
+        let n2 = n1.clone();
+        let n3 = n1.clone();
+
+        thread::spawn(move || {
+            let _ = n1.fetch_add(2, SeqCst);
+        });
+
+        thread::spawn(move || {
+            let prev = n2.fetch_add(2, SeqCst);
+            if (prev & 1) == 0 {
+                assert_eq!(0, n2.load(SeqCst) & 1);
+            }
+        });
+
+        let _ = n3.compare_exchange(0, 1, SeqCst, SeqCst);
+        n3.store(0, SeqCst);
+    });
+}
