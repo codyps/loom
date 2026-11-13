@@ -1,5 +1,5 @@
 use crate::rt;
-use crate::rt::{object, Location, Scheduler};
+use crate::rt::{location, object, Location, Scheduler};
 
 use tracing::trace;
 
@@ -13,41 +13,68 @@ pub(crate) struct Allocation {
 pub(super) struct State {
     is_dropped: bool,
     allocated: Location,
+    /// Where the allocation was freed, once it has been.
+    freed: Location,
 }
 
 /// Track a raw allocation
 pub(crate) fn alloc(ptr: *mut u8, location: Location) {
+    let mut prev = None;
+
     rt::execution(|execution| {
         let state = execution.objects.insert(State {
             is_dropped: false,
             allocated: location,
+            freed: Location::disabled(),
         });
 
         let allocation = Allocation { state };
 
         trace!(?allocation.state, ?ptr, %location, "alloc");
 
-        let prev = execution.raw_allocations.insert(ptr as usize, allocation);
-        assert!(prev.is_none(), "pointer already tracked");
+        prev = execution.raw_allocations.insert(ptr as usize, allocation);
+
+        // The tracker of a freed allocation stays behind to recognize a
+        // double free, until the allocator hands the address out again.
+        if let Some(prev) = &prev {
+            assert!(
+                prev.state.get(&execution.objects).is_dropped,
+                "pointer already tracked"
+            );
+        }
     });
+
+    // Drop outside of the `rt::execution` block
+    drop(prev);
 }
 
 /// Track a raw deallocation
 pub(crate) fn dealloc(ptr: *mut u8, location: Location) {
-    let allocation =
-        rt::execution(
-            |execution| match execution.raw_allocations.remove(&(ptr as usize)) {
-                Some(allocation) => {
-                    trace!(state = ?allocation.state, ?ptr, %location, "dealloc");
+    rt::execution(|execution| {
+        let allocation = match execution.raw_allocations.get(&(ptr as usize)) {
+            Some(allocation) => allocation,
+            None => panic!(
+                "Tried to free a pointer that loom is not tracking. It was not \
+                 allocated with `loom::alloc`."
+            ),
+        };
 
-                    allocation
-                }
-                None => panic!("pointer not tracked"),
-            },
-        );
+        let state = allocation.state.get_mut(&mut execution.objects);
 
-    // Drop outside of the `rt::execution` block
-    drop(allocation);
+        trace!(state = ?allocation.state, ?ptr, %location, "dealloc");
+
+        if state.is_dropped {
+            location::panic("Double free: the allocation has already been freed.")
+                .location("allocated", state.allocated)
+                .location("first freed", state.freed)
+                .location("freed again", location)
+                .fire();
+        }
+
+        // The tracker is left in place, see `alloc`.
+        state.is_dropped = true;
+        state.freed = location;
+    });
 }
 
 impl Allocation {
@@ -56,6 +83,7 @@ impl Allocation {
             let state = execution.objects.insert(State {
                 is_dropped: false,
                 allocated: location,
+                freed: Location::disabled(),
             });
 
             trace!(?state, %location, "Allocation::new");
@@ -85,7 +113,10 @@ impl Drop for Allocation {
             if let Some(state) = self.state.try_get_mut(&mut execution.objects) {
                 trace!(state = ?self.state, drop.location = %location, "Allocation::drop");
 
-                state.is_dropped = true;
+                if !state.is_dropped {
+                    state.is_dropped = true;
+                    state.freed = location;
+                }
             }
         });
     }
