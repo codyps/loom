@@ -333,3 +333,22 @@ fn unsafe_cell_access_after_sync() {
         }
     });
 }
+
+/// Even when source locations are not being captured, the panic message names
+/// the accesses (and threads) involved in the violation.
+#[test]
+#[should_panic(expected = "write two: thread #")]
+fn unsafe_cell_race_lists_accesses_without_locations() {
+    let mut builder = loom::model::Builder::new();
+    builder.location = false;
+
+    builder.check(|| {
+        let x = Data::new(1);
+        let y = Data(x.0.clone());
+
+        let th1 = thread::spawn(move || x.inc());
+        y.inc();
+
+        th1.join().unwrap();
+    });
+}
