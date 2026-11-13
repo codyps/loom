@@ -202,7 +202,13 @@ impl Builder {
         self
     }
 
-    /// Sets the size of the stack (in bytes) for the new thread.
+    /// Sets the size of the stack for the new thread.
+    ///
+    /// Unlike `std`, the size is not in bytes: it is handed to the underlying
+    /// coroutine library as is, which measures it in machine words (`usize`).
+    ///
+    /// Threads that do not set a size use
+    /// [`model::Builder::stack_size`](crate::model::Builder::stack_size).
     pub fn stack_size(mut self, size: usize) -> Builder {
         self.stack_size = Some(size);
 
