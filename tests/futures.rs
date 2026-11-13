@@ -90,3 +90,29 @@ fn spurious_poll() {
 
     assert!(actual.load(Acquire));
 }
+
+/// A waker cloned from `block_on`'s context must compare equal (per
+/// `Waker::will_wake`) to the waker handed to subsequent polls. Futures rely
+/// on this to avoid re-registering, and waking themselves, on every poll.
+#[test]
+fn block_on_waker_will_wake_clone() {
+    loom::model(|| {
+        let mut saved: Option<std::task::Waker> = None;
+
+        block_on(poll_fn(move |cx| match saved.take() {
+            None => {
+                let waker = cx.waker().clone();
+                assert!(cx.waker().will_wake(&waker));
+                assert!(waker.will_wake(&waker.clone()));
+                waker.wake_by_ref();
+                saved = Some(waker);
+                Poll::Pending
+            }
+            Some(waker) => {
+                assert!(cx.waker().will_wake(&waker));
+                assert!(waker.will_wake(cx.waker()));
+                Poll::Ready(())
+            }
+        }));
+    });
+}
