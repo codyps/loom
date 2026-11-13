@@ -33,3 +33,24 @@ fn two_mutexes_deadlock() {
         th2.join().unwrap();
     });
 }
+
+/// Loom objects with destructors that are themselves loom operations (here an
+/// `Arc`) are dropped while the deadlock panic unwinds. The deadlock has to be
+/// reported all the same, not replaced by an abort.
+#[test]
+#[should_panic(expected = "deadlock; threads =")]
+fn deadlock_with_live_loom_objects() {
+    loom::model(|| {
+        let a = loom::sync::Arc::new(Mutex::new(1));
+        let b = a.clone();
+
+        let th = thread::spawn(move || {
+            let _b = b;
+        });
+
+        let _first = a.lock().unwrap();
+        let _second = a.lock().unwrap();
+
+        th.join().unwrap();
+    });
+}

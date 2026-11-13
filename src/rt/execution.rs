@@ -209,17 +209,17 @@ impl Execution {
             );
         }
 
-        let switched = Some(self.threads.active_id()) != next;
-
-        self.threads.set_active(next);
-
-        // There is no active thread. Unless all threads have terminated
-        // or the current thread is panicking, the test has deadlocked.
-        if !self.threads.is_active() {
-            let terminal = self.threads.iter().all(|(_, th)| th.is_terminated());
-
+        if next.is_none() && !self.threads.iter().all(|(_, th)| th.is_terminated()) {
+            // No thread can run, and not because they are all done: the test
+            // has deadlocked.
+            //
+            // The current thread is left active. The panic below unwinds it,
+            // and the destructors that run on the way (a loom `Arc` being
+            // dropped, say) are loom operations that need an active thread:
+            // without one they would panic again and abort the process,
+            // hiding the deadlock report.
             assert!(
-                terminal || std::thread::panicking(),
+                std::thread::panicking(),
                 "deadlock; threads = {:?}",
                 self.threads
                     .iter()
@@ -227,6 +227,17 @@ impl Execution {
                     .collect::<Vec<_>>()
             );
 
+            // Already unwinding, with nothing else left to run: let the
+            // current thread carry on with its destructors.
+            return false;
+        }
+
+        let switched = Some(self.threads.active_id()) != next;
+
+        self.threads.set_active(next);
+
+        // There is no active thread: all threads have terminated.
+        if !self.threads.is_active() {
             return true;
         }
 
