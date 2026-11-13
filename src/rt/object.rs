@@ -285,6 +285,13 @@ impl<T: Object> Ref<T> {
             .expect("[loom internal bug] unexpected object stored at reference")
     }
 
+    /// Like `get`, but returns `None` if the reference does not point at an
+    /// object of this type, e.g. because it outlived the execution it was
+    /// created in.
+    pub(super) fn try_get(self, store: &Store<T::Entry>) -> Option<&T> {
+        store.entries.get(self.index).and_then(T::get_ref)
+    }
+
     /// Get a mutable reference to the object associated with this reference
     /// from the store
     pub(super) fn get_mut(self, store: &mut Store<T::Entry>) -> &mut T {

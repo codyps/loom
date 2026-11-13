@@ -391,3 +391,86 @@ fn as_mut_sequential_accesses() {
         assert_eq!(value.into_inner(), [1, 2, 3]);
     });
 }
+
+/// Dropping the cell while a pointer obtained from it is still alive leaves
+/// that pointer dangling.
+#[test]
+#[should_panic(expected = "dropped or consumed while immutable access")]
+fn unsafe_cell_access_during_drop() {
+    loom::model(|| {
+        let x = UnsafeCell::new(());
+        let _guard = x.get();
+        drop(x);
+    });
+}
+
+#[test]
+#[should_panic(expected = "dropped or consumed while mutable access")]
+fn unsafe_cell_mut_access_during_drop() {
+    loom::model(|| {
+        let x = UnsafeCell::new(1usize);
+        let _guard = x.get_mut();
+        drop(x);
+    });
+}
+
+/// `into_inner` moves the value out from under any pointer just as well.
+#[test]
+#[should_panic(expected = "dropped or consumed while immutable access")]
+fn unsafe_cell_access_during_into_inner() {
+    loom::model(|| {
+        let x = UnsafeCell::new(1usize);
+        let _guard = x.get();
+        let _ = x.into_inner();
+    });
+}
+
+#[test]
+fn unsafe_cell_into_inner_ok() {
+    loom::model(|| {
+        let x = UnsafeCell::new(0usize);
+        {
+            let _guard = x.get();
+        }
+        assert_eq!(x.into_inner(), 0);
+    });
+}
+
+/// Unlike a `Drop` impl on `UnsafeCell<T>` itself, the check must not make
+/// the mock stricter than `std::cell::UnsafeCell` under the drop checker:
+/// values that borrow each other in a cycle through the cell still compile.
+#[test]
+fn unsafe_cell_drop_check_matches_std() {
+    struct Node<'a> {
+        next: UnsafeCell<Option<&'a Node<'a>>>,
+    }
+
+    loom::model(|| {
+        let a = Node {
+            next: UnsafeCell::new(None),
+        };
+        let b = Node {
+            next: UnsafeCell::new(None),
+        };
+
+        a.next.with_mut(|next| unsafe { *next = Some(&b) });
+        b.next.with_mut(|next| unsafe { *next = Some(&a) });
+
+        assert!(a.next.with(|next| unsafe { (*next).is_some() }));
+    });
+}
+
+/// A cell that outlives the model it was created in can still be dropped.
+#[test]
+fn unsafe_cell_dropped_after_model() {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    {
+        let slot = slot.clone();
+        loom::model(move || {
+            slot.lock().unwrap().push(UnsafeCell::new(1usize));
+        });
+    }
+
+    drop(slot);
+}

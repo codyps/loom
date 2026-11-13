@@ -1,5 +1,5 @@
 use crate::rt::location::{self, Location, LocationSet};
-use crate::rt::{self, object, thread, VersionVec};
+use crate::rt::{self, object, thread, Scheduler, VersionVec};
 
 /// Tracks immutable and mutable access to a single memory cell.
 #[derive(Debug)]
@@ -81,6 +81,45 @@ impl Cell {
 
             Writing { state: self.state }
         })
+    }
+}
+
+impl Drop for Cell {
+    /// Destroying the cell invalidates every pointer handed out for it, so
+    /// none may still be alive.
+    ///
+    /// This lives here, rather than on the generic `UnsafeCell<T>`, so that
+    /// the mock does not get stricter drop-check rules than
+    /// `std::cell::UnsafeCell`, which has no `Drop` impl.
+    fn drop(&mut self) {
+        // Don't turn an unwinding panic into an abort.
+        if std::thread::panicking() {
+            return;
+        }
+
+        // The cell may be dropped after the execution that tracks it is gone,
+        // in which case there is nothing left to check against.
+        let _ = Scheduler::try_with_execution(|execution| {
+            let state = match self.state.try_get(&execution.objects) {
+                Some(state) => state,
+                None => return,
+            };
+
+            if state.is_reading > 0 || state.is_writing {
+                let access = if state.is_writing {
+                    "mutable"
+                } else {
+                    "immutable"
+                };
+
+                location::panic(format!(
+                    "`UnsafeCell` dropped or consumed while {} access to it is still active.",
+                    access
+                ))
+                .location("created", state.created_location)
+                .fire();
+            }
+        });
     }
 }
 

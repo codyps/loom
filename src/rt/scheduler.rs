@@ -43,6 +43,25 @@ impl Scheduler {
         Self::with_state(|state| f(state.execution))
     }
 
+    /// Access the execution, if there is one and it is not already being
+    /// accessed further up the stack.
+    ///
+    /// For use from `Drop` implementations, which can run after a model has
+    /// finished or while the runtime is in the middle of an operation.
+    pub(crate) fn try_with_execution<F, R>(f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Execution) -> R,
+    {
+        if !STATE.is_set() {
+            return None;
+        }
+
+        STATE.with(|state| {
+            let mut state = state.try_borrow_mut().ok()?;
+            Some(f(state.execution))
+        })
+    }
+
     /// Perform a context switch
     pub(crate) fn switch() {
         use std::future::Future;
