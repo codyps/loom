@@ -1,3 +1,165 @@
+# Unreleased (fork)
+
+Changes in this fork on top of upstream 0.7.3. Each entry names the upstream
+pull request it is based on ("upstream PR N"); "reworked" means the idea was
+kept but the implementation here differs, for the reason given.
+
+The MSRV is unchanged (1.73, checked with `--all-features`). The whole test
+suite passes with no features, `futures`, `lock_api` and all features, in debug
+and release, and on the lowest allowed direct dependency versions.
+
+### Added
+
+ - `thread::scope`, `Scope`, `ScopedJoinHandle` and `Builder::spawn_scoped`
+   (upstream PR 312, reworked). Built on an internal unchecked spawn instead
+   of runtime internals, as asked for in review. The scope waits for every
+   thread spawned in it, including ones spawned by other scoped threads, and a
+   thread's borrowed result is dropped before the scope ends. This covers the
+   unsoundness case raised in review.
+ - `loom::sync::Notify` gains the `tokio::sync::Notify` API: `notify_one`,
+   `notify_last`, `notify_waiters`, `notified()` and `Notified::enable`
+   (upstream PR 415, reworked). The proposed version kept its permit and wake
+   flags in `std` atomics that loom cannot see, so races between `notified()`
+   and the notify methods were not explored; here all state is behind a
+   modeled lock. `notify()` is now `notify_one()`, and the blocking `wait()`
+   shares the same permit and waiters.
+ - `lock_api` feature: mock `RawMutex` / `RawRwLock` and the `Mutex`,
+   `RwLock` and guard aliases built on them, for code using `lock_api` or
+   `parking_lot` (upstream PR 161, ported; uses `std::sync::OnceLock` rather
+   than a `once_cell` dependency).
+ - `loom::boxed::Box`, a leak-tracked `Box` (upstream PR 141, ported). Fixes
+   the gaps its author listed: zero-sized values, drop-check marker, `Send` /
+   `Sync` / `Unpin` for unsized contents. `Box::into_inner` replaces `*boxed`.
+ - `model::Builder::check_with_input`: run one execution whose scheduling,
+   atomic read and spurious wakeup choices come from a byte string, for
+   driving loom from a fuzzer or replaying an execution (upstream PR 427).
+ - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
+   all threads, including the main one (upstream PR 412).
+ - `thread::JoinHandle::is_finished` (upstream PR 411, fixed: see below).
+ - `LocalKey` convenience methods: `set` / `get` / `take` / `replace` for
+   `Cell`, and `with_borrow` / `with_borrow_mut` / `set` / `take` / `replace`
+   for `RefCell` (upstream PR 430, extended to `std::cell::Cell` and
+   `RefCell`; the proposal only covered `loom::cell::Cell`).
+ - `Arc::into_inner` (upstream PR 354).
+ - `Condvar::wait_while` (upstream PR 167).
+ - `UnsafeCell::as_mut`, a safe tracked `&mut` access (upstream PR 379).
+ - `AtomicPtr::fetch_ptr_add`, `fetch_ptr_sub`, `fetch_byte_add`,
+   `fetch_byte_sub`, `fetch_and`, `fetch_or`, `fetch_xor` (upstream PR 405,
+   reimplemented without the Rust 1.75 / 1.84 pointer methods so the MSRV does
+   not move).
+
+### Fixed
+
+ - Atomics: a plain store could land between the read and the write of a
+   concurrent `swap` / `fetch_*` / successful `compare_exchange`, producing
+   outcomes no real execution has, typically spurious failures of try-lock
+   flags (upstream PR 391). The two models from upstream PR 121, which failed
+   before, are now part of the test suite and pass.
+ - `Thread::unpark` on a thread blocked in `join` aborted the model with
+   `assertion failed: state.notified`. `unpark` now has std's token semantics
+   (upstream PR 418). Additional fix here: a `Condvar::wait` that returns by
+   consuming a stale token no longer stays queued, where it would swallow a
+   later `notify_one` (a false deadlock).
+ - `Mutex::try_lock`, `RwLock::try_read` and `RwLock::try_write` could cause
+   false deadlock reports, and a racing `try_lock` was never observed to fail
+   (upstream PR 383, reworked). The proposal skipped the branch point when the
+   lock was held, which would have stopped loom from exploring the try
+   operation; instead, threads about to *try* are no longer treated as
+   waiters. This also applies to `future::AtomicWaker`, which uses a try-lock.
+ - `RwLock`: a thread holding two read guards released the lock when the first
+   was dropped, and panicked on the second (upstream PR 428).
+ - Thread locals are dropped before lazy statics, and also when a thread
+   panics; a deadlock no longer panics twice (upstream PR 297).
+ - A panic no longer turns into an abort when a spawned-but-not-started thread
+   owns loom objects (upstream PR 304). The crash scenario from upstream PR 47
+   (an atomic used in a destructor after a panic) is now a passing test.
+ - `future::block_on`: wakers for the same task could fail `Waker::will_wake`
+   because the vtable was not a single static (upstream PR 421).
+ - `JoinHandle::is_finished` as proposed read the result without a branch
+   point, so loom never explored the "already finished" outcome. It is now a
+   modeled operation, with a test that both outcomes are seen.
+ - `LocalKey::<Cell<T>>::set` as proposed panicked ("RefCell already
+   borrowed") on the first `set` of a fresh key.
+ - Found while porting, not from an upstream PR:
+   - Reporting a leaked raw allocation (`loom::alloc::alloc`, and so a leaked
+     `Box`) aborted the process instead of panicking with "Allocation leaked".
+   - Dropping a loom `Arc` (or any other object whose drop is a loom
+     operation) while a deadlock panic unwinds aborted the process, hiding the
+     deadlock report.
+
+### Changed
+
+ - Loom objects used in an execution other than the one they were created in
+   now panic with a message saying so, instead of an out-of-bounds or internal
+   error, or silently touching an unrelated object (upstream PR 292, ported).
+ - Dropping or consuming an `UnsafeCell` while a pointer obtained from it is
+   still alive is now a panic (upstream PR 351, reworked). The proposal put a
+   `Drop` impl on `UnsafeCell<T>`, which makes the drop checker stricter than
+   for `std::cell::UnsafeCell`, required ignoring an existing test, and
+   reported false races for cells owned by a `std::sync::Arc`. The check here
+   lives on the cell's non-generic runtime state and only looks at live
+   pointers, so none of that applies.
+ - `Builder::check` installs the `LOOM_LOG` subscriber (upstream PR 413), but
+   only when the caller has no tracing subscriber of their own; previously
+   `loom::model()` always replaced it.
+ - Causality violation panics list the accesses involved even when
+   `LOOM_LOCATION` is not set, with a hint to set it (upstream PR 279).
+ - Many `trace!` events include the source location (upstream PRs 414 and
+   403, which were the same change for atomics).
+ - Atomics record their creation location, so a race with the creation is
+   reported with one (upstream PR 123).
+ - The scheduler asserts that the thread it picked is runnable, so a
+   non-deterministic model fails with a clear message (upstream PR 305).
+ - `tracing-subscriber` 0.3.20 for RUSTSEC-2025-0055 (upstream PR 390). This
+   needed `tracing` 0.1.41 as well, and the CI job for minimal versions now
+   uses `-Z direct-minimal-versions`: with transitive minimal versions,
+   `sharded-slab` picks a `lazy_static` it cannot compile against.
+
+### Documented
+
+ - Mock `lazy_static` values, and loom objects generally, do not outlive the
+   execution they were created in (upstream PR 410, rewritten following the
+   review comments: a caveat rather than a `# Safety` section on a safe
+   function, plus the general rule in the crate docs).
+ - `thread::Builder::stack_size` and the new `Builder::stack_size` are in
+   machine words, not bytes, because the value goes straight to the
+   `generator` crate. The docs said bytes. Behavior is unchanged.
+
+### Not merged
+
+ - Upstream PR 184 (tracing to debug non-deterministic tests): written in 2020
+   against a very different code base, touches 29 files and conflicts
+   throughout. Not ported.
+ - Upstream PR 12 (arena allocation for `VersionVec`): a work-in-progress
+   against code that no longer exists; its author measured no speedup.
+ - Upstream PR 127 (deduplicate `RwLock` code): the functions it merged have
+   since diverged, so there is nothing left to deduplicate that way.
+ - Upstream PR 92 (remove `init_threads`): already done upstream.
+ - Upstream PR 382 (Twitter badge in the README): not relevant to this fork.
+
+### Known limitations
+
+ - Behavior changes that can make an existing model fail where it passed:
+   `try_lock` can now fail under contention (it could not before, which was
+   wrong); an unpark token is no longer lost when the target blocks on
+   something else first; `UnsafeCell` drop and cross-execution reuse checks.
+ - The `block_on` waker test documents the `will_wake` contract but cannot
+   fail on the old code in practice: the old vtable was only duplicated under
+   particular inlining.
+ - The ignored tests are still ignored and still fail: `load_buffering`,
+   `relaxed`, `test_seq_cst` and `compare_and_swap_reads_old_values`. The
+   atomics fix above does not address them.
+ - `Box`: zero-sized values are not leak tracked, and unsized boxes can only
+   be made with `Box::from_raw`.
+ - `lock_api` locks, like every loom object, cannot be kept in a `static`
+   across executions.
+ - `Notify::wait` is still limited to one blocked thread at a time.
+ - Scoped threads: as elsewhere in loom, a panicking thread fails the model
+   rather than being reported through `join`.
+ - `check_with_input`: when the input runs out the first outcome is chosen,
+   which can starve a thread and hit `max_branches` on a correct model. The
+   author asked upstream whether a different fallback is wanted; unanswered.
+
 # 0.7.3 (November 7, 2026)
 
 This release bumps the MSRV to 1.73. (#364)
