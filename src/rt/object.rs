@@ -15,7 +15,17 @@ use serde::{Deserialize, Serialize};
 pub(super) struct Store<T = Entry> {
     /// Stored state for all objects.
     entries: Vec<T>,
+
+    /// Identifies this store, and this generation of its contents: it changes
+    /// whenever the store is cleared. References remember the id of the store
+    /// they were created by, which is how a reference that outlived its
+    /// execution is told apart from a valid one.
+    id: StoreId,
 }
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
+pub(super) struct StoreId(usize);
 
 pub(super) trait Object: Sized {
     type Entry;
@@ -39,6 +49,9 @@ pub(super) trait Object: Sized {
 pub(super) struct Ref<T = ()> {
     /// Index in the store
     index: usize,
+
+    /// The store (generation) this reference belongs to.
+    store_id: StoreId,
 
     _p: PhantomData<T>,
 }
@@ -152,7 +165,12 @@ impl<T> Store<T> {
     pub(super) fn with_capacity(capacity: usize) -> Store<T> {
         Store {
             entries: Vec::with_capacity(capacity),
+            id: StoreId::new(),
         }
+    }
+
+    pub(super) fn id(&self) -> StoreId {
+        self.id
     }
 
     pub(super) fn len(&self) -> usize {
@@ -177,6 +195,7 @@ impl<T> Store<T> {
 
         Ref {
             index,
+            store_id: self.id,
             _p: PhantomData,
         }
     }
@@ -188,18 +207,22 @@ impl<T> Store<T> {
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.id = StoreId::new();
     }
 
     pub(super) fn iter_ref<O>(&self) -> impl DoubleEndedIterator<Item = Ref<O>> + '_
     where
         O: Object<Entry = T>,
     {
+        let store_id = self.id;
+
         self.entries
             .iter()
             .enumerate()
             .filter(|(_, e)| O::get_ref(e).is_some())
-            .map(|(index, _)| Ref {
+            .map(move |(index, _)| Ref {
                 index,
+                store_id,
                 _p: PhantomData,
             })
     }
@@ -269,6 +292,7 @@ impl<T> Ref<T> {
     pub(super) fn erase(self) -> Ref<()> {
         Ref {
             index: self.index,
+            store_id: self.store_id,
             _p: PhantomData,
         }
     }
@@ -278,9 +302,36 @@ impl<T> Ref<T> {
     }
 }
 
+impl StoreId {
+    fn new() -> StoreId {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // The number picked here is arbitrary. It is mostly to avoid collision
+        // with "zero" to aid with debugging.
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(41_123_456);
+
+        StoreId(NEXT_ID.fetch_add(1, Relaxed))
+    }
+}
+
 impl<T: Object> Ref<T> {
+    /// Panics if the reference was not created by (the current generation of)
+    /// `store`.
+    #[track_caller]
+    fn assert_store(self, store: &Store<T::Entry>) {
+        assert!(
+            self.store_id == store.id,
+            "Tried to access a loom object that does not belong to the current execution. \
+             Loom objects must not be reused across executions of a model: is one being \
+             kept in a `static`, a `std::thread_local!`, or otherwise outside the closure \
+             passed to `loom::model`?"
+        );
+    }
+
     /// Get a reference to the object associated with this reference from the store
     pub(super) fn get(self, store: &Store<T::Entry>) -> &T {
+        self.assert_store(store);
         T::get_ref(&store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }
@@ -289,12 +340,17 @@ impl<T: Object> Ref<T> {
     /// object of this type, e.g. because it outlived the execution it was
     /// created in.
     pub(super) fn try_get(self, store: &Store<T::Entry>) -> Option<&T> {
+        if self.store_id != store.id {
+            return None;
+        }
+
         store.entries.get(self.index).and_then(T::get_ref)
     }
 
     /// Get a mutable reference to the object associated with this reference
     /// from the store
     pub(super) fn get_mut(self, store: &mut Store<T::Entry>) -> &mut T {
+        self.assert_store(store);
         T::get_mut(&mut store.entries[self.index])
             .expect("[loom internal bug] unexpected object stored at reference")
     }
@@ -302,9 +358,10 @@ impl<T: Object> Ref<T> {
 
 impl Ref {
     /// Convert a store index `usize` into a ref
-    pub(super) fn from_usize(index: usize) -> Ref {
+    pub(super) fn from_usize(index: usize, store_id: StoreId) -> Ref {
         Ref {
             index,
+            store_id,
             _p: PhantomData,
         }
     }
@@ -315,6 +372,7 @@ impl Ref {
     {
         T::get_ref(&store.entries[self.index]).map(|_| Ref {
             index: self.index,
+            store_id: self.store_id,
             _p: PhantomData,
         })
     }
@@ -324,6 +382,7 @@ impl<T> Clone for Ref<T> {
     fn clone(&self) -> Ref<T> {
         Ref {
             index: self.index,
+            store_id: self.store_id,
             _p: PhantomData,
         }
     }
@@ -394,6 +453,8 @@ impl<T: Object<Entry = Entry>> Ref<T> {
     }
 
     fn set_action(self, execution: &mut Execution, action: Action, location: Location) {
+        self.assert_store(&execution.objects);
+
         assert!(
             T::get_ref(&execution.objects.entries[self.index]).is_some(),
             "failed to get object for ref {:?}",

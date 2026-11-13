@@ -228,7 +228,7 @@ impl Path {
     pub(super) fn branch_load(&mut self) -> usize {
         assert!(!self.is_traversed(), "[loom internal bug]");
 
-        let load = object::Ref::from_usize(self.pos)
+        let load = object::Ref::from_usize(self.pos, self.branches.id())
             .downcast::<Load>(&self.branches)
             .expect("Reached unexpected exploration state. Is the model fully deterministic?")
             .get(&self.branches);
@@ -251,7 +251,7 @@ impl Path {
             });
         }
 
-        let spurious = object::Ref::from_usize(self.pos)
+        let spurious = object::Ref::from_usize(self.pos, self.branches.id())
             .downcast::<Spurious>(&self.branches)
             .expect("Reached unexpected exploration state. Is the model fully deterministic?")
             .get(&self.branches)
@@ -350,7 +350,7 @@ impl Path {
             }
         }
 
-        let schedule = object::Ref::from_usize(self.pos)
+        let schedule = object::Ref::from_usize(self.pos, self.branches.id())
             .downcast::<Schedule>(&self.branches)
             .expect("Reached unexpected exploration state. Is the model fully deterministic?")
             .get(&self.branches);
@@ -399,8 +399,8 @@ impl Path {
             return;
         }
         let schedule = loop {
-            if let Some(schedule_ref) =
-                object::Ref::from_usize(point).downcast::<Schedule>(&self.branches)
+            if let Some(schedule_ref) = object::Ref::from_usize(point, self.branches.id())
+                .downcast::<Schedule>(&self.branches)
             {
                 let schedule = schedule_ref.get_mut(&mut self.branches);
 
@@ -469,7 +469,7 @@ impl Path {
         // This is depth-first tree traversal.
         //
         for last in (0..self.branches.len()).rev() {
-            let last = object::Ref::from_usize(last);
+            let last = object::Ref::from_usize(last, self.branches.id());
 
             // Remove all objects that were created **after** this branch
             self.branches.truncate(last);
