@@ -55,6 +55,17 @@ impl Condvar {
         // Disable the current thread
         rt::park(location);
 
+        // `park` may return without a notification, e.g. when it consumes an
+        // unpark token banked by an earlier `Thread::unpark`. Such a thread is
+        // no longer waiting: if it stayed queued, a later `notify_one` would
+        // be spent on it instead of on a thread that is actually waiting.
+        rt::execution(|execution| {
+            let thread = execution.threads.active_id();
+            let state = self.state.get_mut(&mut execution.objects);
+
+            state.waiters.retain(|waiter| *waiter != thread);
+        });
+
         // Acquire the lock again
         mutex.acquire_lock(location);
     }

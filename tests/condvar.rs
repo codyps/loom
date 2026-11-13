@@ -106,3 +106,43 @@ impl Inc {
         self.condvar.notify_all();
     }
 }
+
+/// A `wait` that returns because of a stale unpark token (a spurious wakeup
+/// as far as the condvar is concerned) must not leave the thread queued as a
+/// waiter: the next `notify_one` has to reach a thread that is really
+/// waiting.
+#[test]
+fn stale_unpark_token_does_not_steal_notification() {
+    use loom::sync::atomic::AtomicBool;
+
+    loom::model(|| {
+        let state = Arc::new((Mutex::new(()), Condvar::new(), AtomicBool::new(false)));
+
+        // Bank an unpark token for the main thread.
+        thread::current().unpark();
+
+        let waiter = {
+            let state = state.clone();
+            thread::spawn(move || {
+                let (mutex, condvar, ready) = &*state;
+                let mut guard = mutex.lock().unwrap();
+                while !ready.load(SeqCst) {
+                    guard = condvar.wait(guard).unwrap();
+                }
+            })
+        };
+
+        let (mutex, condvar, ready) = &*state;
+
+        // Returns immediately by consuming the token.
+        drop(condvar.wait(mutex.lock().unwrap()).unwrap());
+
+        {
+            let _guard = mutex.lock().unwrap();
+            ready.store(true, SeqCst);
+        }
+        condvar.notify_one();
+
+        waiter.join().unwrap();
+    });
+}
