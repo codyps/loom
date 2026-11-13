@@ -102,10 +102,9 @@ fn acq_rel() {
 
 /// https://en.cppreference.com/w/cpp/atomic/memory_order#Sequentially-consistent_ordering
 ///
-/// This test currently fails because loom executes a permutation that isn't legal under `SeqCst`
-/// according to the spec in which `z == 0`.
+/// Loom must not execute a permutation in which `z == 0`, which isn't legal under `SeqCst`
+/// according to the spec.
 #[test]
-#[ignore]
 fn test_seq_cst() {
     use loom::sync::atomic::AtomicBool;
     use loom::thread;

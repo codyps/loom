@@ -122,6 +122,11 @@ pub(super) struct State {
     /// is then never explored.
     last_load_access: [Option<Access>; MAX_THREADS],
 
+    /// Last `SeqCst` load. `SeqCst` loads are ordered among themselves (a
+    /// later one cannot return an older value than an earlier one did), so
+    /// unlike other loads they are dependent with each other.
+    last_sc_load_access: Option<Access>,
+
     /// Last time the atomic was accessed for a store or rmw operation. Every
     /// access before it is ordered before it, so nothing older needs to be
     /// remembered.
@@ -132,6 +137,21 @@ pub(super) struct State {
     /// This is used for applying the RMW atomicity constraint to other stores
     /// (so they don't squeeze in between the read and write part of the RMW).
     last_successful_rmw: VersionVec,
+
+    /// How far the `SeqCst` order has got on this atomic, as a bit set of
+    /// slots in `stores`: the stores written by `SeqCst` stores, returned by
+    /// `SeqCst` loads, or known to a thread when it executed a `SeqCst`
+    /// fence. `SeqCst` operations execute in the order they have in the
+    /// `SeqCst` total order, so every later `SeqCst` operation on this atomic
+    /// has to be consistent with these stores coming first:
+    ///
+    /// - a `SeqCst` store is ordered after all of them, and
+    /// - a `SeqCst` load does not return a store ordered before any of them.
+    sc_floor: u8,
+
+    /// `sc_floor` as of each thread's last `SeqCst` fence. Stores made by the
+    /// thread after the fence, whatever their ordering, come after these.
+    fence_floor: [u8; MAX_THREADS],
 
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
@@ -151,6 +171,53 @@ pub(super) enum Action {
 
     /// Atomic read-modify-write
     Rmw,
+
+    /// Atomic load with `SeqCst` ordering
+    LoadSeqCst,
+
+    /// Atomic store with `SeqCst` ordering
+    StoreSeqCst,
+
+    /// Atomic read-modify-write with a `SeqCst` ordering
+    RmwSeqCst,
+}
+
+impl Action {
+    fn load(ordering: Ordering) -> Action {
+        if is_seq_cst(ordering) {
+            Action::LoadSeqCst
+        } else {
+            Action::Load
+        }
+    }
+
+    fn store(ordering: Ordering) -> Action {
+        if is_seq_cst(ordering) {
+            Action::StoreSeqCst
+        } else {
+            Action::Store
+        }
+    }
+
+    fn rmw(success: Ordering, failure: Ordering) -> Action {
+        if is_seq_cst(success) || is_seq_cst(failure) {
+            Action::RmwSeqCst
+        } else {
+            Action::Rmw
+        }
+    }
+
+    fn is_load(self) -> bool {
+        matches!(self, Action::Load | Action::LoadSeqCst)
+    }
+
+    /// Returns `true` if the access takes part in the `SeqCst` order.
+    pub(super) fn is_seq_cst(self) -> bool {
+        matches!(
+            self,
+            Action::LoadSeqCst | Action::StoreSeqCst | Action::RmwSeqCst
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -173,6 +240,26 @@ struct Store {
 
     /// True when the store was done with `SeqCst` ordering
     seq_cst: bool,
+
+    /// Stores (as a bit set of slots in `State::stores`) that are ordered
+    /// before this one in the modification order because of the `SeqCst`
+    /// order, in addition to what `modification_order` says.
+    ///
+    /// A `SeqCst` load that returns this store places it after everything
+    /// the `SeqCst` order has already been through. The store exists by
+    /// then, with other stores possibly ordered after it, so that cannot be
+    /// expressed by changing its version vector.
+    mo_preds: u8,
+
+    /// `true` once the store is behind the `SeqCst` order: some store that
+    /// is part of that order comes after it in the modification order. A
+    /// `SeqCst` load can no longer return it.
+    sc_stale: bool,
+
+    /// The threads (as a bit set) for which the store was behind the `SeqCst`
+    /// order when they last executed a `SeqCst` fence. None of their loads
+    /// can return it anymore.
+    fence_stale: u8,
 }
 
 #[derive(Debug)]
@@ -187,27 +274,66 @@ struct FirstSeen([u16; MAX_THREADS]);
 /// per execution, created by the first `SeqCst` fence.
 #[derive(Debug)]
 pub(super) struct SeqCstFences {
+    /// The last `SeqCst` fence.
     last_access: Option<Access>,
+
+    /// The last `SeqCst` load, store or rmw of each thread, on any atomic.
+    /// A fence is ordered with respect to those as well: it sees the `SeqCst`
+    /// stores before it, and what its thread knows constrains the `SeqCst`
+    /// loads and stores after it.
+    last_sc_access: [Option<Access>; MAX_THREADS],
 }
 
 impl SeqCstFences {
-    pub(super) fn last_dependent_access(&self) -> Option<&Access> {
+    /// Returns the object for the current execution, creating it if this is
+    /// the first operation that takes part in the `SeqCst` order.
+    fn get(execution: &mut Execution) -> object::Ref<SeqCstFences> {
+        execution.objects.seq_cst_fences().unwrap_or_else(|| {
+            let fences = execution.objects.insert(SeqCstFences {
+                last_access: None,
+                last_sc_access: Default::default(),
+            });
+
+            execution.objects.set_seq_cst_fences(fences);
+            fences
+        })
+    }
+
+    /// The previous accesses a fence is dependent with.
+    pub(super) fn dependent_accesses(&self) -> impl Iterator<Item = &Access> {
+        self.last_access
+            .iter()
+            .chain(self.last_sc_access.iter().flatten())
+    }
+
+    /// The last fence, which `SeqCst` accesses are dependent with.
+    pub(super) fn last_fence_access(&self) -> Option<&Access> {
         self.last_access.as_ref()
     }
 
+    /// Records a fence.
     pub(super) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
         Access::set_or_create(&mut self.last_access, path_id, version);
+
+        // The fence is ordered after all of these.
+        self.last_sc_access = Default::default();
+    }
+
+    /// Records a `SeqCst` access to some atomic.
+    pub(super) fn set_last_sc_access(
+        &mut self,
+        thread: usize,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        Access::set_or_create(&mut self.last_sc_access[thread], path_id, version);
     }
 }
 
 /// Implements atomic fence behavior
 pub(crate) fn fence(ordering: Ordering, location: Location) {
     if let Ordering::SeqCst = ordering {
-        let fences = rt::execution(|execution| {
-            let existing = execution.objects.iter_ref::<SeqCstFences>().next();
-
-            existing.unwrap_or_else(|| execution.objects.insert(SeqCstFences { last_access: None }))
-        });
+        let fences = rt::execution(SeqCstFences::get);
 
         fences.branch_opaque(location);
     }
@@ -253,6 +379,11 @@ fn fence_acqrel(execution: &mut Execution) {
 fn fence_seqcst(execution: &mut Execution) {
     fence_acqrel(execution);
     execution.threads.seq_cst_fence();
+
+    // Order the fence with the `SeqCst` loads and stores.
+    for state in execution.objects.iter_mut::<State>() {
+        state.sc_fence(&execution.threads);
+    }
 }
 
 impl<T: Numeric> Atomic<T> {
@@ -273,7 +404,7 @@ impl<T: Numeric> Atomic<T> {
 
     /// Loads a value from the atomic cell.
     pub(crate) fn load(&self, location: Location, ordering: Ordering) -> T {
-        self.branch(Action::Load, location);
+        self.branch(Action::load(ordering), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -318,7 +449,7 @@ impl<T: Numeric> Atomic<T> {
 
     /// Stores a value into the atomic cell.
     pub(crate) fn store(&self, location: Location, val: T, ordering: Ordering) {
-        self.branch(Action::Store, location);
+        self.branch(Action::store(ordering), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -351,7 +482,7 @@ impl<T: Numeric> Atomic<T> {
     where
         F: FnOnce(T) -> Result<T, E>,
     {
-        self.branch(Action::Rmw, location);
+        self.branch(Action::rmw(success, failure), location);
 
         super::synchronize(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -432,6 +563,11 @@ impl<T: Numeric> Atomic<T> {
     }
 
     fn branch(&self, action: Action, location: Location) {
+        if action.is_seq_cst() {
+            // The access is ordered with respect to `SeqCst` fences.
+            rt::execution(SeqCstFences::get);
+        }
+
         let r = self.state;
         r.branch_action(action, location);
         assert!(
@@ -459,7 +595,10 @@ impl State {
             unsync_mut_locations: LocationSet::new(),
             is_mutating: false,
             last_load_access: Default::default(),
+            last_sc_load_access: None,
             last_non_load_access: None,
+            sc_floor: 0,
+            fence_floor: [0; MAX_THREADS],
             last_successful_rmw: VersionVec::new(),
             stores: Default::default(),
             cnt: 0,
@@ -497,6 +636,10 @@ impl State {
 
         // Apply coherence rules
         self.apply_load_coherence(threads, index);
+
+        if is_seq_cst(ordering) {
+            self.sc_load(index);
+        }
 
         let store = &mut self.stores[index];
 
@@ -537,6 +680,24 @@ impl State {
         // RMW Atomicity.
         modification_order.join(&self.last_successful_rmw);
 
+        // The slot is about to be reused; forget what was known about the
+        // store it held.
+        self.forget_slot(index);
+
+        // A `SeqCst` store comes after everything the `SeqCst` order has been
+        // through. Any store comes after what that order had been through
+        // when the thread last executed a `SeqCst` fence.
+        let mut floor = self.fence_floor[threads.active_id().as_usize()];
+
+        if is_seq_cst(ordering) {
+            floor |= self.sc_floor;
+        }
+
+        for i in slots(floor) {
+            let mo = self.stores[i].modification_order;
+            modification_order.join(&mo);
+        }
+
         sync.sync_store(threads, ordering);
 
         let mut first_seen = FirstSeen::new();
@@ -550,7 +711,125 @@ impl State {
             sync,
             first_seen,
             seq_cst: is_seq_cst(ordering),
+            mo_preds: 0,
+            sc_stale: false,
+            fence_stale: 0,
         };
+
+        if is_seq_cst(ordering) {
+            self.sc_advance(index);
+        }
+    }
+
+    /// The modification order as far as it is known: bit `i` of entry `j` is
+    /// set if the store in slot `i` is ordered before the one in slot `j`.
+    fn mo_before(&self) -> [u8; MAX_ATOMIC_HISTORY] {
+        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let mut before = [0u8; MAX_ATOMIC_HISTORY];
+
+        for j in 0..cnt {
+            before[j] = self.stores[j].mo_preds & !(1 << j);
+
+            for i in 0..cnt {
+                if i != j && self.stores[i].modification_order < self.stores[j].modification_order {
+                    before[j] |= 1 << i;
+                }
+            }
+        }
+
+        // Transitive closure
+        for k in 0..cnt {
+            for j in 0..cnt {
+                if before[j] & (1 << k) != 0 {
+                    before[j] |= before[k];
+                }
+            }
+        }
+
+        before
+    }
+
+    /// Returns `true` if a `SeqCst` load can no longer return the store in
+    /// `slot`.
+    fn is_sc_stale(&self, slot: usize, before: &[u8; MAX_ATOMIC_HISTORY]) -> bool {
+        self.stores[slot].sc_stale || slots(self.sc_floor).any(|f| before[f] & (1 << slot) != 0)
+    }
+
+    /// The store in `slot` becomes part of the `SeqCst` order.
+    fn sc_advance(&mut self, slot: usize) {
+        self.sc_floor |= 1 << slot;
+
+        let before = self.mo_before();
+
+        for i in slots(before[slot]) {
+            self.stores[i].sc_stale = true;
+        }
+    }
+
+    /// A `SeqCst` load returns the store in `slot`.
+    fn sc_load(&mut self, slot: usize) {
+        let before = self.mo_before();
+
+        debug_assert!(
+            !self.is_sc_stale(slot, &before),
+            "[loom internal bug] SeqCst load of a stale store"
+        );
+
+        // The store is not ordered before anything the `SeqCst` order has
+        // been through (it would be stale), so it comes after all of it.
+        self.stores[slot].mo_preds |= self.sc_floor & !(1 << slot) & !before[slot];
+
+        self.sc_advance(slot);
+    }
+
+    /// A `SeqCst` fence executed by the current thread.
+    fn sc_fence(&mut self, threads: &thread::Set) {
+        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let thread = threads.active_id().as_usize();
+
+        // What the thread knows about is, from here on, behind every later
+        // `SeqCst` operation.
+        for i in 0..cnt {
+            let store = &self.stores[i];
+
+            if store.happens_before <= threads.active().causality
+                || store.first_seen.is_seen_by_current(threads)
+            {
+                self.sc_floor |= 1 << i;
+            }
+        }
+
+        let before = self.mo_before();
+
+        for f in slots(self.sc_floor) {
+            for i in slots(before[f]) {
+                self.stores[i].sc_stale = true;
+            }
+        }
+
+        // And the thread itself is, from here on, past everything the
+        // `SeqCst` order has been through.
+        for store in &mut self.stores[..cnt] {
+            if store.sc_stale {
+                store.fence_stale |= 1 << thread;
+            }
+        }
+
+        self.fence_floor[thread] = self.sc_floor;
+    }
+
+    fn forget_slot(&mut self, slot: usize) {
+        let mask = !(1u8 << slot);
+
+        self.sc_floor &= mask;
+
+        for floor in &mut self.fence_floor {
+            *floor &= mask;
+        }
+
+        for store in &mut self.stores {
+            store.mo_preds &= mask;
+        }
     }
 
     fn rmw<E>(
@@ -577,6 +856,10 @@ impl State {
 
         match f(prev) {
             Ok(next) => {
+                if is_seq_cst(success) {
+                    self.sc_load(index);
+                }
+
                 // Perform load synchronization using the `success` ordering.
                 //
                 // This has to come before the store is validated: the store
@@ -603,6 +886,10 @@ impl State {
                 Ok(prev)
             }
             Err(e) => {
+                if is_seq_cst(failure) {
+                    self.sc_load(index);
+                }
+
                 self.stores[index].sync.sync_load(threads, failure);
                 Err(e)
             }
@@ -795,7 +1082,21 @@ impl State {
         //
         // Add all stores **unless** a newer store has already been seen by the
         // current thread's causality.
+        let before = self.mo_before();
+        let thread = threads.active_id().as_usize();
+
         'outer: for (i, store_i) in self.stores.iter().take(cnt).enumerate() {
+            if store_i.fence_stale & (1 << thread) != 0 {
+                // The thread has executed a `SeqCst` fence since this store
+                // fell behind the `SeqCst` order.
+                continue 'outer;
+            }
+
+            if is_seq_cst(ordering) && self.is_sc_stale(i, &before) {
+                // A `SeqCst` load cannot go back behind the `SeqCst` order.
+                continue 'outer;
+            }
+
             for (j, store_j) in self.stores.iter().take(cnt).enumerate() {
                 if i == j {
                     continue;
@@ -807,7 +1108,7 @@ impl State {
                 // TODO: this sometimes fails
                 assert_ne!(mo_i, mo_j);
 
-                if mo_i < mo_j {
+                if before[j] & (1 << i) != 0 {
                     if store_j.first_seen.is_seen_by_current(threads) {
                         // Store `j` is newer, so don't store the current one.
                         continue 'outer;
@@ -840,6 +1141,8 @@ impl State {
 
         // Unlike `match_load_to_stores`, rmw operations only load "newest"
         // stores, in terms of modification order.
+        let before = self.mo_before();
+
         'outer: for (i, store_i) in self.stores.iter().take(cnt).enumerate() {
             for (j, store_j) in self.stores.iter().take(cnt).enumerate() {
                 if i == j {
@@ -851,7 +1154,7 @@ impl State {
 
                 assert_ne!(mo_i, mo_j);
 
-                if mo_i < mo_j {
+                if before[j] & (1 << i) != 0 {
                     // There is a newer store.
                     continue 'outer;
                 }
@@ -877,15 +1180,18 @@ impl State {
     /// dependent with.
     pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
         // Everything is dependent with the last store / rmw. Only stores and
-        // rmws are dependent with loads.
-        let loads = match action {
-            Action::Load => &[][..],
-            _ => &self.last_load_access[..],
+        // rmws are dependent with loads, except that `SeqCst` loads are
+        // ordered among themselves.
+        let (loads, sc_load) = match action {
+            Action::Load => (&[][..], None),
+            Action::LoadSeqCst => (&[][..], self.last_sc_load_access.as_ref()),
+            _ => (&self.last_load_access[..], None),
         };
 
         self.last_non_load_access
             .iter()
             .chain(loads.iter().flatten())
+            .chain(sc_load)
     }
 
     /// Records an access by `thread`.
@@ -896,18 +1202,25 @@ impl State {
         path_id: usize,
         version: &VersionVec,
     ) {
-        match action {
-            Action::Load => {
-                Access::set_or_create(&mut self.last_load_access[thread], path_id, version);
+        if action.is_load() {
+            Access::set_or_create(&mut self.last_load_access[thread], path_id, version);
+
+            if action.is_seq_cst() {
+                Access::set_or_create(&mut self.last_sc_load_access, path_id, version);
             }
-            _ => {
-                // Stores / RMWs. These are ordered after all earlier loads,
-                // which therefore no longer need to be tracked.
-                Access::set_or_create(&mut self.last_non_load_access, path_id, version);
-                self.last_load_access = Default::default();
-            }
+        } else {
+            // Stores / RMWs. These are ordered after all earlier loads,
+            // which therefore no longer need to be tracked.
+            Access::set_or_create(&mut self.last_non_load_access, path_id, version);
+            self.last_load_access = Default::default();
+            self.last_sc_load_access = None;
         }
     }
+}
+
+/// The slots in a bit set of slots.
+fn slots(set: u8) -> impl Iterator<Item = usize> {
+    (0..MAX_ATOMIC_HISTORY).filter(move |slot| set & (1 << slot) != 0)
 }
 
 // ===== impl Store =====
@@ -921,6 +1234,9 @@ impl Default for Store {
             sync: Synchronize::new(),
             first_seen: FirstSeen::new(),
             seq_cst: false,
+            mo_preds: 0,
+            sc_stale: false,
+            fence_stale: 0,
         }
     }
 }

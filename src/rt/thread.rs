@@ -354,29 +354,15 @@ impl Set {
         th.wake(active);
     }
 
-    /// Insert a point of sequential consistency
-    /// TODO
-    /// - Deprecate SeqCst accesses and allow SeqCst fences only. The semantics of SeqCst accesses
-    ///   is complex and difficult to implement correctly. On the other hand, SeqCst fence has
-    ///   well-understood and clear semantics in the absence of SeqCst accesses, and can be used
-    ///   for enforcing the read-after-write (RAW) ordering which is probably what the user want to
-    ///   achieve with SeqCst.
-    /// - Revisit the other uses of this function. They probably don't require sequential
-    ///   consistency. E.g. see https://en.cppreference.com/w/cpp/named_req/Mutex
+    /// Called by synchronization primitives that used to insert a point of
+    /// sequential consistency here.
     ///
-    /// References
-    /// - The "scfix" paper, which proposes a memory model called RC11 that fixes SeqCst
-    ///   semantics. of C11. https://plv.mpi-sws.org/scfix/
-    /// - Some fixes from the "scfix" paper has been incorporated into C/C++20:
-    ///   http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p0668r5.html
-    /// - The "promising semantics" paper, which propose an intuitive semantics of SeqCst fence in
-    ///   the absence of SC accesses. https://sf.snu.ac.kr/promise-concurrency/
-    pub(crate) fn seq_cst(&mut self) {
-        // The previous implementation of sequential consistency was incorrect (though it's correct
-        // for `fence(SeqCst)`-only scenario; use `seq_cst_fence` for `fence(SeqCst)`).
-        // As a quick fix, just disable it. This may fail to model correct code,
-        // but will not silently allow bugs.
-    }
+    /// This does nothing. Treating a `SeqCst` access (or a lock operation) as
+    /// a point at which the thread exchanges everything it knows with a
+    /// global view is far stronger than what `SeqCst` guarantees, and hides
+    /// bugs. `SeqCst` loads and stores are ordered per atomic instead, see
+    /// `rt::atomic`; locks need no more than acquire / release.
+    pub(crate) fn seq_cst(&mut self) {}
 
     pub(crate) fn seq_cst_fence(&mut self) {
         self.threads[self.active.unwrap()]

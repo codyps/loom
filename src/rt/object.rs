@@ -21,6 +21,10 @@ pub(super) struct Store<T = Entry> {
     /// they were created by, which is how a reference that outlived its
     /// execution is told apart from a valid one.
     id: StoreId,
+
+    /// Index of the object tracking the `SeqCst` order, once there is one.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    seq_cst_fences: Option<usize>,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -175,6 +179,7 @@ impl<T> Store<T> {
         Store {
             entries: Vec::with_capacity(capacity),
             id: StoreId::new(),
+            seq_cst_fences: None,
         }
     }
 
@@ -217,6 +222,7 @@ impl<T> Store<T> {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.id = StoreId::new();
+        self.seq_cst_fences = None;
     }
 
     pub(super) fn iter_ref<O>(&self) -> impl DoubleEndedIterator<Item = Ref<O>> + '_
@@ -245,6 +251,25 @@ impl<T> Store<T> {
 }
 
 impl Store {
+    pub(super) fn seq_cst_fences(&self) -> Option<Ref<rt::atomic::SeqCstFences>> {
+        self.seq_cst_fences.map(|index| Ref {
+            index,
+            store_id: self.id,
+            _p: PhantomData,
+        })
+    }
+
+    pub(super) fn set_seq_cst_fences(&mut self, fences: Ref<rt::atomic::SeqCstFences>) {
+        self.seq_cst_fences = Some(fences.index);
+    }
+
+    fn seq_cst_fences_entry(&self) -> Option<&rt::atomic::SeqCstFences> {
+        match self.entries.get(self.seq_cst_fences?) {
+            Some(Entry::SeqCstFences(fences)) => Some(fences),
+            _ => None,
+        }
+    }
+
     /// Calls `f` with every previous access that `operation` is dependent
     /// with and that could still be unordered with respect to it.
     ///
@@ -259,9 +284,24 @@ impl Store {
     ) {
         let last = match &self.entries[operation.obj.index] {
             Entry::Atomic(entry) => {
-                entry
-                    .dependent_accesses(operation.action.into())
-                    .for_each(f);
+                let action: rt::atomic::Action = operation.action.into();
+
+                // A `SeqCst` access is also ordered with `SeqCst` fences.
+                if action.is_seq_cst() {
+                    let fence = self
+                        .seq_cst_fences_entry()
+                        .and_then(|fences| fences.last_fence_access());
+
+                    if let Some(access) = fence {
+                        f(access);
+                    }
+                }
+
+                entry.dependent_accesses(action).for_each(f);
+                return;
+            }
+            Entry::SeqCstFences(entry) => {
+                entry.dependent_accesses().for_each(f);
                 return;
             }
             Entry::Mutex(entry) => {
@@ -285,7 +325,6 @@ impl Store {
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
-            Entry::SeqCstFences(entry) => entry.last_dependent_access(),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
@@ -304,6 +343,19 @@ impl Store {
         path_id: usize,
         dpor_vv: &VersionVec,
     ) {
+        if let Entry::Atomic(_) = &self.entries[operation.obj.index] {
+            let action: rt::atomic::Action = operation.action.into();
+
+            if action.is_seq_cst() {
+                if let Some(Entry::SeqCstFences(fences)) = self
+                    .seq_cst_fences
+                    .and_then(|index| self.entries.get_mut(index))
+                {
+                    fences.set_last_sc_access(thread, path_id, dpor_vv);
+                }
+            }
+        }
+
         match &mut self.entries[operation.obj.index] {
             Entry::Arc(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
             Entry::Atomic(entry) => {

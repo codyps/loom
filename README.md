@@ -68,11 +68,11 @@ RUSTFLAGS="--cfg loom" cargo test --test buggy_concurrent_inc --release
 ## Unsupported features
 Loom currently does not implement the full C11 memory model.
 Here is the (incomplete) list of unsupported features.
-* `SeqCst` accesses (e.g. `load`, `store`, ..):
-  They are regarded as `AcqRel`. That is, they impose weaker
-  synchronization, causing Loom to generate false alarms (not complete). See
-  [#180](https://github.com/tokio-rs/loom/issues/180) for example. On the other
-  hand, `fence(SeqCst)` is supported.
+* `SeqCst` accesses (e.g. `load`, `store`, ..) and fences are ordered as the
+  memory model requires, with one restriction: Loom takes the order in which
+  it executes them as their total order. An execution that is only consistent
+  with a `SeqCst` order that disagrees with every order Loom can execute the
+  program in is not explored. This is the same kind of gap as the next item.
 * Load buffering behavior:
   Loom does not explore some executions that are possible in the C11 memory
   model. That is, there can be a bug in the checked code even if Loom says
