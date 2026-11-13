@@ -145,16 +145,22 @@ impl Execution {
                 None => continue,
             };
 
-            if let Some(access) = self.objects.last_dependent_access(operation) {
+            // Find the most recent dependent access that is not ordered
+            // before this operation: the two race, and the other order has to
+            // be explored as well.
+            let mut point = None;
+
+            self.objects.for_each_dependent_access(operation, |access| {
                 if access.happens_before(&th.dpor_vv) {
                     // The previous access happened before this access, thus
                     // there is no race.
-                    continue;
+                    return;
                 }
 
-                // Get the point to backtrack to
-                let point = access.path_id();
+                point = point.max(Some(access.path_id()));
+            });
 
+            if let Some(point) = point {
                 // Track backtracking point
                 self.path.backtrack(point, th_id);
             }
@@ -246,14 +252,17 @@ impl Execution {
             let threads = &mut self.threads;
             let th_id = threads.active_id();
 
-            if let Some(access) = self.objects.last_dependent_access(operation) {
-                threads.active_mut().dpor_vv.join(access.version());
-            }
+            let mut dpor_vv = threads.active().dpor_vv;
 
-            threads.active_mut().dpor_vv[th_id] += 1;
+            self.objects.for_each_dependent_access(operation, |access| {
+                dpor_vv.join(access.version());
+            });
+
+            dpor_vv[th_id] += 1;
+            threads.active_mut().dpor_vv = dpor_vv;
 
             self.objects
-                .set_last_access(operation, path_id, &threads.active().dpor_vv);
+                .set_last_access(operation, th_id.as_usize(), path_id, &dpor_vv);
         }
 
         // Reactivate yielded threads, but only if the current active thread is

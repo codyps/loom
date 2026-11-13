@@ -236,10 +236,21 @@ impl<T> Store<T> {
 }
 
 impl Store {
-    pub(super) fn last_dependent_access(&self, operation: Operation) -> Option<&Access> {
-        match &self.entries[operation.obj.index] {
+    /// Calls `f` with every previous access that `operation` is dependent
+    /// with and that could still be unordered with respect to it.
+    pub(super) fn for_each_dependent_access(
+        &self,
+        operation: Operation,
+        mut f: impl FnMut(&Access),
+    ) {
+        let last = match &self.entries[operation.obj.index] {
+            Entry::Atomic(entry) => {
+                entry
+                    .dependent_accesses(operation.action.into())
+                    .for_each(f);
+                return;
+            }
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
-            Entry::Atomic(entry) => entry.last_dependent_access(operation.action.into()),
             Entry::Mutex(entry) => entry.last_dependent_access(),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
@@ -249,19 +260,24 @@ impl Store {
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
             ),
+        };
+
+        if let Some(access) = last {
+            f(access);
         }
     }
 
     pub(super) fn set_last_access(
         &mut self,
         operation: Operation,
+        thread: usize,
         path_id: usize,
         dpor_vv: &VersionVec,
     ) {
         match &mut self.entries[operation.obj.index] {
             Entry::Arc(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
             Entry::Atomic(entry) => {
-                entry.set_last_access(operation.action.into(), path_id, dpor_vv)
+                entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
             }
             Entry::Mutex(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
