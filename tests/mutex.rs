@@ -235,3 +235,28 @@ fn park_behind_failed_try_lock_is_reported() {
         waiter.join().unwrap();
     });
 }
+
+/// The error types of the lock API are available next to the locks, as in
+/// `std::sync`.
+#[test]
+fn lock_error_types_are_reexported() {
+    use loom::sync::{LockResult, MutexGuard, PoisonError, TryLockError, TryLockResult};
+
+    fn recover<'a, T>(result: LockResult<MutexGuard<'a, T>>) -> MutexGuard<'a, T> {
+        result.unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn would_block<T>(result: &TryLockResult<T>) -> bool {
+        matches!(result, Err(TryLockError::WouldBlock))
+    }
+
+    loom::model(|| {
+        let lock = Mutex::new(1);
+
+        let guard = recover(lock.lock());
+        assert!(would_block(&lock.try_lock()));
+        drop(guard);
+
+        assert!(!would_block(&lock.try_lock()));
+    });
+}
