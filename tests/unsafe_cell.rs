@@ -352,3 +352,42 @@ fn unsafe_cell_race_lists_accesses_without_locations() {
         th1.join().unwrap();
     });
 }
+
+#[test]
+fn as_mut_is_ergonomical_and_safe() {
+    loom::model(|| {
+        let mut value = UnsafeCell::new(-3i32);
+        let mut mut_ref = value.as_mut();
+        *mut_ref = mut_ref.abs();
+    });
+}
+
+/// `as_mut` is tracked like any other mutable access: it is an error while a
+/// pointer handed out earlier is still alive.
+#[test]
+#[should_panic(expected = "currently reading from cell")]
+fn as_mut_while_reading() {
+    loom::model(|| {
+        let mut value = UnsafeCell::new(1usize);
+        let _reader = value.get();
+        let _ = value.as_mut();
+    });
+}
+
+#[test]
+fn as_mut_sequential_accesses() {
+    loom::model(|| {
+        let mut value = UnsafeCell::new(vec![1usize]);
+
+        value.as_mut().push(2);
+        {
+            let mut vec = value.as_mut();
+            vec.push(3);
+            assert_eq!(vec.len(), 3);
+        }
+
+        // The mutable access ended with the guard.
+        value.with(|ptr| assert_eq!(unsafe { &*ptr }, &[1, 2, 3]));
+        assert_eq!(value.into_inner(), [1, 2, 3]);
+    });
+}
