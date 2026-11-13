@@ -118,6 +118,18 @@
 //! loom = "0.7"
 //! ```
 //!
+//! `loom` is not a cfg that rustc knows about, so it warns about every `cfg(loom)` it sees
+//! (`unexpected_cfgs`). Declare the cfg in the same `Cargo.toml` to tell it that this one is
+//! intended:
+//!
+//! ```toml
+//! [lints.rust]
+//! unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+//! ```
+//!
+//! (Cargo understands this from Rust 1.80 on. A build script printing
+//! `cargo::rustc-check-cfg=cfg(loom)` does the same.)
+//!
 //! One common strategy to use the right types with and without loom is to create a module in your
 //! crate named `sync` or any other name of your choosing. In this module, list out the types that
 //! need to be toggled between loom and `std`:
