@@ -293,6 +293,29 @@
 //! to reason about the interaction between those operations and the other concurrent operations in
 //! your program, and thus certain executions that are possible in the real world won't be modeled.
 //!
+//! The opposite happens as well. When the hidden operation is one that *orders* things, loom does
+//! not know about the ordering, and models executions that are impossible in the real world. A
+//! loom atomic or [`UnsafeCell`](cell::UnsafeCell) that is only ever touched while holding a
+//! `std::sync::Mutex` is an example: for real, the mutex serializes the accesses and makes each
+//! one see the effects of the previous one; loom sees unsynchronized accesses, and will report a
+//! data race, or let a load return a stale value. Such failures are not bugs in the code under
+//! test. The fix is to make the ordering visible, by using the loom version of whatever provides
+//! it. If that lives in a dependency that has no loom support, the dependency has to be replaced
+//! by a stand-in for the test that is built from loom types and synchronizes the same way.
+//!
+//! Time is a special case of this. Loom has no notion of it: [`std::thread::sleep`] does not make
+//! any ordering more or less likely, and timeouts never fire (`Condvar::wait_timeout` waits for a
+//! notification like `wait`). A test must not rely on something happening "soon enough".
+//!
+//! ## Panics in Threads
+//!
+//! A panic on any thread of a model fails the model, right where it happens. This differs from
+//! `std`, where a panic in a spawned thread ends only that thread and is handed to whoever calls
+//! [`JoinHandle::join`](thread::JoinHandle::join). In loom `join` never returns an `Err`. A model
+//! is a test, and a thread nobody joins is the normal case in one, so an assertion failing on
+//! such a thread has to count. It does mean that code which deliberately recovers from a
+//! panicking thread through `join` cannot be modeled.
+//!
 //! ## State That Outlives an Execution
 //!
 //! A model is run many times, once for every execution loom explores. All of loom's bookkeeping

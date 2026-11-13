@@ -286,6 +286,11 @@ impl Builder {
 
 impl<T> JoinHandle<T> {
     /// Waits for the associated thread to finish.
+    ///
+    /// Unlike `std`, this never returns `Err`: a panic on a modeled thread
+    /// fails the whole model immediately instead of being delivered here.
+    /// See the crate documentation on
+    /// [panics in threads](crate#panics-in-threads).
     #[track_caller]
     pub fn join(self) -> std::thread::Result<T> {
         self.notify.wait(location!());
