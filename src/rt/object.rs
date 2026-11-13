@@ -273,10 +273,15 @@ impl Store {
                     .for_each(f);
                 return;
             }
+            Entry::Channel(entry) => {
+                entry
+                    .dependent_accesses(operation.action.into())
+                    .for_each(f);
+                return;
+            }
             Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
-            Entry::Channel(entry) => entry.last_dependent_access(operation.action.into()),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj

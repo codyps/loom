@@ -31,13 +31,19 @@ impl<T> Sender<T> {
     /// not be sent.
     #[track_caller]
     pub fn send(&self, msg: T) -> Result<(), std::sync::mpsc::SendError<T>> {
-        self.object.send(location!());
+        if !self.object.send(location!()) {
+            // The receiver is gone.
+            return Err(std::sync::mpsc::SendError(msg));
+        }
+
         self.sender.send(msg)
     }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Sender<T> {
+        self.object.clone_sender();
+
         Sender {
             object: std::sync::Arc::clone(&self.object),
             sender: self.sender.clone(),
@@ -57,9 +63,12 @@ impl<T> Receiver<T> {
     /// corresponding channel has hung up.
     #[track_caller]
     pub fn recv(&self) -> Result<T, std::sync::mpsc::RecvError> {
-        self.object.recv(location!());
-        self.receiver.recv()
+        match self.object.recv(location!()) {
+            rt::Recv::Message => Ok(self.take()),
+            _ => Err(std::sync::mpsc::RecvError),
+        }
     }
+
     /// Attempts to wait for a value on this receiver, returning an error if the
     /// corresponding channel has hung up, or if it waits more than `timeout`.
     pub fn recv_timeout(
@@ -70,20 +79,37 @@ impl<T> Receiver<T> {
     }
 
     /// Attempts to return a pending value on this receiver without blocking.
+    #[track_caller]
     pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
-        if self.object.is_empty() {
-            return Err(std::sync::mpsc::TryRecvError::Empty);
-        } else {
-            self.recv().map_err(|e| e.into())
+        use std::sync::mpsc::TryRecvError;
+
+        match self.object.try_recv(location!()) {
+            rt::Recv::Message => Ok(self.take()),
+            rt::Recv::Empty => Err(TryRecvError::Empty),
+            rt::Recv::Disconnected => Err(TryRecvError::Disconnected),
         }
+    }
+
+    /// Takes a message the model says is there out of the real channel.
+    fn take(&self) -> T {
+        self.receiver
+            .try_recv()
+            .expect("[loom internal bug] message missing from channel")
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    #[track_caller]
+    fn drop(&mut self) {
+        self.object.drop_sender(location!());
     }
 }
 
 impl<T> Drop for Receiver<T> {
+    #[track_caller]
     fn drop(&mut self) {
-        // Drain the channel.
-        while !self.object.is_empty() {
-            self.recv().unwrap();
-        }
+        // Messages still in the channel are dropped along with the real
+        // receiver.
+        self.object.drop_receiver(location!());
     }
 }

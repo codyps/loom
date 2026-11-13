@@ -12,10 +12,22 @@ pub(super) struct State {
     /// Count of messages in the channel.
     msg_cnt: usize,
 
-    /// Last access that was a send operation.
+    /// Number of `Sender` handles that have not been dropped. Once this
+    /// reaches zero and the channel is empty, receiving fails instead of
+    /// blocking.
+    senders: usize,
+
+    /// `false` once the `Receiver` has been dropped, after which sending
+    /// fails.
+    receiver_alive: bool,
+
+    /// Last access that was a send operation, or the drop of the last sender.
     last_send_access: Option<Access>,
     /// Last access that was a receive operation.
     last_recv_access: Option<Access>,
+    /// Last access by the receiver that observed whether a message was
+    /// there without waiting for one: a `try_recv`, or the receiver's drop.
+    last_observe_access: Option<Access>,
 
     /// A synchronization point for synchronizing the sending threads and the
     /// channel.
@@ -45,8 +57,25 @@ pub(super) struct State {
 pub(super) enum Action {
     /// Send a message
     MsgSend,
-    /// Receive a message
+    /// Receive a message, waiting for one if necessary
     MsgRecv,
+    /// Receive a message if there is one; never waits.
+    MsgTryRecv,
+    /// Drop a sender
+    SenderDrop,
+    /// Drop the receiver
+    ReceiverDrop,
+}
+
+/// What a receive operation found.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Recv {
+    /// A message was taken out of the channel.
+    Message,
+    /// The channel is empty, but there are senders left.
+    Empty,
+    /// The channel is empty and all senders are gone.
+    Disconnected,
 }
 
 impl Channel {
@@ -54,8 +83,11 @@ impl Channel {
         super::execution(|execution| {
             let state = execution.objects.insert(State {
                 msg_cnt: 0,
+                senders: 1,
+                receiver_alive: true,
                 last_send_access: None,
                 last_recv_access: None,
+                last_observe_access: None,
                 sender_synchronize: Synchronize::new(),
                 receiver_synchronize: VecDeque::new(),
                 created: location,
@@ -66,10 +98,17 @@ impl Channel {
         })
     }
 
-    pub(crate) fn send(&self, location: Location) {
+    /// Returns `false` if the receiver is gone, in which case the message is
+    /// not delivered.
+    pub(crate) fn send(&self, location: Location) -> bool {
         self.state.branch_action(Action::MsgSend, location);
         super::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
+
+            if !state.receiver_alive {
+                return false;
+            }
+
             state.msg_cnt = state.msg_cnt.checked_add(1).expect("overflow");
 
             state
@@ -80,40 +119,119 @@ impl Channel {
                 .push_back(state.sender_synchronize);
 
             if state.msg_cnt == 1 {
-                // Unblock all threads that are blocked waiting on this channel
-                let thread_id = execution.threads.active_id();
-                for (id, thread) in execution.threads.iter_mut() {
-                    if id == thread_id {
-                        continue;
-                    }
+                self.unblock_receivers(execution);
+            }
 
-                    let obj = thread
-                        .operation
-                        .as_ref()
-                        .map(|operation| operation.object());
+            true
+        })
+    }
 
-                    if obj == Some(self.state.erase()) {
-                        thread.set_runnable();
-                    }
+    /// Track a new sender handle.
+    pub(crate) fn clone_sender(&self) {
+        super::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            state.senders = state.senders.checked_add(1).expect("overflow");
+        })
+    }
+
+    /// Track a sender handle going away. Dropping the last one disconnects
+    /// the channel, which a receiver can observe.
+    pub(crate) fn drop_sender(&self, location: Location) {
+        // The drop may be running because of a panic, or after the execution
+        // has come to an end, in which case it cannot be a branch point.
+        if can_branch() {
+            self.state.branch_action(Action::SenderDrop, location);
+        }
+
+        super::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+            state.senders = state
+                .senders
+                .checked_sub(1)
+                .expect("[loom internal bug] sender dropped twice");
+
+            if state.senders == 0 && execution.threads.is_active() {
+                // What the receiver learns from the disconnect is ordered
+                // after everything the senders did.
+                state
+                    .sender_synchronize
+                    .sync_store(&mut execution.threads, Release);
+
+                // A receiver waiting for a message is not going to get one;
+                // let it find out.
+                self.unblock_receivers(execution);
+            }
+        })
+    }
+
+    /// Track the receiver going away. Messages still in the channel are
+    /// dropped with it.
+    pub(crate) fn drop_receiver(&self, location: Location) {
+        if can_branch() {
+            self.state.branch_action(Action::ReceiverDrop, location);
+        }
+
+        super::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+
+            state.receiver_alive = false;
+            state.msg_cnt = 0;
+
+            let pending = std::mem::take(&mut state.receiver_synchronize);
+
+            if execution.threads.is_active() {
+                // The messages are destroyed by this thread, which makes it
+                // their receiver as far as causality goes.
+                for mut synchronize in pending {
+                    synchronize.sync_load(&mut execution.threads, Acquire);
                 }
             }
         })
     }
 
-    pub(crate) fn recv(&self, location: Location) {
+    /// Receive a message, blocking the thread until there is one or the
+    /// channel is disconnected.
+    pub(crate) fn recv(&self, location: Location) -> Recv {
         self.state
-            .branch_disable(Action::MsgRecv, self.is_empty(), location);
+            .branch_disable(Action::MsgRecv, self.would_block(), location);
+
+        let recv = self.take_message();
+
+        assert_ne!(recv, Recv::Empty, "expected to be able to read the message");
+
+        recv
+    }
+
+    /// Receive a message if there is one.
+    pub(crate) fn try_recv(&self, location: Location) -> Recv {
+        self.state.branch_action(Action::MsgTryRecv, location);
+        self.take_message()
+    }
+
+    fn take_message(&self) -> Recv {
         super::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
             let thread_id = execution.threads.active_id();
-            state.msg_cnt = state
-                .msg_cnt
-                .checked_sub(1)
-                .expect("expected to be able to read the message");
-            let mut synchronize = state.receiver_synchronize.pop_front().unwrap();
-            dbg!(synchronize.sync_load(&mut execution.threads, Acquire));
+
             if state.msg_cnt == 0 {
-                // Block all **other** threads attempting to read from the channel
+                if state.senders > 0 {
+                    return Recv::Empty;
+                }
+
+                // Learn about the disconnect.
+                let mut synchronize = state.sender_synchronize;
+                synchronize.sync_load(&mut execution.threads, Acquire);
+
+                return Recv::Disconnected;
+            }
+
+            state.msg_cnt -= 1;
+
+            let mut synchronize = state.receiver_synchronize.pop_front().unwrap();
+            synchronize.sync_load(&mut execution.threads, Acquire);
+
+            if state.msg_cnt == 0 && state.senders > 0 {
+                // Block all **other** threads waiting to read from the channel
                 for (id, thread) in execution.threads.iter_mut() {
                     if id == thread_id {
                         continue;
@@ -129,17 +247,45 @@ impl Channel {
                     }
                 }
             }
+
+            Recv::Message
         })
     }
 
-    /// Returns `true` if the channel is currently empty
-    pub(crate) fn is_empty(&self) -> bool {
-        super::execution(|execution| self.get_state(&mut execution.objects).msg_cnt == 0)
+    /// Unblock all threads that are blocked waiting on this channel
+    fn unblock_receivers(&self, execution: &mut super::Execution) {
+        let thread_id = execution.threads.active_id();
+
+        for (id, thread) in execution.threads.iter_mut() {
+            if id == thread_id {
+                continue;
+            }
+
+            let obj = thread
+                .operation
+                .as_ref()
+                .map(|operation| operation.object());
+
+            if obj == Some(self.state.erase()) {
+                thread.set_runnable();
+            }
+        }
     }
 
-    fn get_state<'a>(&self, objects: &'a mut object::Store) -> &'a mut State {
-        self.state.get_mut(objects)
+    /// Returns `true` if a blocking receive has to wait: the channel is
+    /// empty, and a sender could still put something in it.
+    fn would_block(&self) -> bool {
+        super::execution(|execution| {
+            let state = self.state.get(&execution.objects);
+            state.msg_cnt == 0 && state.senders > 0
+        })
     }
+}
+
+/// Returns `true` if the current thread can take a branch point: it is not
+/// unwinding, and the execution has a thread running.
+fn can_branch() -> bool {
+    !std::thread::panicking() && super::execution(|execution| execution.threads.is_active())
 }
 
 impl State {
@@ -162,17 +308,38 @@ impl State {
         }
     }
 
-    pub(super) fn last_dependent_access(&self, action: Action) -> Option<&Access> {
-        match action {
-            Action::MsgSend => self.last_send_access.as_ref(),
-            Action::MsgRecv => self.last_recv_access.as_ref(),
-        }
+    /// Returns the previous accesses that `action` is dependent with.
+    ///
+    /// Sends (and sender drops) are ordered among themselves, as are the
+    /// receiver's operations. A blocking receive never observes a send "not
+    /// having happened yet", it just waits, so the two do not race. A
+    /// `try_recv` does observe that, as does dropping the receiver (which
+    /// destroys what was sent before it and fails what is sent after it), so
+    /// those race with sends, in both directions.
+    pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
+        let (first, second) = match action {
+            Action::MsgSend | Action::SenderDrop => {
+                (&self.last_send_access, &self.last_observe_access)
+            }
+            Action::MsgRecv => (&self.last_recv_access, &None),
+            Action::MsgTryRecv | Action::ReceiverDrop => {
+                (&self.last_recv_access, &self.last_send_access)
+            }
+        };
+
+        first.iter().chain(second.iter())
     }
 
     pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
         match action {
-            Action::MsgSend => Access::set_or_create(&mut self.last_send_access, path_id, version),
+            Action::MsgSend | Action::SenderDrop => {
+                Access::set_or_create(&mut self.last_send_access, path_id, version)
+            }
             Action::MsgRecv => Access::set_or_create(&mut self.last_recv_access, path_id, version),
+            Action::MsgTryRecv | Action::ReceiverDrop => {
+                Access::set_or_create(&mut self.last_recv_access, path_id, version);
+                Access::set_or_create(&mut self.last_observe_access, path_id, version);
+            }
         }
     }
 }
