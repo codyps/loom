@@ -125,6 +125,91 @@ and release, and on the lowest allowed direct dependency versions.
    machine words, not bytes, because the value goes straight to the
    `generator` crate. The docs said bytes. Behavior is unchanged.
 
+### Upstream issues
+
+After the pull requests, the open upstream issues were reviewed ("upstream
+issue N"). Each fix below is its own commit with tests.
+
+Fixed:
+
+ - Exploration could miss interleavings, or stop after a single execution,
+   when one thread's atomic load hid another thread's earlier load from the
+   backtracking logic (upstream issues 392, 432, 166). Loom now tracks the last
+   load per thread. Without a preemption bound this could make a failing model
+   pass.
+ - Releasing a `Mutex` / `RwLock` is now a scheduling point, so a `try_lock`
+   (`try_read`, `try_write`) is explored as landing inside another thread's
+   critical section even when the holder does nothing else while holding the
+   lock (upstream issue 426). Each guard drop adds a step to the execution
+   path, which counts towards `max_branches`.
+ - `SeqCst` fences are explored in both orders; a model that is only correct
+   for one order used to pass (upstream issue 437).
+ - An `UnsafeCell` access racing with another access that is still open was
+   missed if the last thing done inside the open access was a `Release` store
+   (upstream issue 431).
+ - False "Concurrent atomic store and `unsync_load`" report when a successful
+   compare-exchange acquired the release that followed the `unsync_load`
+   (upstream issue 433).
+ - `Condvar` no longer shares the thread's unpark token: a wait does not
+   consume a token, and a notification is not one (upstream issue 422). This
+   replaces the narrower fix made when merging upstream PR 418.
+ - `mpsc`: dropping the last `Sender` ends a blocked `recv()` (upstream issue
+   213); sending to a dropped `Receiver` fails instead of being reported as
+   "Messages leaked" (upstream issue 139); `try_recv()` is a modeled operation
+   whose result varies with the schedule, and reports `Disconnected`.
+ - Checkpoints record the model they belong to, and one from a different model
+   is ignored; before, any second test run with `LOOM_CHECKPOINT_FILE` set
+   could panic in the scheduler (upstream issue 425). Pointing the checkpoint
+   path at a directory gives every model its own file (upstream issue 271).
+ - Double frees through `loom::alloc::dealloc` are reported as double frees,
+   with locations (upstream issue 384).
+
+Added:
+
+ - `RwLockWriteGuard::downgrade`, for the `std` style lock and, through
+   `RawRwLockDowngrade`, for the `lock_api` one (upstream issue 397).
+ - `FromIterator<T>` and `From<Vec<T>>` for `Arc<[T]>` (upstream issue 395).
+ - `PoisonError` and `TryLockError` re-exported from `loom::sync` (upstream
+   issue 394).
+ - `AtomicBool::with_mut`, which every other atomic type already had (see
+   upstream issue 154).
+
+Documented:
+
+ - What `AtomicWaker` is a mock of (upstream issue 377).
+ - Declaring the `loom` cfg so rustc does not warn about it (upstream issue
+   352), and `-C debug-assertions` for release runs (upstream issue 361).
+ - Operations hidden from loom can also make it model impossible executions
+   (upstream issue 407); loom has no notion of time (upstream issue 193).
+ - A panic in a spawned thread fails the model and is never returned by
+   `join` (upstream issue 417). Kept as is on purpose: delivering it through
+   `join` would silently swallow failed assertions on threads that are never
+   joined, which is the common case in a model.
+
+Already resolved by the merged pull requests:
+
+ - Re-run with the reproduction from the issue: 423, 376, 249 / 177, 254,
+   152 / 179, 291, 424, 389 and 282 (the last two are now regression tests).
+ - Covered by the tests added with the corresponding pull request, not re-run
+   from the issue text: 416, 406, 402, 396 / 308, 393, 349, 345 / 363.
+ - The "index out of bounds" / "unexpected object" reports (399, 378, 290,
+   283, 228) look like the cross-execution reuse that now has its own error
+   message, but none of them could be reproduced from the report.
+
+Not addressed:
+
+ - `SeqCst` loads and stores are still treated as `AcqRel` (upstream issues
+   180, 191, 6), and load buffering is not modeled. These need a different
+   memory model implementation, not a fix.
+ - Requests that cannot be met by a mock that carries tracking state:
+   `repr(transparent)` atomics and cells (51, 317), `const fn new` (170),
+   `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
+ - Design questions and feature requests left alone: catching thread panics
+   (417, documented instead), spurious condvar wakeups (1), `MaybeUninit`
+   (299), raising `MAX_THREADS` (157), random exploration (11), dropping the
+   `generator` dependency (388), and the reports that depend on external code
+   that could not be run here (301, 362, 398).
+
 ### Not merged
 
  - Upstream PR 184 (tracing to debug non-deterministic tests): written in 2020
@@ -154,6 +239,7 @@ and release, and on the lowest allowed direct dependency versions.
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
    across executions.
  - `Notify::wait` is still limited to one blocked thread at a time.
+ - `Condvar` waits never end spuriously, and `wait_timeout` never times out.
  - Scoped threads: as elsewhere in loom, a panicking thread fails the model
    rather than being reported through `join`.
  - `check_with_input`: when the input runs out the first outcome is chosen,
