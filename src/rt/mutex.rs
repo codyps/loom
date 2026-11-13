@@ -125,7 +125,7 @@ impl Mutex {
                         && operation.action() != object::Action::OpaqueNonBlocking
                     {
                         let location = operation.location();
-                        trace!(state = ?self.state, thread = ?id,
+                        trace!(state = ?self.state, thread = ?id, %location,
                             "Mutex::post_acquire");
                         thread.set_blocked(location);
                     }
