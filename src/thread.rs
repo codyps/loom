@@ -229,6 +229,16 @@ impl<T> JoinHandle<T> {
         self.result.lock().unwrap().take().unwrap()
     }
 
+    /// Checks if the associated thread has finished running its main function.
+    ///
+    /// Mock implementation of [`std::thread::JoinHandle::is_finished`]. This is
+    /// a modeled operation: loom explores executions in which the thread has
+    /// and has not yet finished at the time of the call.
+    #[track_caller]
+    pub fn is_finished(&self) -> bool {
+        self.notify.is_notified(location!())
+    }
+
     /// Gets a handle to the underlying [`Thread`]
     pub fn thread(&self) -> &Thread {
         &self.thread

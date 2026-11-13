@@ -33,6 +33,35 @@ fn many_joins() {
 }
 
 #[test]
+fn is_finished() {
+    loom::model(|| {
+        let mut handles = vec![];
+        let mutex = loom::sync::Arc::new(loom::sync::Mutex::new(()));
+        let lock = mutex.lock().unwrap();
+
+        for _ in 1..3 {
+            let mutex = mutex.clone();
+            handles.push(thread::spawn(move || {
+                mutex.lock().unwrap();
+            }));
+        }
+
+        for handle in &handles {
+            assert!(!handle.is_finished());
+        }
+
+        std::mem::drop(lock);
+
+        for handle in handles.into_iter() {
+            while !handle.is_finished() {
+                thread::yield_now();
+            }
+            let _ = handle.join();
+        }
+    })
+}
+
+#[test]
 fn alt_join() {
     loom::model(|| {
         use loom::sync::{Arc, Mutex};
@@ -142,4 +171,35 @@ fn park_unpark_std() {
     println!("park");
     std::thread::park();
     println!("it did not deadlock");
+}
+
+/// `is_finished` must be a point the model explores around: across all
+/// executions both outcomes have to be observed for a thread racing with the
+/// check.
+#[test]
+fn is_finished_explores_both_outcomes() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    let saw_finished = Arc::new(AtomicBool::new(false));
+    let saw_running = Arc::new(AtomicBool::new(false));
+
+    {
+        let saw_finished = saw_finished.clone();
+        let saw_running = saw_running.clone();
+        loom::model(move || {
+            let handle = thread::spawn(|| {});
+
+            if handle.is_finished() {
+                saw_finished.store(true, SeqCst);
+            } else {
+                saw_running.store(true, SeqCst);
+            }
+
+            handle.join().unwrap();
+        });
+    }
+
+    assert!(saw_running.load(SeqCst), "never observed a running thread");
+    assert!(saw_finished.load(SeqCst), "never observed a finished thread");
 }

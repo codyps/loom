@@ -84,6 +84,33 @@ impl Notify {
         });
     }
 
+    /// Returns `true` if there is a pending notification, without consuming
+    /// it.
+    ///
+    /// This is a branch point that is dependent with `notify`, so both
+    /// orderings of the check and a racing notification get explored.
+    pub(crate) fn is_notified(self, location: Location) -> bool {
+        self.state.branch_opaque(location);
+
+        rt::execution(|execution| {
+            let state = self.state.get_mut(&mut execution.objects);
+
+            trace!(state = ?self.state, notified = ?state.notified, %location, "Notify::is_notified");
+
+            if state.notified {
+                // Observing the notification establishes causality with the
+                // notifier, as consuming it would.
+                state.synchronize.sync_load(&mut execution.threads, Acquire);
+
+                if state.seq_cst {
+                    execution.threads.seq_cst();
+                }
+            }
+
+            state.notified
+        })
+    }
+
     pub(crate) fn wait(self, location: Location) {
         let (notified, spurious) = rt::execution(|execution| {
             let spurious = if self.state.get(&execution.objects).might_spur() {
