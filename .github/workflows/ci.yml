@@ -65,6 +65,8 @@ jobs:
         run: cargo check --features checkpoint
       - name: Test --features futures
         run: cargo test --features futures
+      - name: Test --features lock_api
+        run: cargo test --features lock_api
 
   # Stable
   stable:
@@ -80,6 +82,8 @@ jobs:
         run: cargo check --features checkpoint
       - name: Test --features futures
         run: cargo test --features futures
+      - name: Test --features lock_api
+        run: cargo test --features lock_api
 
   # check docs
   docs:

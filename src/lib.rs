@@ -398,6 +398,10 @@ if_futures! {
     pub mod future;
 }
 
+#[cfg(feature = "lock_api")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lock_api")))]
+pub mod lock_api;
+
 /// Mock version of `std::thread_local!`.
 // This is defined *after* all other code in `loom`, since we use
 // `scoped_thread_local!` internally, which uses the `std::thread_local!` macro
