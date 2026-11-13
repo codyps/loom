@@ -201,6 +201,14 @@
 //! each test closure a large number of times, at which point the speed win from optimized code
 //! makes a big difference.
 //!
+//! A release build compiles `debug_assert!` out, both in your code and in loom itself, which uses
+//! debug assertions for some of its internal consistency checks. If your code relies on debug
+//! assertions to state its invariants, keep them for the loom run:
+//!
+//! ```console
+//! RUSTFLAGS="--cfg loom -C debug-assertions" cargo test --test loom_my_struct --release
+//! ```
+//!
 //! # Debugging Loom Failures
 //!
 //! Loom's deterministic execution allows the specific chain of events leading to a test failure
