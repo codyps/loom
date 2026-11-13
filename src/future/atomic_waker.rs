@@ -4,7 +4,18 @@ use crate::thread;
 use std::sync::Mutex;
 use std::task::Waker;
 
-/// Mock implementation of `tokio::sync::AtomicWaker`.
+/// A synchronization primitive for task wakeup.
+///
+/// Mock of the `AtomicWaker` found in `futures::task::AtomicWaker` and in
+/// the `atomic-waker` crate (tokio has an equivalent, but it is private to
+/// tokio): a slot holding the [`Waker`] of the one task that wants to be
+/// woken. [`register`](AtomicWaker::register) stores the current task's
+/// waker and [`wake`](AtomicWaker::wake) wakes whichever task registered
+/// last, from any thread.
+///
+/// Two things differ from those types. `register` takes the waker by value
+/// (use [`register_by_ref`](AtomicWaker::register_by_ref) for the
+/// `&Waker` form), and `take_waker` is what `futures` calls `take`.
 #[derive(Debug)]
 pub struct AtomicWaker {
     waker: Mutex<Option<Waker>>,
