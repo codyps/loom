@@ -195,3 +195,24 @@ fn access_on_drop_during_panic_in_unspawned_thread() {
     // to the main thread.
     result.expect("loom should not panic inside another panic");
 }
+
+/// `Arc<[T]>` can be collected into, as with `std`.
+#[test]
+fn slice_from_iterator() {
+    loom::model(|| {
+        let numbers: Arc<[usize]> = (1..=3).collect();
+        assert_eq!(&*numbers, &[1, 2, 3]);
+
+        let empty: Arc<[usize]> = std::iter::empty().collect();
+        assert!(empty.is_empty());
+
+        let from_vec: Arc<[String]> = Arc::from(vec![String::from("a")]);
+        assert_eq!(from_vec.len(), 1);
+
+        // The result is an ordinary, tracked `Arc`.
+        let other = numbers.clone();
+        let th = thread::spawn(move || other.iter().sum::<usize>());
+        assert_eq!(th.join().unwrap(), 6);
+        assert_eq!(Arc::strong_count(&numbers), 1);
+    });
+}

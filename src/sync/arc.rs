@@ -296,6 +296,21 @@ impl<T> From<T> for Arc<T> {
     }
 }
 
+impl<T> From<Vec<T>> for Arc<[T]> {
+    #[track_caller]
+    fn from(values: Vec<T>) -> Self {
+        Arc::from_std(std::sync::Arc::from(values))
+    }
+}
+
+impl<T> std::iter::FromIterator<T> for Arc<[T]> {
+    /// Takes each element in the iterator and collects it into an `Arc<[T]>`.
+    #[track_caller]
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Arc::from_std(iter.into_iter().collect())
+    }
+}
+
 impl<T: ?Sized> AsRef<T> for Arc<T> {
     fn as_ref(&self) -> &T {
         self
