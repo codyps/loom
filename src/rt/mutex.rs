@@ -47,7 +47,7 @@ impl Mutex {
     }
 
     pub(crate) fn try_acquire_lock(&self, location: Location) -> bool {
-        self.state.branch_opaque(location);
+        self.state.branch_opaque_non_blocking(location);
         self.post_acquire()
     }
 
@@ -119,7 +119,11 @@ impl Mutex {
                 }
 
                 if let Some(operation) = thread.operation.as_ref() {
-                    if operation.object() == self.state.erase() {
+                    // A thread about to `try_lock` does not wait for the
+                    // mutex; it will simply observe that it is locked.
+                    if operation.object() == self.state.erase()
+                        && operation.action() != object::Action::OpaqueNonBlocking
+                    {
                         let location = operation.location();
                         trace!(state = ?self.state, thread = ?id,
                             "Mutex::post_acquire");

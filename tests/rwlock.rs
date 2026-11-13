@@ -205,3 +205,59 @@ fn rwlock_read_twice_same_thread_blocks_writer() {
         assert_eq!(*lock.read().unwrap(), 2);
     });
 }
+
+/// A thread that is about to `try_read`/`try_write` never waits for the lock,
+/// so it must not be treated as blocked when another thread acquires it first.
+#[test]
+fn rwlock_try_write_no_block() {
+    loom::model(|| {
+        let lock = Rc::new(RwLock::new(0));
+        let lock2 = lock.clone();
+
+        let th = thread::spawn(move || {
+            let _ = lock.try_read();
+        });
+
+        let guard = lock2.try_write();
+
+        th.join().unwrap();
+
+        drop(guard)
+    })
+}
+
+#[test]
+fn rwlock_try_write_no_block_against_read() {
+    loom::model(|| {
+        let lock = Rc::new(RwLock::new(0));
+        let lock2 = lock.clone();
+
+        let th = thread::spawn(move || {
+            let _ = lock.try_write();
+        });
+
+        let guard = lock2.read().unwrap();
+
+        th.join().unwrap();
+
+        drop(guard)
+    })
+}
+
+#[test]
+fn rwlock_try_write_no_block_against_write() {
+    loom::model(|| {
+        let lock = Rc::new(RwLock::new(0));
+        let lock2 = lock.clone();
+
+        let th = thread::spawn(move || {
+            let _ = lock.try_write();
+        });
+
+        let guard = lock2.write().unwrap();
+
+        th.join().unwrap();
+
+        drop(guard)
+    })
+}

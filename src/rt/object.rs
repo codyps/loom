@@ -68,6 +68,11 @@ pub(super) enum Action {
 
     /// Generic action with no specialized dependencies on access.
     Opaque,
+
+    /// Like `Opaque`, but for an attempt that never waits for the object
+    /// (e.g. `Mutex::try_lock`). A thread about to take such an action must
+    /// not be blocked when another thread acquires the object first.
+    OpaqueNonBlocking,
 }
 
 macro_rules! objects {
@@ -375,6 +380,10 @@ impl<T: Object<Entry = Entry>> Ref<T> {
 
     pub(super) fn branch_opaque(self, location: Location) {
         self.branch_action(Action::Opaque, location)
+    }
+
+    pub(super) fn branch_opaque_non_blocking(self, location: Location) {
+        self.branch_action(Action::OpaqueNonBlocking, location)
     }
 
     fn set_action(self, execution: &mut Execution, action: Action, location: Location) {

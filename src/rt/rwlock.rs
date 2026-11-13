@@ -23,6 +23,12 @@ pub(super) enum Action {
 
     /// Write lock
     Write,
+
+    /// Read lock attempt (`try_read`); never waits for the lock.
+    TryRead,
+
+    /// Write lock attempt (`try_write`); never waits for the lock.
+    TryWrite,
 }
 
 #[derive(Debug)]
@@ -80,12 +86,12 @@ impl RwLock {
     }
 
     pub(crate) fn try_acquire_read_lock(&self, location: Location) -> bool {
-        self.state.branch_action(Action::Read, location);
+        self.state.branch_action(Action::TryRead, location);
         self.post_acquire_read_lock()
     }
 
     pub(crate) fn try_acquire_write_lock(&self, location: Location) -> bool {
-        self.state.branch_action(Action::Write, location);
+        self.state.branch_action(Action::TryWrite, location);
         self.post_acquire_write_lock()
     }
 
@@ -245,15 +251,19 @@ impl RwLock {
             // Establish sequential consistency between locks
             execution.threads.seq_cst();
 
-            // Block all other threads attempting to acquire rwlock
-            // Block all writer threads from attempting to acquire the RwLock
+            // Block all other threads waiting to acquire the RwLock. Threads
+            // that are only attempting to (`try_read` / `try_write`) do not
+            // wait; they will observe that the lock is held.
             for (id, th) in execution.threads.iter_mut() {
                 if id == thread_id {
                     continue;
                 }
 
                 match th.operation.as_ref() {
-                    Some(op) if op.object() == self.state.erase() => {
+                    Some(op)
+                        if op.object() == self.state.erase()
+                            && (op.action() == Action::Read || op.action() == Action::Write) =>
+                    {
                         let location = op.location();
                         th.set_blocked(location);
                     }
