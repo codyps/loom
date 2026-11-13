@@ -569,3 +569,24 @@ fn swap_does_not_lose_concurrent_store() {
         t2.join().unwrap();
     });
 }
+
+/// Every atomic type offers `with_mut` for exclusive, non-atomic access.
+#[test]
+fn with_mut_on_all_atomic_types() {
+    use loom::sync::atomic::AtomicPtr;
+
+    loom::model(|| {
+        let mut flag = AtomicBool::new(false);
+        flag.with_mut(|flag| *flag = true);
+        assert!(flag.load(Relaxed));
+
+        let mut number = AtomicUsize::new(1);
+        number.with_mut(|number| *number += 1);
+        assert_eq!(number.load(Relaxed), 2);
+
+        let mut value = 5usize;
+        let mut ptr = AtomicPtr::new(std::ptr::null_mut());
+        ptr.with_mut(|ptr| *ptr = &mut value);
+        assert_eq!(unsafe { *ptr.load(Relaxed) }, 5);
+    });
+}

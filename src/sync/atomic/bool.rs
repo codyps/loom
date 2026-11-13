@@ -16,6 +16,16 @@ impl AtomicBool {
         AtomicBool(Atomic::new(v, location!()))
     }
 
+    /// Get access to a mutable reference to the inner value.
+    ///
+    /// This is loom's counterpart to `std`'s `get_mut`: the reference is only
+    /// available inside the closure, so that loom knows when the exclusive
+    /// access ends.
+    #[track_caller]
+    pub fn with_mut<R>(&mut self, f: impl FnOnce(&mut bool) -> R) -> R {
+        self.0.with_mut(f)
+    }
+
     /// Load the value without any synchronization.
     ///
     /// # Safety
