@@ -434,3 +434,51 @@ fn atomic_load_on_drop_after_panic() {
         panic!();
     });
 }
+
+/// A flag claimed with a compare-exchange, read by its owner without
+/// synchronization, then released with a `Release` store. The next owner's
+/// successful compare-exchange acquires that release, so its store happens
+/// after the previous owner's unsynchronized read.
+#[test]
+fn unsync_load_then_release_then_successful_cas() {
+    loom::model(|| {
+        let owned = Arc::new(AtomicBool::new(false));
+
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let owned = owned.clone();
+                thread::spawn(move || {
+                    if owned.compare_exchange(false, true, Acquire, Relaxed).is_ok() {
+                        let _ = unsafe { owned.unsync_load() };
+                        owned.store(false, Release);
+                    }
+                })
+            })
+            .collect();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    });
+}
+
+/// The same, but nothing orders the unsynchronized read before the other
+/// thread's successful compare-exchange: that is still a race.
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn unsync_load_races_with_successful_cas() {
+    loom::model(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let th = {
+            let flag = flag.clone();
+            thread::spawn(move || {
+                let _ = flag.compare_exchange(false, true, Acquire, Relaxed);
+            })
+        };
+
+        let _ = unsafe { flag.unsync_load() };
+
+        th.join().unwrap();
+    });
+}

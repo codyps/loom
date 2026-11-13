@@ -535,12 +535,18 @@ impl State {
 
         match f(prev) {
             Ok(next) => {
+                // Perform load synchronization using the `success` ordering.
+                //
+                // This has to come before the store is validated: the store
+                // half of the RMW happens after everything the load half
+                // synchronizes with. Checking it against the thread's
+                // causality from before the load reports accesses that the
+                // load orders before this store as concurrent with it.
+                self.stores[index].sync.sync_load(threads, success);
+
                 self.stored_locations.track(location, threads);
                 // Track a store operation happened
                 self.track_store(threads);
-
-                // Perform load synchronization using the `success` ordering.
-                self.stores[index].sync.sync_load(threads, success);
 
                 // Store the new value, initializing with the `sync` value from
                 // the load. This is our (hacky) way to establish a release
