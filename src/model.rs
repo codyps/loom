@@ -158,6 +158,65 @@ impl Builder {
         self
     }
 
+    /// Run one execution of the model, using bytes to choose its execution path.
+    ///
+    /// At each choice with multiple eligible outcomes, consumes one byte and
+    /// selects `byte % number_of_outcomes`. Thread choices are ordered by Loom
+    /// thread ID. Atomic read outcomes (including read-modify-write operations)
+    /// and spurious wakeups use the same input stream.
+    /// Choices with a single outcome consume no input. Exhausted input selects
+    /// the first outcome, and unused bytes are ignored.
+    ///
+    /// The model must be deterministic apart from Loom's modeled operations for
+    /// the same input to reproduce an execution. Replay across Loom versions is
+    /// not guaranteed. Input is copied into the execution before the model runs.
+    ///
+    /// Respects `max_threads`, `max_branches`, `preemption_bound`, `stack_size`,
+    /// `location`, `log`, and explicit exploration boundaries. While exploration is disabled,
+    /// Loom uses its usual initial choices without consuming input.
+    /// Checkpoint and permutation settings, including `max_duration`, are unused
+    /// because this method runs only one execution.
+    ///
+    /// # Panics
+    ///
+    /// Model failures and exceeded execution limits panic as in [`Builder::check`].
+    /// An input-selected execution, including the fallback after input exhaustion,
+    /// can starve a thread and exceed `max_branches` even for a correct model.
+    /// Reaching this limit does not establish a concurrency bug.
+    ///
+    /// ```
+    /// let input = [5, 2];
+    /// loom::model::Builder::new().check_with_input(&input, || {
+    ///     let child = loom::thread::spawn(|| {});
+    ///     child.join().unwrap();
+    /// });
+    /// ```
+    pub fn check_with_input<F>(&self, input: &[u8], f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.with_logging(|| self.check_with_input_inner(input, f))
+    }
+
+    fn check_with_input_inner<F>(&self, input: &[u8], f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let _span = tracing::info_span!("iter", message = 1).entered();
+        let mut execution = Execution::new(
+            self.max_threads,
+            self.max_branches,
+            self.preemption_bound,
+            !self.expect_explicit_explore,
+        );
+        execution.path.set_input(input);
+        execution.log = self.log;
+        execution.location = self.location;
+
+        let mut scheduler = Scheduler::new(self.max_threads);
+        run_execution(&mut execution, &mut scheduler, self.stack_size, f);
+    }
+
     /// Check the provided model.
     ///
     /// Unless a [`tracing`] subscriber is already active for the calling
@@ -168,11 +227,17 @@ impl Builder {
     where
         F: Fn() + Sync + Send + 'static,
     {
+        self.with_logging(|| self.check_inner(f))
+    }
+
+    /// Runs `f` with loom's `LOOM_LOG` subscriber installed, unless the
+    /// caller already has a subscriber of their own in place.
+    fn with_logging<R>(&self, f: impl FnOnce() -> R) -> R {
         let has_subscriber =
             tracing::dispatcher::get_default(|current| !current.is::<subscriber::NoSubscriber>());
 
         if has_subscriber {
-            return self.check_inner(f);
+            return f();
         }
 
         let subscriber = fmt::Subscriber::builder()
@@ -181,9 +246,7 @@ impl Builder {
             .without_time()
             .finish();
 
-        subscriber::with_default(subscriber, || {
-            self.check_inner(f);
-        });
+        subscriber::with_default(subscriber, f)
     }
 
     fn check_inner<F>(&self, f: F)
@@ -242,41 +305,7 @@ impl Builder {
 
             let f = f.clone();
 
-            scheduler.run(&mut execution, self.stack_size, move || {
-                /// the given closure `f` may panic when executed.
-                /// when this happens, we still want to ensure
-                /// that thread locals are destructed before the
-                /// global statics are dropped. therefore, we set
-                /// up a guard that is dropped as part of the unwind
-                /// logic when `f` panics. this guard in turn ensures,
-                /// through the implementation of `rt::thread_done`,
-                /// that thread local fields are dropped before the
-                /// global statics are dropped. without this guard,
-                /// a `Drop` implementation on a type that is stored
-                /// in a thread local field could access the lazy static,
-                /// and this then would in turn panic from the method
-                /// [`Lazy::get`](crate::lazy_static::Lazy), which
-                /// causes a panic inside a panic, which in turn causes
-                /// Rust to abort, triggering a segfault in `loom`.
-                struct PanicGuard;
-                impl Drop for PanicGuard {
-                    fn drop(&mut self) {
-                        rt::thread_done(true);
-                    }
-                }
-
-                // set up the panic guard
-                let panic_guard = PanicGuard;
-
-                // execute the closure, note that `f()` may panic!
-                f();
-
-                // if `f()` didn't panic, then we terminate the
-                // main thread by dropping the guard ourselves.
-                drop(panic_guard);
-            });
-
-            execution.check_for_leaks();
+            run_execution(&mut execution, &mut scheduler, self.stack_size, move || f());
 
             i += 1;
 
@@ -298,6 +327,51 @@ impl Default for Builder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn run_execution<F>(
+    execution: &mut Execution,
+    scheduler: &mut Scheduler,
+    stack_size: Option<usize>,
+    f: F,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    scheduler.run(execution, stack_size, move || {
+        /// the given closure `f` may panic when executed.
+        /// when this happens, we still want to ensure
+        /// that thread locals are destructed before the
+        /// global statics are dropped. therefore, we set
+        /// up a guard that is dropped as part of the unwind
+        /// logic when `f` panics. this guard in turn ensures,
+        /// through the implementation of `rt::thread_done`,
+        /// that thread local fields are dropped before the
+        /// global statics are dropped. without this guard,
+        /// a `Drop` implementation on a type that is stored
+        /// in a thread local field could access the lazy static,
+        /// and this then would in turn panic from the method
+        /// [`Lazy::get`](crate::lazy_static::Lazy), which
+        /// causes a panic inside a panic, which in turn causes
+        /// Rust to abort, triggering a segfault in `loom`.
+        struct PanicGuard;
+        impl Drop for PanicGuard {
+            fn drop(&mut self) {
+                rt::thread_done(true);
+            }
+        }
+
+        // set up the panic guard
+        let panic_guard = PanicGuard;
+
+        // execute the closure, note that `f()` may panic!
+        f();
+
+        // if `f()` didn't panic, then we terminate the
+        // main thread by dropping the guard ourselves.
+        drop(panic_guard);
+    });
+
+    execution.check_for_leaks();
 }
 
 /// Run all concurrent permutations of the provided closure.
