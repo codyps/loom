@@ -26,6 +26,14 @@ pub struct Lazy<T> {
 
 impl<T: 'static> Lazy<T> {
     /// Mock implementation of `lazy_static::Lazy::get`.
+    ///
+    /// The value is created anew for every execution of the model and is
+    /// destroyed when that execution ends. The returned reference is typed
+    /// `&'static T` to match `lazy_static`, but it must not be kept past the
+    /// execution it was obtained in, for example by stashing it somewhere
+    /// that is read after [`model`](crate::model()) returns or in a later
+    /// execution. See the crate documentation on
+    /// [state that outlives an execution](crate#state-that-outlives-an-execution).
     pub fn get(&'static self) -> &'static T {
         // This is not great. Specifically, we're returning a 'static reference to a value that
         // only lives for the duration of the execution. Unfortunately, the semantics of lazy

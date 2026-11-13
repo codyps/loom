@@ -268,6 +268,19 @@
 //! to reason about the interaction between those operations and the other concurrent operations in
 //! your program, and thus certain executions that are possible in the real world won't be modeled.
 //!
+//! ## State That Outlives an Execution
+//!
+//! A model is run many times, once for every execution loom explores. All of loom's bookkeeping
+//! is tied to one execution, so no loom type may be carried over from one execution into another,
+//! or used after the model has finished: create everything inside the closure passed to
+//! [`model`](model()), and let it be dropped there.
+//!
+//! This also applies to the mock [`lazy_static!`]. Real statics live for the whole program, but
+//! loom re-initializes its mock statics for every execution and destroys them when the execution
+//! ends. The `&'static` references they hand out are therefore only valid for the rest of the
+//! current execution, even though their type does not say so; do not smuggle them out of the
+//! model (through a real `static`, a channel to a non-loom thread, and so on).
+//!
 //! ## Large Models
 //!
 //! By default, loom runs an **exhaustive** check of your program's possible concurrent executions
