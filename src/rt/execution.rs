@@ -162,6 +162,8 @@ impl Execution {
 
         let curr_thread = self.threads.active_id();
 
+        self.release_yielded();
+
         if let Some(pos) = self.scheduled_at {
             if !self.threads.active().is_runnable() {
                 self.path.note_stopped(pos, curr_thread.as_usize());
@@ -373,10 +375,10 @@ impl Execution {
                 .set_last_access(operation, th_id.as_usize(), path_id, &dpor_vv);
         }
 
-        // Reactivate yielded threads, but only if the current active thread is
-        // not yielded.
+        // Reactivate yielded threads that have nothing to wait for, see
+        // `release_yielded`, but not the one that is about to run.
         for (id, th) in self.threads.iter_mut() {
-            if th.is_yield() && Some(id) != next {
+            if th.is_yield() && Some(id) != next && th.yield_waits == 0 {
                 th.set_runnable();
             }
         }
@@ -386,6 +388,44 @@ impl Execution {
         }
 
         curr_thread != self.threads.active_id()
+    }
+
+    /// Decides which of the threads that have yielded can run again.
+    ///
+    /// A thread that yields says that it cannot get anywhere until some
+    /// other thread does something. Which thread that is, is not known, so
+    /// it waits for every thread that can run to take a step, or to become
+    /// unable to. Without that, two threads that spin on a lock can hand the
+    /// processor back and forth forever while the thread that holds the
+    /// lock, and could release it, is never run: the search would follow
+    /// them ever deeper.
+    ///
+    /// This is called when the active thread has taken a step.
+    fn release_yielded(&mut self) {
+        let active = self.threads.active_id();
+
+        let runnable = self
+            .threads
+            .iter()
+            .filter(|(_, th)| th.is_runnable())
+            .fold(0u8, |set, (id, _)| set | 1 << id.as_usize());
+        let others = runnable & !(1 << active.as_usize());
+
+        for (_, th) in self.threads.iter_mut() {
+            th.yield_waits &= others;
+        }
+
+        if self.threads.active().is_yield() {
+            self.threads.active_mut().yield_waits = others;
+        }
+
+        // The threads that have nothing left to wait for can be chosen from
+        // here on.
+        for (id, th) in self.threads.iter_mut() {
+            if id != active && th.is_yield() && th.yield_waits == 0 {
+                th.set_runnable();
+            }
+        }
     }
 
     /// Panics if any leaks were detected

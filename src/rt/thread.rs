@@ -54,6 +54,11 @@ pub(crate) struct Thread {
     /// Number of times the thread yielded
     pub yield_count: usize,
 
+    /// The threads (as a bit set) that the thread, having yielded, waits
+    /// for: it does not run again before each of them has taken a step or
+    /// has become unable to.
+    pub(super) yield_waits: u8,
+
     locals: LocalMap,
 
     /// `tracing` span used to associate diagnostics with the current thread.
@@ -128,6 +133,7 @@ impl Thread {
             elsewhere_view: VersionVec::new(),
             last_yield: None,
             yield_count: 0,
+            yield_waits: 0,
             locals: HashMap::new(),
         }
     }

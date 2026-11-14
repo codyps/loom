@@ -62,6 +62,13 @@ and release, and on the lowest allowed direct dependency versions.
    tries every thread at every point the bound allows. A bounded search
    therefore takes more executions than it did: it explores what it left
    out.
+ - A model with three or more threads that spin on something, such as a
+   spin lock, ran out of branches: two of the threads could yield to each
+   other forever while the thread they were waiting for was never run. A
+   thread that yields is now not run again before every other thread that
+   can run has taken a step. This takes the yield at its word, see
+   "Yielding" in the crate documentation: a pass through a loop that ends
+   in a yield should not do anything that matters.
  - Atomics: a plain store could land between the read and the write of a
    concurrent `swap` / `fetch_*` / successful `compare_exchange`, producing
    outcomes no real execution has, typically spurious failures of try-lock

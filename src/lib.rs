@@ -186,6 +186,12 @@
 //! must include calls to [`loom::thread::yield_now`](thread::yield_now). This tells loom that
 //! another thread needs to be scheduled in order for the current one to make progress.
 //!
+//! A thread that has yielded is not run again until every other thread that can run has taken a
+//! step. Loom takes the yield at its word: the thread had nothing to do, so running it again
+//! with nothing changed would repeat the same pass through the loop. A pass that ends in a yield
+//! should therefore not do anything that matters, such as counting its attempts and behaving
+//! differently after a number of them: loom explores few of the possible counts.
+//!
 //! # Running Loom Tests
 //!
 //! Loom tests must be run separately, with `RUSTFLAGS="--cfg loom"` specified (assuming you went
