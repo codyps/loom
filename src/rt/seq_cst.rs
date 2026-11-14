@@ -92,6 +92,21 @@ impl NodeSet {
         self.first == 0 && self.rest.iter().all(|word| *word == 0)
     }
 
+    /// Keeps the nodes for which `keep` returns `true`.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        let nodes: Vec<usize> = self.iter().collect();
+
+        for node in nodes {
+            if !keep(node) {
+                if node < 64 {
+                    self.first &= !(1 << node);
+                } else {
+                    self.rest[node / 64 - 1] &= !(1 << (node % 64));
+                }
+            }
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         std::iter::once(self.first)
             .chain(self.rest.iter().copied())
@@ -275,6 +290,13 @@ impl SeqCst {
         self.waiting[candidate.thread].push(id);
 
         id
+    }
+
+    /// Returns `true` if `from` has to come before `to`.
+    pub(crate) fn precedes(&self, from: usize, to: usize) -> bool {
+        self.after
+            .get(from)
+            .map_or(false, |after| after.contains(to))
     }
 
     /// Requires `from` to come before `to`. Returns `false`, leaving the

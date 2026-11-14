@@ -141,6 +141,12 @@ pub(super) struct State {
     /// `MAX_ATOMIC_HISTORY`.
     history: usize,
 
+    /// The slot of the store that was made most recently.
+    last: usize,
+
+    /// What is left of the stores that are not kept anymore.
+    forgotten: Forgotten,
+
     /// What `mo_before` returned, if nothing that it is computed from has
     /// changed since. It is asked for several times per operation.
     mo_cache: MoCache,
@@ -243,6 +249,10 @@ struct Store {
     /// For a store made by a read-modify-write: the slot of the store it
     /// read. Nothing may come between the two in the modification order.
     rmw_of: Option<u8>,
+
+    /// The number of this store among the stores to the atomic, in the
+    /// order in which they were made.
+    seq: u16,
 }
 
 /// The nodes of the `SeqCst` order (see `rt::seq_cst`) that are related to a
@@ -266,6 +276,49 @@ struct StoreNodes {
 
     /// Fences that a load which returned the store happens before.
     load_fences_after: NodeSet,
+
+    /// What counted as the stores that had been forgotten when this one was
+    /// made (see `State::forget_slot`): those come before it.
+    forgotten: Forgotten,
+}
+
+/// The nodes of the `SeqCst` order that are related to stores that are not
+/// kept anymore.
+#[derive(Debug, Clone, Default)]
+struct Forgotten {
+    /// What counted as the stores when they were the earlier of two.
+    sources: NodeSet,
+
+    /// The fences among those.
+    fences: NodeSet,
+}
+
+impl Forgotten {
+    fn add(&mut self, store: &StoreNodes) {
+        self.sources.union_with(&store.sources());
+        self.fences.union_with(&store.fences_before);
+        self.fences.union_with(&store.load_fences_before);
+    }
+
+    /// Drops the nodes that say nothing the others do not: what has to come
+    /// after a node has to come after everything before that node. Without
+    /// this the set would grow with every store that is forgotten.
+    fn prune(&mut self, seq_cst: &SeqCst) {
+        let sources: Vec<usize> = self.sources.iter().collect();
+
+        self.sources.retain(|node| {
+            !sources
+                .iter()
+                .any(|&other| other != node && seq_cst.precedes(node, other))
+        });
+    }
+
+    /// The edges that follow from the forgotten stores being ordered before
+    /// `later`.
+    fn edges(&self, later: &StoreNodes, edges: &mut Vec<(usize, usize)>) {
+        product(&self.sources, &later.targets(), edges);
+        product(&self.fences, &later.load_fences_after, edges);
+    }
 }
 
 impl StoreNodes {
@@ -378,7 +431,7 @@ impl MoCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FirstSeen([u16; MAX_THREADS]);
 
 /// The order of `SeqCst` fences.
@@ -606,7 +659,7 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?self.state, %location, "Atomic::unsync_load");
 
             // Return the value
-            let index = state.index(state.cnt - 1);
+            let index = state.last;
             T::from_u64(state.stores[index].value)
         })
     }
@@ -731,7 +784,7 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?self.state, %location, "Atomic::with_mut");
 
             // Return the value of the most recent store
-            let index = state.index(state.cnt - 1);
+            let index = state.last;
             T::from_u64(state.stores[index].value)
         });
 
@@ -748,7 +801,7 @@ impl<T: Numeric> Atomic<T> {
 
                     // The value may have been mutated, so it must be placed
                     // back.
-                    let index = state.index(state.cnt - 1);
+                    let index = state.last;
                     state.stores[index].value = T::into_u64(self.0);
 
                     if !std::thread::panicking() {
@@ -811,6 +864,8 @@ impl State {
 
         let mut state = State {
             history,
+            last: 0,
+            forgotten: Forgotten::default(),
             created_location: location,
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
@@ -900,9 +955,14 @@ impl State {
         ordering: Ordering,
         node: Option<usize>,
     ) {
-        let index = self.index(self.cnt);
+        let index = if (self.cnt as usize) < self.history {
+            self.cnt as usize
+        } else {
+            self.next_slot(&self.mo_before())
+        };
 
         self.mo_cache.clear();
+        self.last = index;
 
         // Increment the count
         self.cnt += 1;
@@ -926,7 +986,7 @@ impl State {
 
         // The slot is about to be reused; forget what was known about the
         // store it held.
-        self.forget_slot(index);
+        self.forget_slot(seq_cst, index, self.cnt as usize > self.history);
 
         sync.sync_store(threads, ordering);
 
@@ -941,8 +1001,12 @@ impl State {
             sync,
             first_seen,
             mo_preds: 0,
-            sc: StoreNodes::default(),
+            sc: StoreNodes {
+                forgotten: self.forgotten.clone(),
+                ..StoreNodes::default()
+            },
             rmw_of: None,
+            seq: self.cnt,
         };
 
         self.note_store(threads, seq_cst, atomic, index, is_seq_cst(ordering), node);
@@ -1187,6 +1251,8 @@ impl State {
                 &later_nodes.load_fences_after,
                 &mut edges,
             );
+
+            later_nodes.forgotten.edges(later_nodes, &mut edges);
         }
 
         edges
@@ -1295,10 +1361,21 @@ impl State {
 
         let cnt = cmp::min(self.cnt as usize, self.history);
         let reused = if self.cnt as usize >= self.history {
-            Some(self.cnt as usize % self.history)
+            Some(self.next_slot(&before))
         } else {
             None
         };
+
+        // The new store comes after the forgotten ones, the one that makes
+        // room for it included.
+        let mut written = written;
+        written.forgotten = self.forgotten.clone();
+
+        if let Some(reused) = reused {
+            written.forgotten.add(&nodes[reused]);
+        }
+
+        written.forgotten.edges(&written, &mut edges);
 
         for slot in (0..cnt).filter(|&slot| Some(slot) != reused) {
             if slot == index || before[index] & (1 << slot) != 0 {
@@ -1363,10 +1440,58 @@ impl State {
         seq_cst.admits(if is_seq_cst { Some(&candidate) } else { None }, &edges)
     }
 
-    fn forget_slot(&mut self, slot: usize) {
+    /// Forgets the store in `slot`, which is the first of the stores that
+    /// are kept (see `next_slot`), or not a store at all.
+    ///
+    /// The store is taken to come before every other one from here on. What
+    /// that means for the order of `SeqCst` operations is settled now for
+    /// the stores that are kept, and remembered for the ones to come.
+    fn forget_slot(&mut self, seq_cst: &mut SeqCst, slot: usize, in_use: bool) {
         let mask: StoreSet = !(1 << slot);
 
+        if in_use {
+            // What is known about the order of the other stores by way of
+            // this one has to be known without it.
+            let before = self.mo_before();
+            let cnt = cmp::min(self.cnt as usize, self.history);
+
+            for (other, before) in before.iter().enumerate().take(cnt) {
+                self.stores[other].mo_preds |= *before;
+            }
+        }
+
         self.mo_cache.clear();
+
+        if in_use && !seq_cst.is_empty() {
+            let mut edges = Vec::new();
+
+            for other in (0..self.history).filter(|&other| other != slot) {
+                StoreNodes::edges(&self.stores[slot].sc, &self.stores[other].sc, &mut edges);
+            }
+
+            for (from, to) in edges {
+                // A store for which this does not work out was in fact the
+                // earlier one. Nothing is going to say otherwise anymore.
+                let _ = seq_cst.add_edge(from, to);
+            }
+
+            let forgotten = self.stores[slot].sc.clone();
+            self.forgotten.add(&forgotten);
+            self.forgotten.prune(seq_cst);
+        }
+
+        // A store written by a read-modify-write that read this one comes
+        // directly after it: whatever is, or turns out to be, after this
+        // store is after that one as well. That store takes this one's
+        // place in the order, and counts as seen by the threads that have
+        // seen this one.
+        let follower = (0..self.history)
+            .find(|&other| other != slot && self.stores[other].rmw_of == Some(slot as u8));
+
+        if let Some(follower) = follower {
+            let position = self.stores[slot].position();
+            self.stores[follower].take_position(position);
+        }
 
         for store in &mut self.stores[..self.history] {
             store.mo_preds &= mask;
@@ -1449,16 +1574,20 @@ impl State {
                 // the load. This is our (hacky) way to establish a release
                 // sequence.
                 let sync = self.stores[index].sync;
+                let position = self.stores[index].position();
                 self.store(threads, seq_cst, atomic, sync, next, success, node);
 
-                // Remember which store this one replaced, unless its slot was
-                // just reused for the new store.
-                let written = (self.cnt as usize - 1) % self.history;
+                // Remember which store this one replaced. If its slot was
+                // just reused for the new store, the new one takes its
+                // place, see `forget_slot`.
+                let written = self.last;
 
                 self.mo_cache.clear();
 
                 if written != index {
                     self.stores[written].rmw_of = Some(index as u8);
+                } else {
+                    self.stores[written].take_position(position);
                 }
 
                 // RMW atomicity: the new store goes directly after the one
@@ -1718,6 +1847,14 @@ impl State {
         }
 
         assert!(
+            n > 0 || self.cnt as usize <= self.history,
+            "An atomic load can only return a store that loom does not keep anymore: more than \
+             {} stores have been made to the atomic. Raise `Builder::atomic_history` \
+             (`LOOM_ATOMIC_HISTORY`).",
+            self.history
+        );
+
+        assert!(
             n > 0,
             "[loom internal bug] no store an atomic load could return"
         );
@@ -1792,38 +1929,34 @@ impl State {
         n
     }
 
-    /// The slot of the store that is, or was, number `cnt` of this atomic.
-    fn index(&self, cnt: u16) -> usize {
-        cnt as usize % self.history
-    }
+    /// The slot for the next store: a free one, or else the one of a store
+    /// that is given up for it.
+    ///
+    /// The store that is given up must be one that no other store that is
+    /// kept comes after in the modification order `before`. What is known
+    /// about the order of the stores is known through each other: with a
+    /// store in the middle gone, the ones before it could end up after the
+    /// ones that followed it, and a thread that had seen it could go back
+    /// to reading what came before. With an earliest store gone, all that
+    /// is lost is that it can be read. Of the earliest stores, the one made
+    /// first goes.
+    fn next_slot(&self, before: &MoOrder) -> usize {
+        let cnt = self.cnt as usize;
 
-    /// The slots in use, as the two ends of the ring: the oldest store is in
-    /// slot `start`, and slots up to `end` hold stores.
-    fn range(&self) -> (usize, usize) {
-        let history = self.history as u16;
-        let start = self.index(self.cnt.saturating_sub(history));
-        let mut end = self.index(cmp::min(self.cnt, history));
-
-        if end == 0 {
-            end = self.history;
+        if cnt < self.history {
+            return cnt;
         }
 
-        assert!(
-            start <= end,
-            "[loom internal bug] cnt = {}; start = {}; end = {}",
-            self.cnt,
-            start,
-            end
-        );
-
-        (start, end)
+        (0..self.history)
+            .filter(|&slot| before[slot] == 0)
+            .min_by_key(|&slot| self.stores[slot].seq)
+            .expect("[loom internal bug] the modification order has no first store")
     }
 
     fn stores_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Store> {
-        let (start, end) = self.range();
-        let (two, one) = self.stores[..end].split_at_mut(start);
+        let cnt = cmp::min(self.cnt as usize, self.history);
 
-        one.iter_mut().chain(two.iter_mut())
+        self.stores[..cnt].iter_mut()
     }
 
     /// Returns the last dependent access
@@ -1885,7 +2018,23 @@ impl Default for Store {
             mo_preds: 0,
             sc: StoreNodes::default(),
             rmw_of: None,
+            seq: 0,
         }
+    }
+}
+
+impl Store {
+    /// Where the store is in the modification order as far as its version
+    /// goes, and the threads that have seen it.
+    fn position(&self) -> (VersionVec, FirstSeen) {
+        (self.modification_order, self.first_seen.clone())
+    }
+
+    /// Takes the place of a store that this one directly follows, and that
+    /// is being forgotten.
+    fn take_position(&mut self, (modification_order, first_seen): (VersionVec, FirstSeen)) {
+        self.modification_order = modification_order;
+        self.first_seen.merge(&first_seen);
     }
 }
 
@@ -1894,6 +2043,13 @@ impl Default for Store {
 impl FirstSeen {
     fn new() -> FirstSeen {
         FirstSeen([u16::MAX; MAX_THREADS])
+    }
+
+    /// Adds what `other` has been seen by.
+    fn merge(&mut self, other: &FirstSeen) {
+        for (seen, other) in self.0.iter_mut().zip(&other.0) {
+            *seen = cmp::min(*seen, *other);
+        }
     }
 
     fn touch(&mut self, threads: &thread::Set) {
