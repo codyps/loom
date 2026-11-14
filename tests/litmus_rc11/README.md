@@ -18,20 +18,30 @@ continues a release sequence.
 
 ## What is covered
 
-`reference.txt` has 17,947 programs: every program of two threads with two
-operations each over two variables, using relaxed and `SeqCst` loads, stores
-and exchanges and `SeqCst` fences, plus random samples of larger shapes (up to
-four threads, three operations per thread, three variables, acquire /
-release). An optimized build of the test checks all of them in a few
-seconds; an unoptimized one checks one in eight.
+`reference.txt` has 20,743 programs:
 
-Not covered: `compare_exchange`, fences other than `SeqCst`, more than four
-threads or three operations per thread, and everything that is not an atomic.
-For the latter see `tests/exhaustive.rs`, which compares loom with a search
-of its own that leaves nothing out.
+- every program of two threads with two operations each over two variables,
+  using relaxed and `SeqCst` loads, stores and exchanges and `SeqCst` fences;
+- random samples of larger shapes of those: up to four threads, three
+  operations per thread, three variables, and acquire / release;
+- 1,500 programs with strong compare-exchange, with every pair of orders in
+  which the failure order is no stronger than the success order;
+- 599 programs of two threads with up to five operations;
+- 600 programs of five and six threads;
+- 97 programs with seven to nine stores to a single variable, which is more
+  than loom keeps by default.
 
-One of the generated programs is missing because herd did not finish it
-within 50 minutes.
+An optimized build of the test checks all of them in about ten seconds; an
+unoptimized one checks one in eight.
+
+Not covered: weak compare-exchange (herd has none), fences other than
+`SeqCst`, and everything that is not an atomic. For the latter see
+`tests/exhaustive.rs`, which compares loom with a search of its own that
+leaves nothing out.
+
+205 of the generated programs are missing because herd did not finish them
+in time: 203 of the 300 with many stores to one variable and one other
+within five minutes, one within fifty.
 
 ## Known gaps
 
@@ -48,8 +58,13 @@ which C++ and Rust allow in principle. Loom cannot produce it either, so the
 comparison says nothing about it.
 
 Loom keeps a limited number of stores per atomic (`Builder::atomic_history`,
-7 by default). Two programs here make more stores than that to one variable.
-Run with `LOOM_ATOMIC_HISTORY=3`, where many programs do, loom misses
+7 by default). About a hundred programs here make more stores than that to
+one variable, and loom agrees with the reference on them. For the 203 that
+herd did not finish, loom with the default gives what it gives with every
+store kept, except for one program that it gives up on with a message that
+says to keep more stores. Run with `LOOM_ATOMIC_HISTORY=3` on the first
+17,947 programs, many of which then make more stores than are kept, loom
+misses
 allowed outcomes for 45 programs (the stores that would be read are gone),
 gives up on 29 with a message that says to keep more stores, and still
 finds outcomes that are not allowed for 1. With 5 stores kept it agrees

@@ -33,9 +33,11 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
- - The whole RC11 reference corpus (17,947 programs) is checked in and
-   checked by the test suite, all of it in an optimized build. It used to
-   be a subset of 2,067.
+ - The whole RC11 reference corpus is checked in and checked by the test
+   suite, all of it in an optimized build. It used to be a subset of 2,067
+   programs and is now 20,743: the 17,947 of the first corpus, and 2,796
+   more with compare-exchange, longer threads, five and six threads, and
+   more stores to one variable than loom keeps by default.
  - `tests/exhaustive.rs`: 22 small models of everything loom provides
    (mutex, condition variable, channel, `RwLock`, `Notify`, park, `Arc`,
    atomics, yielding, `block_on`, scoped threads), each explored the usual
