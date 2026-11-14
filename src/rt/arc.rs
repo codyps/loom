@@ -1,5 +1,5 @@
 use crate::rt::object;
-use crate::rt::{self, Access, Location, Synchronize, VersionVec};
+use crate::rt::{self, Access, Location, Synchronize, VersionVec, MAX_THREADS};
 
 use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 
@@ -22,17 +22,30 @@ pub(super) struct State {
     /// Only updated on on ref dec and acquired before drop
     synchronize: Synchronize,
 
-    /// Tracks access to the arc object
-    last_ref_inc: Option<Access>,
+    /// Tracks access to the arc object, for deciding which operations to
+    /// explore in the other order.
+    ///
+    /// An inspection of the count is dependent with every change of it, but
+    /// not with other inspections. Clones are not dependent with each other
+    /// or with drops either: they commute, and a thread can only clone or
+    /// drop a handle of its own. So there is no single "last access" that
+    /// stands for all earlier ones. An inspection races with the last clone
+    /// of every other thread, and a clone or a drop races with the last
+    /// inspection of every other thread. Keeping one access per kind lets
+    /// one thread's access hide another thread's earlier one, and the
+    /// execution that reorders them is then never tried.
+    last_ref_inc: [Option<Access>; MAX_THREADS],
+    last_ref_inspect: [Option<Access>; MAX_THREADS],
+
+    /// Drops are dependent with each other (the last one frees the value), so
+    /// the last one stands for the ones before it.
     last_ref_dec: Option<Access>,
-    last_ref_inspect: Option<Access>,
-    last_ref_modification: Option<RefModify>,
 }
 
 /// Actions performed on the Arc
 ///
 /// Clones are only dependent with inspections. Drops are dependent between each
-/// other.
+/// other, and with inspections.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
     /// Clone the arc
@@ -46,18 +59,6 @@ pub(super) enum Action {
     Inspect,
 }
 
-/// Actions which modify the Arc's reference count
-///
-/// This is used to ascertain dependence for Action::Inspect
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum RefModify {
-    /// Corresponds to Action::RefInc
-    RefInc,
-
-    /// Corresponds to Action::RefDec
-    RefDec,
-}
-
 impl Arc {
     pub(crate) fn new(location: Location) -> Arc {
         rt::execution(|execution| {
@@ -65,10 +66,9 @@ impl Arc {
                 ref_cnt: 1,
                 allocated: location,
                 synchronize: Synchronize::new(),
-                last_ref_inc: None,
+                last_ref_inc: Default::default(),
+                last_ref_inspect: Default::default(),
                 last_ref_dec: None,
-                last_ref_inspect: None,
-                last_ref_modification: None,
             });
 
             trace!(?state, %location, "Arc::new");
@@ -181,30 +181,38 @@ impl State {
         }
     }
 
-    pub(super) fn last_dependent_access(&self, action: Action) -> Option<&Access> {
-        match action {
-            // RefIncs are not dependent w/ RefDec, only inspections
-            Action::RefInc => self.last_ref_inspect.as_ref(),
-            Action::RefDec => self.last_ref_dec.as_ref(),
-            Action::Inspect => match self.last_ref_modification {
-                Some(RefModify::RefInc) => self.last_ref_inc.as_ref(),
-                Some(RefModify::RefDec) => self.last_ref_dec.as_ref(),
-                None => None,
-            },
-        }
+    /// Returns the previous accesses that `action` is dependent with.
+    pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
+        let (inspections, incs, dec) = match action {
+            // Clones are only dependent with inspections.
+            Action::RefInc => (&self.last_ref_inspect[..], &[][..], None),
+            // Drops are dependent with each other, and with inspections.
+            Action::RefDec => (
+                &self.last_ref_inspect[..],
+                &[][..],
+                self.last_ref_dec.as_ref(),
+            ),
+            // Inspections are dependent with everything that changes the
+            // count.
+            Action::Inspect => (&[][..], &self.last_ref_inc[..], self.last_ref_dec.as_ref()),
+        };
+
+        inspections.iter().chain(incs.iter()).flatten().chain(dec)
     }
 
-    pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
-        match action {
-            Action::RefInc => {
-                self.last_ref_modification = Some(RefModify::RefInc);
-                Access::set_or_create(&mut self.last_ref_inc, path_id, version)
-            }
-            Action::RefDec => {
-                self.last_ref_modification = Some(RefModify::RefDec);
-                Access::set_or_create(&mut self.last_ref_dec, path_id, version)
-            }
-            Action::Inspect => Access::set_or_create(&mut self.last_ref_inspect, path_id, version),
-        }
+    pub(super) fn set_last_access(
+        &mut self,
+        action: Action,
+        thread: usize,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        let access = match action {
+            Action::RefInc => &mut self.last_ref_inc[thread],
+            Action::RefDec => &mut self.last_ref_dec,
+            Action::Inspect => &mut self.last_ref_inspect[thread],
+        };
+
+        Access::set_or_create(access, path_id, version)
     }
 }

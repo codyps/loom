@@ -327,7 +327,12 @@ impl Store {
                     .for_each(f);
                 return;
             }
-            Entry::Arc(entry) => entry.last_dependent_access(operation.action.into()),
+            Entry::Arc(entry) => {
+                entry
+                    .dependent_accesses(operation.action.into())
+                    .for_each(f);
+                return;
+            }
             Entry::Condvar(entry) => entry.last_dependent_access(),
             Entry::Notify(entry) => entry.last_dependent_access(),
             obj => panic!(
@@ -362,7 +367,9 @@ impl Store {
         }
 
         match &mut self.entries[operation.obj.index] {
-            Entry::Arc(entry) => entry.set_last_access(operation.action.into(), path_id, dpor_vv),
+            Entry::Arc(entry) => {
+                entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
+            }
             Entry::Atomic(entry) => {
                 entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
             }

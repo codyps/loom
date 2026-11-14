@@ -137,6 +137,12 @@ Fixed:
    backtracking logic (upstream issues 392, 432, 166). Loom now tracks the last
    load per thread. Without a preemption bound this could make a failing model
    pass.
+ - The same kind of gap for `Arc`: `strong_count` racing with another
+   thread's clone or drop was only explored in the order loom happened to
+   execute them, so a count could never be seen to change. Drops were not
+   treated as racing with counts at all, and a thread's own count hid other
+   threads' counts from its clone. Channels were checked for the same problem
+   and are fine.
  - Releasing a `Mutex` / `RwLock` is now a scheduling point, so a `try_lock`
    (`try_read`, `try_write`) is explored as landing inside another thread's
    critical section even when the holder does nothing else while holding the
