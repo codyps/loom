@@ -19,20 +19,16 @@ continues a release sequence.
 ## Known gaps
 
 Loom executes one operation at a time and only lets an operation observe what
-has already been executed. Two consequences show up as missing outcomes:
+has already been executed. One consequence shows up as missing outcomes:
 
 - A read-modify-write always goes last in the modification order of the
   stores executed so far. It cannot be placed before a store that was
   executed earlier but that nothing orders before it.
-- The order in which `SeqCst` operations are executed is used as their total
-  order. An outcome that needs a `SeqCst` order that no possible execution
-  order agrees with is not found. This takes a relaxed load (or a
-  read-modify-write, per the previous point) that forces two `SeqCst`
-  operations to execute in one order, without ordering them in the memory
-  model.
 
-Neither makes loom report a failure that cannot happen. Both mean that loom
-can miss a bug that only shows up in such an execution.
+This does not make loom report a failure that cannot happen. It does mean that
+loom can miss a bug that only shows up in such an execution. Every program in
+the full generated set for which loom misses an outcome contains a
+read-modify-write.
 
 ## Regenerating
 

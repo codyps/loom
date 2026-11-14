@@ -281,3 +281,67 @@ fn store_buffering_seq_cst_rmw() {
 
     assert_eq!(seen, BTreeSet::from([(0, 1), (1, 0), (1, 1)]));
 }
+
+/// The order of `SeqCst` operations is not the order loom happens to execute
+/// them in.
+///
+/// For the first thread to read 3, the second thread has to have executed
+/// both of its stores, so its store to `y` is executed before the first
+/// thread's. Nothing puts them in that order as far as `SeqCst` is concerned,
+/// though: a relaxed load does not order anything. The first thread's store
+/// may still come first, and `y` end up as 2.
+#[test]
+fn seq_cst_order_is_not_execution_order() {
+    let seen = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+
+        let t1 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                let read = x.load(Relaxed);
+                y.store(1, SeqCst);
+                read
+            })
+        };
+        let t2 = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                y.store(2, SeqCst);
+                x.store(3, SeqCst);
+            })
+        };
+
+        let read = t1.join().unwrap();
+        t2.join().unwrap();
+
+        (read, y.load(Relaxed))
+    });
+
+    assert_eq!(seen, BTreeSet::from([(0, 1), (0, 2), (3, 1), (3, 2)]));
+}
+
+/// A `SeqCst` load may return a store that is older than a `SeqCst` store,
+/// as long as it can come before that store in the order of `SeqCst`
+/// operations. Here it cannot when the loading thread has already seen the
+/// newer store, and can otherwise.
+#[test]
+fn seq_cst_load_of_older_store() {
+    let seen = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let writer = {
+            let x = x.clone();
+            thread::spawn(move || x.store(1, SeqCst))
+        };
+
+        let first = x.load(Relaxed);
+        let second = x.load(SeqCst);
+
+        writer.join().unwrap();
+
+        (first, second)
+    });
+
+    assert_eq!(seen, BTreeSet::from([(0, 0), (0, 1), (1, 1)]));
+}

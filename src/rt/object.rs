@@ -191,6 +191,11 @@ impl<T> Store<T> {
         self.entries.len()
     }
 
+    /// The index the next inserted object will get.
+    pub(super) fn next_index(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(super) fn capacity(&self) -> usize {
         self.entries.capacity()
     }
@@ -398,6 +403,12 @@ impl<T> Ref<T> {
 
     pub(super) fn ref_eq(self, other: Ref<T>) -> bool {
         self.index == other.index
+    }
+
+    /// The position of the object in its store, which identifies it within
+    /// an execution.
+    pub(super) fn index(self) -> usize {
+        self.index
     }
 }
 

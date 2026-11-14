@@ -28,6 +28,11 @@ impl VersionVec {
             .map(move |(thread_id, &version)| (thread::Id::new(execution_id, thread_id), version))
     }
 
+    /// The version of the thread with index `thread`.
+    pub(crate) fn get(&self, thread: usize) -> u16 {
+        self.versions[thread]
+    }
+
     pub(crate) fn inc(&mut self, id: thread::Id) {
         self.versions[id.as_usize()] += 1;
     }

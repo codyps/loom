@@ -1,4 +1,5 @@
 use crate::rt::alloc::Allocation;
+use crate::rt::seq_cst::SeqCst;
 use crate::rt::{lazy_static, object, thread, Path};
 
 use std::collections::HashMap;
@@ -19,6 +20,9 @@ pub(crate) struct Execution {
 
     /// All loom aware objects part of this execution run.
     pub(super) objects: object::Store,
+
+    /// The order of `SeqCst` operations.
+    pub(super) seq_cst: SeqCst,
 
     /// Maps raw allocations to LeakTrack objects
     pub(super) raw_allocations: HashMap<usize, Allocation>,
@@ -63,6 +67,7 @@ impl Execution {
             threads,
             lazy_statics: lazy_static::Set::new(),
             objects: object::Store::with_capacity(max_branches),
+            seq_cst: SeqCst::default(),
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
             max_threads,
@@ -99,6 +104,7 @@ impl Execution {
         let log = self.log;
         let mut path = self.path;
         let mut objects = self.objects;
+        let mut seq_cst = self.seq_cst;
         let mut lazy_statics = self.lazy_statics;
         let mut raw_allocations = self.raw_allocations;
         let mut arc_objs = self.arc_objs;
@@ -110,6 +116,7 @@ impl Execution {
         }
 
         objects.clear();
+        seq_cst.clear();
         lazy_statics.reset();
         raw_allocations.clear();
         arc_objs.clear();
@@ -121,6 +128,7 @@ impl Execution {
             path,
             threads,
             objects,
+            seq_cst,
             lazy_statics,
             raw_allocations,
             arc_objs,

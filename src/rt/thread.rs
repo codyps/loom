@@ -1,5 +1,6 @@
 use crate::rt::execution;
 use crate::rt::object::Operation;
+use crate::rt::seq_cst;
 use crate::rt::vv::VersionVec;
 
 use std::{any::Any, collections::HashMap, fmt, ops};
@@ -38,6 +39,14 @@ pub(crate) struct Thread {
 
     /// Tracks DPOR relations
     pub dpor_vv: VersionVec,
+
+    /// The location (atomic, or fence) of the thread's last atomic operation,
+    /// what the thread knew of after it, and what it knew of after its last
+    /// operation on a different location before that. The order of `SeqCst`
+    /// operations depends on the latter, see `rt::seq_cst`.
+    last_location: Option<usize>,
+    last_view: VersionVec,
+    elsewhere_view: VersionVec,
 
     /// Version at which the thread last yielded
     pub last_yield: Option<u16>,
@@ -114,10 +123,40 @@ impl Thread {
             causality: VersionVec::new(),
             released: VersionVec::new(),
             dpor_vv: VersionVec::new(),
+            last_location: None,
+            last_view: VersionVec::new(),
+            elsewhere_view: VersionVec::new(),
             last_yield: None,
             yield_count: 0,
             locals: HashMap::new(),
         }
+    }
+
+    /// What the thread knew of after its last atomic operation on a location
+    /// other than `location`.
+    pub(crate) fn elsewhere(&self, location: usize) -> VersionVec {
+        match self.last_location {
+            // A fence is not a location: two fences are not "the same".
+            Some(last) if last == location && location != seq_cst::NO_LOCATION => {
+                self.elsewhere_view
+            }
+            Some(_) => self.last_view,
+            None => VersionVec::new(),
+        }
+    }
+
+    /// Records that the thread has executed an atomic operation on
+    /// `location`.
+    pub(crate) fn note_access(&mut self, location: usize) {
+        if self.last_location != Some(location) || location == seq_cst::NO_LOCATION {
+            if self.last_location.is_some() {
+                self.elsewhere_view = self.last_view;
+            }
+
+            self.last_location = Some(location);
+        }
+
+        self.last_view = self.causality;
     }
 
     pub(crate) fn is_runnable(&self) -> bool {

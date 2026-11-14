@@ -20,6 +20,12 @@ impl Synchronize {
         }
     }
 
+    /// What a thread comes to know of by acquiring this synchronization
+    /// point.
+    pub(crate) fn happens_before(&self) -> &VersionVec {
+        &self.happens_before
+    }
+
     pub fn sync_load(&mut self, threads: &mut thread::Set, order: Ordering) {
         match order {
             Relaxed | Release => {

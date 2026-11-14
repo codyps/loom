@@ -167,20 +167,22 @@ Fixed:
 Memory model, checked against RC11 with the herd7 simulator on about 18,000
 generated litmus programs (`tests/litmus_rc11`):
 
- - `SeqCst` loads and stores are ordered per atomic instead of being treated
-   as `AcqRel` (upstream issues 180, 191). Store buffering, Dekker / Peterson
+ - `SeqCst` loads, stores and fences are ordered as the memory model
+   requires, instead of being treated as `AcqRel` (upstream issues 180, 191).
+   Loom keeps a graph of which `SeqCst` operations have to come before which
+   others (RC11's `psc` relation) and only lets a load return a store if
+   that keeps the graph free of cycles. Store buffering, Dekker / Peterson
    style exclusion and the cppreference `SeqCst` example now pass, without
-   the outcomes `SeqCst` does allow being lost.
+   outcomes that `SeqCst` allows being lost.
  - Loom allowed outcomes no execution has, in 296 of the programs, some of
    them using only `Relaxed`: observing a store could lose the fact that
    another store comes after it, and a store could end up between the two
    halves of a read-modify-write. It also hit an internal assertion on 4
    programs. With the fixes loom produces no forbidden outcome on the corpus.
- - Loom still misses allowed outcomes in 359 of the 15,658 programs it
-   explores fully: a read-modify-write is always placed last in the
-   modification order (200 programs before these changes, unchanged), and
-   the execution order of `SeqCst` operations is used as their total order
-   (new with the `SeqCst` change). Both are documented in the README.
+ - Loom still misses allowed outcomes in 202 of the 15,423 programs it
+   explores fully, all of them containing a read-modify-write, which is
+   always placed last in the modification order. This is unchanged from
+   before, and documented in the README.
 
 Added:
 
