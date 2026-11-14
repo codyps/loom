@@ -128,6 +128,10 @@ pub(super) struct State {
     /// remembered.
     last_non_load_access: Option<Access>,
 
+    /// The threads (as a bit set) for which a weak compare-exchange on this
+    /// atomic has failed spuriously.
+    spuriously_failed: u8,
+
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
     stores: [Store; MAX_ATOMIC_HISTORY],
@@ -577,12 +581,19 @@ impl<T: Numeric> Atomic<T> {
         })
     }
 
+    /// Performs a read-modify-write: `f` is given the current value, and
+    /// returns the value to store or the error to fail with.
+    ///
+    /// If `spurious` is given, the operation may also fail although `f`
+    /// would have it succeed, with the error `spurious` returns for the
+    /// current value. That is what a "weak" compare-exchange can do.
     pub(crate) fn rmw<F, E>(
         &self,
         location: Location,
         success: Ordering,
         failure: Ordering,
         f: F,
+        spurious: Option<fn(T) -> E>,
     ) -> Result<T, E>
     where
         F: FnOnce(T) -> Result<T, E>,
@@ -613,6 +624,16 @@ impl<T: Numeric> Atomic<T> {
 
             trace!(state = ?self.state, ?success, ?failure, %location, "Atomic::rmw");
 
+            // Whether to fail spuriously is a choice loom explores both ways.
+            // It is only made if the operation would succeed otherwise.
+            let path = &mut execution.path;
+            let spurious = spurious.map(|error| {
+                (
+                    move || path.branch_spurious(),
+                    move |num| error(T::from_u64(num)),
+                )
+            });
+
             let result = state.rmw(
                 &mut execution.threads,
                 &mut execution.seq_cst,
@@ -622,6 +643,7 @@ impl<T: Numeric> Atomic<T> {
                 success,
                 failure,
                 |num| f(T::from_u64(num)).map(T::into_u64),
+                spurious,
             );
 
             execution.threads.active_mut().note_access(atomic);
@@ -731,6 +753,7 @@ impl State {
             is_mutating: false,
             last_load_access: Default::default(),
             last_non_load_access: None,
+            spuriously_failed: 0,
             stores: Default::default(),
             cnt: 0,
         };
@@ -1283,6 +1306,7 @@ impl State {
         success: Ordering,
         failure: Ordering,
         f: impl FnOnce(u64) -> Result<u64, E>,
+        spurious: Option<(impl FnOnce() -> bool, impl FnOnce(u64) -> E)>,
     ) -> Result<u64, E> {
         self.loaded_locations.track(location, threads);
 
@@ -1301,7 +1325,25 @@ impl State {
         // knows of none of them, or it could not read this one.
         let later = self.later_stores(index);
 
-        match f(prev) {
+        let result = match (f(prev), spurious) {
+            (Ok(next), Some((fail, error))) => {
+                // A weak compare-exchange may fail although the value is the
+                // expected one. Each thread gets to do that once per atomic:
+                // a loop that retries until it succeeds then still ends, and
+                // the model stays finite.
+                let thread = 1 << threads.active_id().as_usize();
+
+                if self.spuriously_failed & thread == 0 && fail() {
+                    self.spuriously_failed |= thread;
+                    Err(error(prev))
+                } else {
+                    Ok(next)
+                }
+            }
+            (result, _) => result,
+        };
+
+        match result {
             Ok(next) => {
                 // Perform load synchronization using the `success` ordering.
                 //

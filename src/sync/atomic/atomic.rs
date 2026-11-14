@@ -54,7 +54,7 @@ where
     where
         F: FnOnce(T) -> Result<T, E>,
     {
-        self.state.rmw(location!(), success, failure, f)
+        self.state.rmw(location!(), success, failure, f, None)
     }
 
     #[track_caller]
@@ -93,6 +93,32 @@ where
                 Err(actual)
             }
         })
+    }
+
+    /// Like `compare_exchange`, but may fail although the current value is
+    /// `current`, as `compare_exchange_weak` is allowed to. The error is the
+    /// current value in that case too.
+    #[track_caller]
+    pub(crate) fn compare_exchange_weak(
+        &self,
+        current: T,
+        new: T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<T, T> {
+        self.state.rmw(
+            location!(),
+            success,
+            failure,
+            |actual| {
+                if actual == current {
+                    Ok(new)
+                } else {
+                    Err(actual)
+                }
+            },
+            Some(|actual| actual),
+        )
     }
 
     #[track_caller]

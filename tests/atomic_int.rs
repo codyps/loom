@@ -66,7 +66,6 @@ macro_rules! test_int {
             }
 
             #[test]
-            #[ignore]
             fn compare_exchange_weak() {
                 loom::model(|| {
                     let a: $int = NUM_A as $int;
@@ -74,7 +73,18 @@ macro_rules! test_int {
 
                     let atomic = <$atomic>::new(a);
                     assert_eq!(Err(a), atomic.compare_exchange_weak(b, a, SeqCst, SeqCst));
-                    assert_eq!(Ok(a), atomic.compare_exchange_weak(a, b, SeqCst, SeqCst));
+
+                    // A weak exchange may fail although the value is the
+                    // expected one, so it has to be retried.
+                    loop {
+                        match atomic.compare_exchange_weak(a, b, SeqCst, SeqCst) {
+                            Ok(previous) => {
+                                assert_eq!(a, previous);
+                                break;
+                            }
+                            Err(current) => assert_eq!(a, current),
+                        }
+                    }
 
                     assert_eq!(b, atomic.load(SeqCst));
                 });

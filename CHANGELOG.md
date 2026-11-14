@@ -143,6 +143,12 @@ Fixed:
    treated as racing with counts at all, and a thread's own count hid other
    threads' counts from its clone. Channels were checked for the same problem
    and are fine.
+ - `compare_exchange_weak` can fail spuriously, as it is allowed to: where
+   the exchange would succeed, loom also explores the execution in which it
+   fails and returns the current value. Each thread does so at most once per
+   atomic in an execution, so retry loops end. Code that tries a weak
+   exchange once and treats failure as contention is now caught. It used to
+   be identical to `compare_exchange`.
  - Releasing a `Mutex` / `RwLock` is now a scheduling point, so a `try_lock`
    (`try_read`, `try_write`) is explored as landing inside another thread's
    critical section even when the holder does nothing else while holding the

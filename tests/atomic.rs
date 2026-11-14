@@ -706,3 +706,164 @@ fn compare_exchange_can_fail_on_stale_value() {
     assert!(solutions.contains(&(1, Err(0))), "{:?}", solutions);
     assert!(solutions.contains(&(1, Ok(1))), "{:?}", solutions);
 }
+
+/// Runs `f` under loom and returns the set of values it returned.
+fn outcomes<T, F>(f: F) -> HashSet<T>
+where
+    T: std::hash::Hash + Eq + Send + 'static,
+    F: Fn() -> T + Sync + Send + 'static,
+{
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+    {
+        let seen = seen.clone();
+        loom::model(move || {
+            let outcome = f();
+            seen.lock().unwrap().insert(outcome);
+        });
+    }
+
+    let seen = std::mem::take(&mut *seen.lock().unwrap());
+    seen
+}
+
+/// A weak compare-exchange can fail even though the value is the expected
+/// one. A strong one cannot.
+#[test]
+fn compare_exchange_weak_fails_spuriously() {
+    let weak = outcomes(|| {
+        let x = AtomicUsize::new(0);
+        (
+            x.compare_exchange_weak(0, 1, Relaxed, Relaxed),
+            x.load(Relaxed),
+        )
+    });
+
+    assert_eq!(weak, HashSet::from([(Ok(0), 1), (Err(0), 0)]));
+
+    let strong = outcomes(|| {
+        let x = AtomicUsize::new(0);
+        (x.compare_exchange(0, 1, Relaxed, Relaxed), x.load(Relaxed))
+    });
+
+    assert_eq!(strong, HashSet::from([(Ok(0), 1)]));
+}
+
+/// A weak compare-exchange that fails because of the value says so, and is
+/// not offered as a spurious failure on top.
+#[test]
+fn compare_exchange_weak_real_failure() {
+    let seen = outcomes(|| {
+        let x = AtomicUsize::new(5);
+        x.compare_exchange_weak(0, 1, Relaxed, Relaxed)
+    });
+
+    assert_eq!(seen, HashSet::from([Err(5)]));
+}
+
+/// The usual retry loop ends, and loses no update, with two threads at it.
+#[test]
+fn compare_exchange_weak_retry_loop() {
+    fn increment(x: &AtomicUsize) -> usize {
+        let mut attempts = 0;
+        let mut current = x.load(Relaxed);
+
+        loop {
+            attempts += 1;
+
+            match x.compare_exchange_weak(current, current + 1, Relaxed, Relaxed) {
+                Ok(_) => return attempts,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    let seen = outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let th = {
+            let x = x.clone();
+            thread::spawn(move || increment(&x))
+        };
+
+        let mine = increment(&x);
+        let theirs = th.join().unwrap();
+
+        assert_eq!(x.load(Relaxed), 2);
+
+        (mine, theirs)
+    });
+
+    // Without spurious failures the most a thread needs is two attempts
+    // (losing the race once). A spurious failure adds one.
+    assert!(seen.contains(&(1, 1)), "{:?}", seen);
+    assert!(
+        seen.iter().any(|&(mine, theirs)| mine == 3 || theirs == 3),
+        "{:?}",
+        seen
+    );
+    assert!(
+        seen.iter().all(|&(mine, theirs)| mine <= 3 && theirs <= 3),
+        "{:?}",
+        seen
+    );
+}
+
+/// Each thread fails spuriously at most once per atomic, which is what keeps
+/// a model with a retry loop finite.
+#[test]
+fn compare_exchange_weak_fails_once_per_thread() {
+    let seen = outcomes(|| {
+        let x = AtomicUsize::new(0);
+
+        let first = x.compare_exchange_weak(0, 1, Relaxed, Relaxed).is_ok();
+        let current = x.load(Relaxed);
+        let second = x
+            .compare_exchange_weak(current, current + 1, Relaxed, Relaxed)
+            .is_ok();
+
+        (first, second)
+    });
+
+    assert_eq!(
+        seen,
+        HashSet::from([(true, true), (false, true), (true, false)])
+    );
+}
+
+/// Code that tries a weak compare-exchange once and takes failure to mean
+/// that somebody else got there first is wrong. Loom has to say so.
+#[test]
+#[should_panic(expected = "lock is free, so taking it cannot fail")]
+fn compare_exchange_weak_without_retry_is_a_bug() {
+    loom::model(|| {
+        let locked = AtomicBool::new(false);
+
+        let acquired = locked
+            .compare_exchange_weak(false, true, Acquire, Relaxed)
+            .is_ok();
+
+        assert!(acquired, "lock is free, so taking it cannot fail");
+    });
+}
+
+/// The other atomic types have it too.
+#[test]
+fn compare_exchange_weak_bool_and_ptr() {
+    use loom::sync::atomic::AtomicPtr;
+
+    let seen = outcomes(|| {
+        let flag = AtomicBool::new(false);
+        let ptr = AtomicPtr::new(std::ptr::null_mut::<u8>());
+        let mut target = 0u8;
+
+        (
+            flag.compare_exchange_weak(false, true, Relaxed, Relaxed)
+                .is_ok(),
+            ptr.compare_exchange_weak(std::ptr::null_mut(), &mut target, Relaxed, Relaxed)
+                .is_ok(),
+        )
+    });
+
+    assert_eq!(seen.len(), 4, "{:?}", seen);
+}

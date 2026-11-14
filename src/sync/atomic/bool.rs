@@ -83,7 +83,15 @@ impl AtomicBool {
         self.0.compare_exchange(current, new, success, failure)
     }
 
-    /// Stores a value into the atomic if the current value is the same as the current value.
+    /// Stores a value into the atomic if the current value is the same as
+    /// the `current` value.
+    ///
+    /// Unlike `compare_exchange`, this is allowed to fail even when the
+    /// comparison succeeds, and loom explores that: where the exchange would
+    /// succeed, it also tries the execution in which it fails, returning the
+    /// current value as the error. Each thread fails spuriously at most once
+    /// per atomic in an execution, so a loop that retries until the exchange
+    /// succeeds still terminates.
     #[track_caller]
     pub fn compare_exchange_weak(
         &self,
@@ -92,7 +100,7 @@ impl AtomicBool {
         success: Ordering,
         failure: Ordering,
     ) -> Result<bool, bool> {
-        self.compare_exchange(current, new, success, failure)
+        self.0.compare_exchange_weak(current, new, success, failure)
     }
 
     /// Logical "and" with the current value.
