@@ -33,6 +33,8 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
+ - `model::Builder::workers` and `LOOM_WORKERS`: explore the executions of a
+   model on several threads, see "Performance" below.
  - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
    all threads, including the main one (upstream PR 412).
  - `thread::JoinHandle::is_finished` (upstream PR 411, fixed: see below).
@@ -181,6 +183,21 @@ Counts below are without a preemption bound.
    receiver that drains the channel: 835 executions before these two
    changes, 38 now (228 instead of 2,112 with a preemption bound of 3). Two
    writers and two readers of two atomics: 1,630 to 999.
+ - Several workers (`LOOM_WORKERS`, `model::Builder::workers`; one by
+   default). Each explores a part of the tree of executions with a path of
+   its own. A worker that runs out is handed an alternative that another
+   one has not got to yet, with a copy of the path that leads there; where
+   several workers have a copy of a branch, the first to ask for one of its
+   alternatives gets it, and learns which ones were taken before, so that
+   sleep sets work across workers as they do within one. The executions
+   explored are the same as with one worker, give or take the few that are
+   found to be repeats on the way. Four threads doing three `fetch_add`
+   each, 373,000 executions: 7.5 s with one worker, 3.8 s with two, 1.9 s
+   with four, 0.6 s with sixteen. Not used with a checkpoint file.
+
+   Checked with four workers against the RC11 reference corpus (all 17,935
+   programs equal) and against the exhaustive bounded search at bounds 0 to
+   3; the whole test suite passes with `LOOM_WORKERS=4`.
  - Coroutines and their stacks are kept from one execution to the next.
    Mapping a stack with its guard page and unwinding the coroutine at the
    end, for every thread of every execution, was most of the time of a small

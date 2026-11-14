@@ -2,6 +2,10 @@ use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
 #[cfg(feature = "checkpoint")]
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// An execution path
 #[derive(Debug)]
@@ -40,11 +44,55 @@ pub(crate) struct Path {
     /// If true, threads may be put to sleep, see `sleep_sets`.
     #[cfg_attr(feature = "checkpoint", serde(default))]
     sleep_sets: bool,
+
+    /// What this path has in common with the paths of the other workers of
+    /// a search that is run by several, see `Shared`.
+    #[cfg_attr(feature = "checkpoint", serde(skip))]
+    shared: Option<Arc<Shared>>,
 }
 
-#[derive(Debug)]
+/// Identifies a branch, and whether other workers have a copy of it.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
+struct Node {
+    /// Unique among the branches of a search.
+    id: u64,
+
+    /// Set once the branch has been handed to another worker as part of the
+    /// path that leads to its work. From then on an alternative of the
+    /// branch is only taken by the worker that claims it first.
+    shared: bool,
+}
+
+impl Node {
+    fn new() -> Node {
+        use std::sync::atomic::AtomicU64;
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        Node {
+            id: NEXT.fetch_add(1, Relaxed),
+            shared: false,
+        }
+    }
+
+    /// Asks for the alternative `alt` of the branch. `Ok` if this worker
+    /// gets to explore it, `Err` if another one has taken it; either way
+    /// with the alternatives (as a bit set) that were taken before.
+    fn claim(&self, shared: &Option<Arc<Shared>>, alt: u8) -> Result<u8, u8> {
+        match shared {
+            Some(shared) if self.shared => shared.claim(self.id, alt),
+            _ => Ok(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Schedule {
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    node: Node,
+
     /// Number of times the thread leading to this branch point has been
     /// pre-empted.
     preemptions: u8,
@@ -73,9 +121,12 @@ pub(crate) struct Schedule {
     exploring: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Load {
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    node: Node,
+
     /// All possible values
     values: [u8; MAX_ATOMIC_HISTORY],
 
@@ -88,15 +139,18 @@ pub(crate) struct Load {
     exploring: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Spurious {
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    node: Node,
+
     spur: bool,
     exploring: bool,
 }
 
 objects! {
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
     Entry,
     Schedule(Schedule),
@@ -124,6 +178,166 @@ pub(crate) enum Thread {
 
     /// The thread has been explored
     Visited,
+
+    /// Another worker took the thread while this one was exploring the
+    /// active thread. It is not explored here, and it is not explored as far
+    /// as the active thread is concerned either: the other worker treats the
+    /// active thread as explored, and only one of the two can rely on the
+    /// other. It becomes `Visited` when the active thread is done.
+    Taken,
+}
+
+/// What the workers of a search have in common: the work that is waiting
+/// for a worker, and which alternatives of the branches that several of them
+/// have a copy of are taken.
+///
+/// Each worker explores a part of the tree of executions, depth first, with
+/// a path of its own. When a worker has nothing left, another one hands it
+/// an alternative it has not got to yet, along with a copy of the path that
+/// leads there. The branches on that path then exist twice, and both
+/// workers may find out later, on their own, that one of them needs another
+/// thread to be tried: whoever asks here first gets to do it.
+///
+/// A thread that another worker is exploring from a branch counts as
+/// explored there for the purposes of putting threads to sleep. That is
+/// sound because claims are made one after the other: of two threads at a
+/// branch, only the one claimed later treats the other one as explored.
+pub(crate) struct Shared {
+    pool: Mutex<Pool>,
+
+    /// Signalled when work arrives, or when there will be none.
+    wake: Condvar,
+
+    /// The number of idle workers that no work is waiting for.
+    hungry: AtomicUsize,
+
+    /// Set to make every worker stop as soon as it can.
+    stop: AtomicBool,
+
+    /// The alternatives (as a bit set) that have been taken, by branch.
+    claims: Mutex<HashMap<u64, u8>>,
+}
+
+struct Pool {
+    /// Paths that end in an alternative nobody is exploring yet.
+    tasks: VecDeque<Path>,
+
+    /// Workers that are waiting for work.
+    idle: usize,
+
+    workers: usize,
+
+    /// Set when every worker has run out of work.
+    finished: bool,
+}
+
+impl Shared {
+    pub(crate) fn new(workers: usize) -> Shared {
+        Shared {
+            pool: Mutex::new(Pool {
+                tasks: VecDeque::new(),
+                idle: 0,
+                workers,
+                finished: false,
+            }),
+            wake: Condvar::new(),
+            hungry: AtomicUsize::new(0),
+            stop: AtomicBool::new(false),
+            claims: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn pool(&self) -> MutexGuard<'_, Pool> {
+        self.pool.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn update_hungry(&self, pool: &Pool) {
+        self.hungry
+            .store(pool.idle.saturating_sub(pool.tasks.len()), Relaxed);
+    }
+
+    /// See `Node::claim`.
+    fn claim(&self, node: u64, alt: u8) -> Result<u8, u8> {
+        let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = claims.entry(node).or_insert(0);
+        let before = *taken;
+
+        if before & (1 << alt) != 0 {
+            return Err(before);
+        }
+
+        *taken |= 1 << alt;
+
+        Ok(before)
+    }
+
+    /// Records alternatives of a branch as taken.
+    fn register(&self, node: u64, alts: u8) {
+        let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+
+        *claims.entry(node).or_insert(0) |= alts;
+    }
+
+    fn wants_work(&self) -> bool {
+        self.hungry.load(Relaxed) > 0 && !self.stopped()
+    }
+
+    fn push(&self, path: Path) {
+        let mut pool = self.pool();
+
+        pool.tasks.push_back(path);
+        self.update_hungry(&pool);
+        self.wake.notify_one();
+    }
+
+    /// Waits for work. Returns `None` when there is none left for anybody,
+    /// or the search has been stopped.
+    pub(crate) fn next_task(&self) -> Option<Path> {
+        let mut pool = self.pool();
+
+        loop {
+            if self.stopped() || pool.finished {
+                return None;
+            }
+
+            if let Some(path) = pool.tasks.pop_front() {
+                self.update_hungry(&pool);
+                return Some(path);
+            }
+
+            pool.idle += 1;
+
+            if pool.idle == pool.workers {
+                // Nobody is left to hand out work.
+                pool.finished = true;
+                self.wake.notify_all();
+                return None;
+            }
+
+            self.update_hungry(&pool);
+
+            pool = self.wake.wait(pool).unwrap_or_else(|e| e.into_inner());
+            pool.idle -= 1;
+        }
+    }
+
+    /// Makes every worker stop as soon as it can.
+    pub(crate) fn stop(&self) {
+        let _pool = self.pool();
+
+        self.stop.store(true, Relaxed);
+        self.wake.notify_all();
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(Relaxed)
+    }
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("Shared").finish_non_exhaustive()
+    }
 }
 
 macro_rules! assert_path_len {
@@ -155,6 +369,7 @@ impl Path {
             skipping: false,
             exploring_on_start: exploring,
             sleep_sets: false,
+            shared: None,
         }
     }
 
@@ -214,6 +429,7 @@ impl Path {
         };
 
         let load_ref = self.branches.insert(Load {
+            node: Node::new(),
             values: [0; MAX_ATOMIC_HISTORY],
             pos,
             len: 0,
@@ -263,6 +479,7 @@ impl Path {
             let spur = self.input.is_some() && self.input_choice(2) != 0;
 
             self.branches.insert(Spurious {
+                node: Node::new(),
                 spur,
                 exploring: self.exploring,
             });
@@ -379,6 +596,7 @@ impl Path {
             // Initialize a  new branch. The initial field values don't matter
             // as they will be updated below.
             let schedule_ref = self.branches.insert(Schedule {
+                node: Node::new(),
                 preemptions: 0,
                 initial_active: None,
                 threads: [Thread::Disabled; MAX_THREADS],
@@ -597,66 +815,216 @@ impl Path {
         //
         // This is depth-first tree traversal.
         //
-        for last in (0..self.branches.len()).rev() {
-            let last = object::Ref::from_usize(last, self.branches.id());
-
+        for index in (0..self.branches.len()).rev() {
             // Remove all objects that were created **after** this branch
-            self.branches.truncate(last);
+            self.branches
+                .truncate(object::Ref::from_usize(index, self.branches.id()));
 
-            if let Some(schedule_ref) = last.downcast::<Schedule>(&self.branches) {
-                let schedule = schedule_ref.get_mut(&mut self.branches);
+            let found = match self.branches.entry_mut(index) {
+                Entry::Schedule(schedule) => {
+                    if !schedule.exploring {
+                        continue;
+                    }
 
-                if !schedule.exploring {
-                    continue;
+                    // Transition the active thread to visited, and with it
+                    // the ones that other workers took in the meantime.
+                    for thread in schedule.threads.iter_mut() {
+                        if thread.is_active() || *thread == Thread::Taken {
+                            *thread = Thread::Visited;
+                        }
+                    }
+
+                    // Find a pending thread and transition it to active. One
+                    // that another worker got to first counts as visited:
+                    // that worker explores it.
+                    loop {
+                        let pending = match schedule.threads.iter().position(|th| th.is_pending()) {
+                            Some(pending) => pending,
+                            None => break false,
+                        };
+
+                        // Whatever other workers took here, they took it
+                        // before the thread that is about to be: it is
+                        // explored as far as this one is concerned, whether
+                        // or not this worker knew that it was wanted.
+                        let (claimed, taken) =
+                            match schedule.node.claim(&self.shared, pending as u8) {
+                                Ok(taken) => (true, taken),
+                                Err(taken) => (false, taken),
+                            };
+
+                        for (i, thread) in schedule.threads.iter_mut().enumerate() {
+                            if taken & (1 << i) != 0 {
+                                *thread = Thread::Visited;
+                            }
+                        }
+
+                        if claimed {
+                            schedule.threads[pending] = Thread::Active;
+                            break true;
+                        }
+                    }
                 }
+                Entry::Load(load) => {
+                    if !load.exploring {
+                        continue;
+                    }
 
-                // Transition the active thread to visited.
-                if let Some(thread) = schedule.threads.iter_mut().find(|th| th.is_active()) {
-                    *thread = Thread::Visited;
+                    loop {
+                        load.pos += 1;
+
+                        if load.pos >= load.len {
+                            break false;
+                        }
+
+                        if load.node.claim(&self.shared, load.pos).is_ok() {
+                            break true;
+                        }
+                    }
                 }
+                Entry::Spurious(spurious) => {
+                    if !spurious.exploring || spurious.spur {
+                        continue;
+                    }
 
-                // Find a pending thread and transition it to active
-                let rem = schedule
-                    .threads
-                    .iter_mut()
-                    .find(|th| th.is_pending())
-                    .map(|th| {
-                        *th = Thread::Active;
-                    })
-                    .is_some();
-
-                if rem {
-                    return true;
-                }
-            } else if let Some(load_ref) = last.downcast::<Load>(&self.branches) {
-                let load = load_ref.get_mut(&mut self.branches);
-
-                if !load.exploring {
-                    continue;
-                }
-
-                load.pos += 1;
-
-                if load.pos < load.len {
-                    return true;
-                }
-            } else if let Some(spurious_ref) = last.downcast::<Spurious>(&self.branches) {
-                let spurious = spurious_ref.get_mut(&mut self.branches);
-
-                if !spurious.exploring {
-                    continue;
-                }
-
-                if !spurious.spur {
                     spurious.spur = true;
-                    return true;
+                    spurious.node.claim(&self.shared, 1).is_ok()
                 }
-            } else {
-                unreachable!();
+            };
+
+            if found {
+                self.offer_work();
+                return true;
             }
         }
 
         false
+    }
+
+    /// Takes part in a search that several workers run together.
+    pub(crate) fn set_shared(&mut self, shared: Arc<Shared>) {
+        self.shared = Some(shared);
+    }
+
+    /// Hands alternatives that this path has yet to explore to workers that
+    /// have run out of work, as long as there are both.
+    fn offer_work(&mut self) {
+        let shared = match &self.shared {
+            Some(shared) => shared.clone(),
+            None => return,
+        };
+
+        let mut from = 0;
+
+        while shared.wants_work() {
+            match self.split(&shared, &mut from) {
+                Some(path) => shared.push(path),
+                None => break,
+            }
+        }
+    }
+
+    /// Splits off the first alternative that is left to explore at or after
+    /// the branch at `from`: the closer to the start, the more work there
+    /// is likely to be behind it. Returns the path that leads to it.
+    fn split(&mut self, shared: &Arc<Shared>, from: &mut usize) -> Option<Path> {
+        for index in *from..self.branches.len() {
+            loop {
+                let (node, alt) = match self.branches.entry(index) {
+                    Entry::Schedule(schedule) if schedule.exploring => {
+                        match schedule.threads.iter().position(|th| th.is_pending()) {
+                            Some(pending) => (schedule.node, pending as u8),
+                            None => break,
+                        }
+                    }
+                    Entry::Load(load) if load.exploring && load.pos + 1 < load.len => {
+                        (load.node, load.pos + 1)
+                    }
+                    Entry::Spurious(spurious) if spurious.exploring && !spurious.spur => {
+                        (spurious.node, 1)
+                    }
+                    _ => break,
+                };
+
+                // The other worker gets a copy of everything up to here.
+                // From now on these branches are worked on by both.
+                for shared_index in 0..=index {
+                    match self.branches.entry_mut(shared_index) {
+                        Entry::Schedule(schedule) => {
+                            if !schedule.node.shared {
+                                // Let the others know what has been
+                                // explored here, or is being.
+                                let explored = schedule
+                                    .threads
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, th)| th.is_active() || **th == Thread::Visited)
+                                    .fold(0, |explored, (i, _)| explored | 1 << i);
+
+                                shared.register(schedule.node.id, explored);
+                            }
+
+                            schedule.node.shared = true;
+                        }
+                        Entry::Load(load) => load.node.shared = true,
+                        Entry::Spurious(spurious) => spurious.node.shared = true,
+                    }
+                }
+
+                let taken = match shared.claim(node.id, alt) {
+                    Ok(taken) => taken,
+                    Err(_) => {
+                        // Somebody else has it.
+                        match self.branches.entry_mut(index) {
+                            Entry::Schedule(schedule) => {
+                                schedule.threads[alt as usize] = Thread::Taken;
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                };
+
+                let mut branches = self.branches.clone_prefix(index + 1);
+
+                match branches.entry_mut(index) {
+                    Entry::Schedule(schedule) => {
+                        // What this worker is exploring from here is as good
+                        // as explored for the other one, and so is what
+                        // was taken before.
+                        for (i, thread) in schedule.threads.iter_mut().enumerate() {
+                            if thread.is_active() || taken & (1 << i) != 0 {
+                                *thread = Thread::Visited;
+                            }
+                        }
+
+                        schedule.threads[alt as usize] = Thread::Active;
+                    }
+                    Entry::Load(load) => load.pos = alt,
+                    Entry::Spurious(spurious) => spurious.spur = true,
+                }
+
+                if let Entry::Schedule(schedule) = self.branches.entry_mut(index) {
+                    schedule.threads[alt as usize] = Thread::Taken;
+                }
+
+                *from = index;
+
+                return Some(Path {
+                    input: None,
+                    preemption_bound: self.preemption_bound,
+                    pos: 0,
+                    branches,
+                    exploring: self.exploring_on_start,
+                    skipping: false,
+                    exploring_on_start: self.exploring_on_start,
+                    sleep_sets: self.sleep_sets,
+                    shared: Some(shared.clone()),
+                });
+            }
+        }
+
+        None
     }
 
     fn last_schedule(&self) -> Option<object::Ref<Schedule>> {

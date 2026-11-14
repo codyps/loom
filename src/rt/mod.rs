@@ -39,7 +39,7 @@ mod mutex;
 pub(crate) use self::mutex::Mutex;
 
 mod path;
-pub(crate) use self::path::Path;
+pub(crate) use self::path::{Path, Shared};
 
 mod rwlock;
 pub(crate) use self::rwlock::RwLock;

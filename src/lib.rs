@@ -362,6 +362,21 @@
 //! [`Builder::sleep_sets`](model::Builder::sleep_sets)). A bounded search can do much less of
 //! that, so for a small model the exhaustive check may well be the faster one: try it first.
 //!
+//! ## Using several cores
+//!
+//! Loom explores the executions of a model on one thread unless told otherwise. Setting the
+//! `LOOM_WORKERS` environment variable (or [`Builder::workers`](model::Builder::workers)) to a
+//! number divides them among that many threads:
+//!
+//! ```console
+//! LOOM_WORKERS=8 RUSTFLAGS="--cfg loom" cargo test --test loom_my_struct --release
+//! ```
+//!
+//! The same executions are explored, in a different order. The model's closure is then called
+//! from several threads at once, so what it shares between executions has to cope with that, and
+//! `cargo test` runs tests in parallel already: with many loom tests in one binary there may be
+//! nothing left to gain.
+//!
 //! ## Relaxed Memory Ordering
 //!
 //! The [`Relaxed` memory ordering](std::sync::atomic::Ordering::Relaxed) allows particularly

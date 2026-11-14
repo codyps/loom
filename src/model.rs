@@ -118,6 +118,27 @@ pub struct Builder {
     /// Defaults to `true`. Setting the `LOOM_SLEEP_SETS` environment variable
     /// to `0` turns it off.
     pub sleep_sets: bool,
+
+    /// The number of OS threads to explore executions with.
+    ///
+    /// With more than one, the executions of a model are divided among that
+    /// many workers, and the closure passed to [`check`](Builder::check) is
+    /// called from all of them at the same time. Each call is still an
+    /// execution of its own, with its own loom objects, but whatever the
+    /// closure shares between executions (a counter of executions, a set of
+    /// observed results) is now shared between threads, and the order in
+    /// which executions are run is no longer the same from run to run.
+    ///
+    /// If the model fails, the other workers stop after the execution they
+    /// are in, and the failure is passed on to the caller of `check`. Which
+    /// failing execution that is may differ between runs.
+    ///
+    /// A single worker is used regardless of this setting when a checkpoint
+    /// file is in use. Log output (`LOOM_LOG`) only covers the worker that
+    /// runs on the calling thread.
+    ///
+    /// Defaults to the `LOOM_WORKERS` environment variable, or 1.
+    pub workers: usize,
 }
 
 impl Builder {
@@ -141,6 +162,10 @@ impl Builder {
         let log = env::var("LOOM_LOG").is_ok();
 
         let sleep_sets = env::var("LOOM_SLEEP_SETS").map_or(true, |v| v != "0");
+
+        let workers = env::var("LOOM_WORKERS")
+            .map(|v| v.parse().expect("invalid value for `LOOM_WORKERS`"))
+            .unwrap_or(1);
 
         let max_duration = env::var("LOOM_MAX_DURATION")
             .map(|v| {
@@ -181,6 +206,7 @@ impl Builder {
             location,
             log,
             sleep_sets,
+            workers,
         }
     }
 
@@ -285,6 +311,10 @@ impl Builder {
     where
         F: Fn() + Sync + Send + 'static,
     {
+        if self.workers > 1 && self.checkpoint_file.is_none() {
+            return self.check_parallel(f);
+        }
+
         let mut i = 1;
         let mut _span = tracing::info_span!("iter", message = i).entered();
 
@@ -363,6 +393,125 @@ impl Builder {
                 return;
             }
         }
+    }
+}
+
+impl Builder {
+    /// Explores the model with several workers, each on a thread of its
+    /// own, see `rt::Shared` for how the work is divided.
+    fn check_parallel<F>(&self, f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use std::sync::Mutex;
+
+        let f = Arc::new(f);
+        let shared = Arc::new(rt::Shared::new(self.workers));
+        let iterations = AtomicUsize::new(0);
+        let failure = Mutex::new(None);
+        let start = Instant::now();
+
+        let worker = |first: bool| {
+            let mut scheduler = Scheduler::new(self.max_threads);
+
+            // One worker starts at the root. The others wait for it to
+            // find something for them to do.
+            let mut task = if first {
+                Some(self.new_execution().path)
+            } else {
+                shared.next_task()
+            };
+
+            while let Some(mut path) = task {
+                path.set_shared(shared.clone());
+
+                let mut execution = self.new_execution();
+                execution.path = path;
+
+                loop {
+                    if shared.stopped() {
+                        return;
+                    }
+
+                    let i = iterations.fetch_add(1, Relaxed) + 1;
+
+                    if i % self.checkpoint_interval == 0 {
+                        info!(parent: None, " ================== Iteration {} ==================", i);
+
+                        let out_of_time = self
+                            .max_duration
+                            .map_or(false, |max| start.elapsed() >= max);
+                        let out_of_permutations =
+                            self.max_permutations.map_or(false, |max| i >= max);
+
+                        if out_of_time || out_of_permutations {
+                            shared.stop();
+                            return;
+                        }
+                    }
+
+                    let _span = tracing::info_span!(parent: None, "iter", message = i).entered();
+
+                    let f = f.clone();
+
+                    run_execution(&mut execution, &mut scheduler, self.stack_size, move || f());
+
+                    match execution.step() {
+                        Some(next) => execution = next,
+                        None => break,
+                    }
+                }
+
+                task = shared.next_task();
+            }
+        };
+
+        let run = |first: bool| {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| worker(first))) {
+                // The first failure is the one that is reported.
+                failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert(panic);
+                shared.stop();
+            }
+        };
+
+        std::thread::scope(|scope| {
+            for worker in 1..self.workers {
+                std::thread::Builder::new()
+                    .name(format!("loom-worker-{}", worker))
+                    .spawn_scoped(scope, || run(false))
+                    .expect("failed to spawn a loom worker thread");
+            }
+
+            run(true);
+        });
+
+        let failure = failure.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        if let Some(panic) = failure {
+            resume_unwind(panic);
+        }
+
+        info!(parent: None, "Completed in {} iterations", iterations.load(Relaxed));
+    }
+
+    fn new_execution(&self) -> Execution {
+        let mut execution = Execution::new(
+            self.max_threads,
+            self.max_branches,
+            self.preemption_bound,
+            !self.expect_explicit_explore,
+        );
+
+        execution.log = self.log;
+        execution.location = self.location;
+        execution.path.set_sleep_sets(self.sleep_sets);
+
+        execution
     }
 }
 

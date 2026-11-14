@@ -223,6 +223,33 @@ impl<T> Store<T> {
         }
     }
 
+    /// The object at `index`.
+    pub(super) fn entry(&self, index: usize) -> &T {
+        &self.entries[index]
+    }
+
+    /// The object at `index`.
+    pub(super) fn entry_mut(&mut self, index: usize) -> &mut T {
+        &mut self.entries[index]
+    }
+
+    /// A copy of the store that holds the first `len` objects. It is the
+    /// same store as far as references are concerned: the ones that point at
+    /// those objects are valid for the copy.
+    pub(super) fn clone_prefix(&self, len: usize) -> Store<T>
+    where
+        T: Clone,
+    {
+        let mut entries = Vec::with_capacity(self.entries.capacity());
+        entries.extend_from_slice(&self.entries[..len]);
+
+        Store {
+            entries,
+            id: self.id,
+            seq_cst_fences: None,
+        }
+    }
+
     pub(crate) fn truncate<O>(&mut self, obj: Ref<O>) {
         let target = obj.index + 1;
         self.entries.truncate(target);
