@@ -260,6 +260,10 @@ struct Store {
     /// order when they last executed a `SeqCst` fence. None of their loads
     /// can return it anymore.
     fence_stale: u8,
+
+    /// For a store made by a read-modify-write: the slot of the store it
+    /// read. Nothing may come between the two in the modification order.
+    rmw_of: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -714,6 +718,7 @@ impl State {
             mo_preds: 0,
             sc_stale: false,
             fence_stale: 0,
+            rmw_of: None,
         };
 
         if is_seq_cst(ordering) {
@@ -737,12 +742,58 @@ impl State {
             }
         }
 
-        // Transitive closure
-        for k in 0..cnt {
-            for j in 0..cnt {
-                if before[j] & (1 << k) != 0 {
-                    before[j] |= before[k];
+        loop {
+            // Transitive closure
+            for k in 0..cnt {
+                for j in 0..cnt {
+                    if before[j] & (1 << k) != 0 {
+                        before[j] |= before[k];
+                    }
                 }
+            }
+
+            // RMW atomicity: the store written by a read-modify-write comes
+            // right after the store it read. Whatever is ordered after the
+            // store that was read is therefore ordered after the one that
+            // was written, too. That includes stores that existed, with no
+            // known position, when the read-modify-write happened, and got
+            // ordered after the store it read only later.
+            let mut changed = false;
+
+            for written in 0..cnt {
+                let read = match self.stores[written].rmw_of {
+                    Some(read) => read as usize,
+                    None => continue,
+                };
+
+                for other in 0..cnt {
+                    if other == written || other == read {
+                        continue;
+                    }
+
+                    let after_read = before[other] & (1 << read) != 0;
+                    let after_written = before[other] & (1 << written) != 0;
+                    let before_written = before[written] & (1 << other) != 0;
+
+                    if after_read && !after_written && !before_written {
+                        before[other] |= 1 << written;
+                        changed = true;
+                    }
+
+                    // And the other way around: whatever is ordered before
+                    // the store that was written is ordered before the one
+                    // that was read.
+                    let before_read = before[read] & (1 << other) != 0;
+
+                    if before_written && !before_read && !after_read {
+                        before[read] |= 1 << other;
+                        changed = true;
+                    }
+                }
+            }
+
+            if !changed {
+                break;
             }
         }
 
@@ -829,6 +880,10 @@ impl State {
 
         for store in &mut self.stores {
             store.mo_preds &= mask;
+
+            if store.rmw_of == Some(slot as u8) {
+                store.rmw_of = None;
+            }
         }
     }
 
@@ -879,6 +934,14 @@ impl State {
                 let sync = self.stores[index].sync;
                 self.store(threads, sync, next, success);
 
+                // Remember which store this one replaced, unless its slot was
+                // just reused for the new store.
+                let written = (self.cnt as usize - 1) % MAX_ATOMIC_HISTORY;
+
+                if written != index {
+                    self.stores[written].rmw_of = Some(index as u8);
+                }
+
                 // RMW Atomicity. Future stores must happen after this, because we
                 // already observed a value.
                 self.last_successful_rmw.join(&threads.active().causality);
@@ -896,23 +959,33 @@ impl State {
         }
     }
 
+    /// The current thread loads the store in slot `index`: every store the
+    /// thread already knows about comes before it in the modification order.
+    ///
+    /// This is recorded as explicit edges, and not by joining the other
+    /// stores' positions into this store's version vector. The store exists
+    /// already and may have stores ordered after it; moving its vector moves
+    /// it away from those, losing the fact that they come later. A thread
+    /// could then load the store, and after it one that is known to be newer,
+    /// only to be handed the older one again at the end.
     fn apply_load_coherence(&mut self, threads: &mut thread::Set, index: usize) {
-        for i in 0..self.stores.len() {
+        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let before = self.mo_before();
+
+        for i in 0..cnt {
             // Skip if it is the current load.
             if index == i {
                 continue;
             }
 
             // READ-READ coherence
-            if self.stores[i].first_seen.is_seen_by_current(threads) {
-                let mo = self.stores[i].modification_order;
-                self.stores[index].modification_order.join(&mo);
-            }
+            let seen = self.stores[i].first_seen.is_seen_by_current(threads);
 
             // WRITE-READ coherence
-            if self.stores[i].happens_before < threads.active().causality {
-                let mo = self.stores[i].modification_order;
-                self.stores[index].modification_order.join(&mo);
+            let happens_before = self.stores[i].happens_before < threads.active().causality;
+
+            if (seen || happens_before) && before[i] & (1 << index) == 0 {
+                self.stores[index].mo_preds |= 1 << i;
             }
         }
     }
@@ -1237,6 +1310,7 @@ impl Default for Store {
             mo_preds: 0,
             sc_stale: false,
             fence_stale: 0,
+            rmw_of: None,
         }
     }
 }
