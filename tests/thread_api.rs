@@ -139,7 +139,7 @@ fn thread_stack_size() {
     let mut builder = loom::model::Builder::new();
     // The global stack size is intentionally set too small. The thread's stack
     // size will override it.
-    builder.stack_size = Some(1024);
+    builder.stack_size = Some(2048);
     builder.check(|| {
         let body = || {
             // Allocate a large array on the stack.

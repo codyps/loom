@@ -59,20 +59,22 @@ impl cmp::PartialOrd for VersionVec {
     fn partial_cmp(&self, other: &VersionVec) -> Option<cmp::Ordering> {
         use cmp::Ordering::*;
 
-        let mut ret = Equal;
+        // Looking at every component, without leaving early, is what lets
+        // this be done a few components at a time.
+        let mut less = false;
+        let mut greater = false;
 
         for i in 0..MAX_THREADS {
-            let a = self.versions[i];
-            let b = other.versions[i];
-            match a.cmp(&b) {
-                Equal => {}
-                Less if ret == Greater => return None,
-                Greater if ret == Less => return None,
-                ordering => ret = ordering,
-            }
+            less |= self.versions[i] < other.versions[i];
+            greater |= self.versions[i] > other.versions[i];
         }
 
-        Some(ret)
+        match (less, greater) {
+            (false, false) => Some(Equal),
+            (true, false) => Some(Less),
+            (false, true) => Some(Greater),
+            (true, true) => None,
+        }
     }
 }
 

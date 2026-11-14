@@ -1,4 +1,4 @@
-use crate::rt::{execution, object, thread, MAX_ATOMIC_HISTORY, MAX_THREADS};
+use crate::rt::{execution, object, thread, ThreadSet, MAX_ATOMIC_HISTORY, MAX_THREADS};
 
 #[cfg(feature = "checkpoint")]
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,7 @@ impl Node {
     /// Asks for the alternative `alt` of the branch. `Ok` if this worker
     /// gets to explore it, `Err` if another one has taken it; either way
     /// with the alternatives (as a bit set) that were taken before.
-    fn claim(&self, shared: &Option<Arc<Shared>>, alt: u8) -> Result<u8, u8> {
+    fn claim(&self, shared: &Option<Arc<Shared>>, alt: u8) -> Result<ThreadSet, ThreadSet> {
         match shared {
             Some(shared) if self.shared => shared.claim(self.id, alt),
             _ => Ok(0),
@@ -110,13 +110,13 @@ pub(crate) struct Schedule {
     /// them from here leads to nothing that has not been explored already,
     /// see `Execution::schedule`.
     #[cfg_attr(feature = "checkpoint", serde(default))]
-    sleeping: u8,
+    sleeping: ThreadSet,
 
     /// The threads (as a bit set) that, when run from this point, could not
     /// carry on after their step: switching away from them at the next
     /// point was not a preemption.
     #[cfg_attr(feature = "checkpoint", serde(default))]
-    stopped: u8,
+    stopped: ThreadSet,
 
     exploring: bool,
 }
@@ -215,7 +215,7 @@ pub(crate) struct Shared {
     stop: AtomicBool,
 
     /// The alternatives (as a bit set) that have been taken, by branch.
-    claims: Mutex<HashMap<u64, u8>>,
+    claims: Mutex<HashMap<u64, ThreadSet>>,
 }
 
 struct Pool {
@@ -257,7 +257,7 @@ impl Shared {
     }
 
     /// See `Node::claim`.
-    fn claim(&self, node: u64, alt: u8) -> Result<u8, u8> {
+    fn claim(&self, node: u64, alt: u8) -> Result<ThreadSet, ThreadSet> {
         let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
         let taken = claims.entry(node).or_insert(0);
         let before = *taken;
@@ -272,7 +272,7 @@ impl Shared {
     }
 
     /// Records alternatives of a branch as taken.
-    fn register(&self, node: u64, alts: u8) {
+    fn register(&self, node: u64, alts: ThreadSet) {
         let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
 
         *claims.entry(node).or_insert(0) |= alts;
@@ -543,7 +543,7 @@ impl Path {
     ///
     /// So the thread only sleeps if choosing it here, and leaving it after
     /// its step, was no more of a preemption than choosing `next` is.
-    pub(super) fn explored_at(&self, pos: usize, next: usize) -> u8 {
+    pub(super) fn explored_at(&self, pos: usize, next: usize) -> ThreadSet {
         if pos >= self.branches.len() {
             return 0;
         }
@@ -582,7 +582,7 @@ impl Path {
     pub(super) fn branch_thread(
         &mut self,
         execution_id: execution::Id,
-        sleeping: u8,
+        sleeping: ThreadSet,
         seed: impl ExactSizeIterator<Item = Thread>,
     ) -> Option<thread::Id> {
         if self.is_traversed() {

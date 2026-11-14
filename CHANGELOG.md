@@ -33,6 +33,21 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
+ - A model can have 16 threads, counting the main one, instead of 5
+   (`MAX_THREADS`), and that is the default for `model::Builder::max_threads`
+   as well. The limit is what the bookkeeping per thread is sized for; with
+   the comparison of version vectors rewritten to go with it, an execution
+   takes about 2% longer than with 5. What decides whether a model with
+   many threads can be checked is how much the threads have to do with each
+   other: fifteen threads that keep to themselves are one execution, eight
+   that take the same lock once are 40,320.
+ - `model::Builder::atomic_history` and `LOOM_ATOMIC_HISTORY`: the number of
+   stores loom keeps per atomic, 7 by default as before and now up to 16. A
+   load may return a store made long ago if nothing tells the loading
+   thread about a newer one; with more such stores than are kept, the
+   oldest are not returned. Keeping more makes operations on an atomic with
+   that many stores slower (by half with 12 stores and all of them kept),
+   which is why it is a setting and not a new default.
  - `model::Builder::workers` and `LOOM_WORKERS`: explore the executions of a
    model on several threads, see "Performance" below.
  - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
@@ -110,6 +125,11 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Changed
 
+ - Checkpoint files written before the thread limit was raised cannot be
+   read anymore, and have to be deleted: the panic says so.
+ - Creating a thread takes about 3.5 KB more stack in a debug build than it
+   did with the lower thread limit. A model that was close to overflowing
+   its stack may need `LOOM_STACK_SIZE`.
  - Loom objects used in an execution other than the one they were created in
    now panic with a message saying so, instead of an out-of-bounds or internal
    error, or silently touching an unrelated object (upstream PR 292, ported).

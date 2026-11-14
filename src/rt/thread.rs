@@ -61,7 +61,7 @@ pub(crate) struct Thread {
     /// The threads (as a bit set) that the thread, having yielded, waits
     /// for: it does not run again before each of them has taken a step or
     /// has become unable to.
-    pub(super) yield_waits: u8,
+    pub(super) yield_waits: crate::rt::ThreadSet,
 
     locals: LocalMap,
 
@@ -276,7 +276,11 @@ impl Set {
 
     /// Create a new thread
     pub(crate) fn new_thread(&mut self) -> Id {
-        assert!(self.threads.len() < self.max());
+        assert!(
+            self.threads.len() < self.max(),
+            "the model has more than {} threads, counting the main one (see `max_threads`)",
+            self.max()
+        );
 
         // Get the identifier for the thread about to be created
         let id = self.threads.len();

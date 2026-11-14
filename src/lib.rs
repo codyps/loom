@@ -418,7 +418,8 @@
 //! However, even with equivalent execution elimination, the number of possible executions grows
 //! significantly with each new thread, to the point where checking becomes infeasible. Loom
 //! therefore specifically limits the number of threads it will model (see [`MAX_THREADS`]), and
-//! tailors its implementation to that limit.
+//! tailors its implementation to that limit. What makes a model with many threads feasible is
+//! that most of what they do has nothing to do with each other.
 //!
 //! # Implementation
 //!

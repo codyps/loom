@@ -61,10 +61,16 @@ pub(crate) use self::vv::VersionVec;
 use tracing::trace;
 
 /// Maximum number of threads that can be included in a model.
-pub const MAX_THREADS: usize = 5;
+pub const MAX_THREADS: usize = 16;
+
+/// A set of threads, or of the alternatives of a branch: one bit each.
+pub(crate) type ThreadSet = u32;
+
+const _: () = assert!(MAX_THREADS <= ThreadSet::BITS as usize);
+const _: () = assert!(MAX_ATOMIC_HISTORY <= ThreadSet::BITS as usize);
 
 /// Maximum number of atomic store history to track per-cell.
-pub(crate) const MAX_ATOMIC_HISTORY: usize = 7;
+pub(crate) const MAX_ATOMIC_HISTORY: usize = 16;
 
 pub(crate) fn spawn<F>(stack_size: Option<usize>, f: F) -> crate::rt::thread::Id
 where

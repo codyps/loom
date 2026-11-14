@@ -1,6 +1,6 @@
 use crate::rt::alloc::Allocation;
 use crate::rt::seq_cst::SeqCst;
-use crate::rt::{lazy_static, object, thread, Path};
+use crate::rt::{lazy_static, object, thread, Path, ThreadSet};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,7 +29,7 @@ pub(crate) struct Execution {
     /// this execution, with nothing dependent on it having happened since.
     /// Scheduling such a thread now can only lead to executions that are
     /// equivalent to ones explored from that earlier point.
-    sleeping: u8,
+    sleeping: ThreadSet,
 
     /// The position in the path of the scheduling decision that the active
     /// thread is running from.
@@ -43,7 +43,8 @@ pub(crate) struct Execution {
     /// Maximum number of concurrent threads
     pub(super) max_threads: usize,
 
-    pub(super) max_history: usize,
+    /// The number of stores kept per atomic.
+    pub(crate) max_history: usize,
 
     /// Capture locations for significant events
     pub(crate) location: bool,
@@ -412,7 +413,7 @@ impl Execution {
             .threads
             .iter()
             .filter(|(_, th)| th.is_runnable())
-            .fold(0u8, |set, (id, _)| set | 1 << id.as_usize());
+            .fold(0 as ThreadSet, |set, (id, _)| set | 1 << id.as_usize());
         let others = runnable & !(1 << active.as_usize());
 
         for (_, th) in self.threads.iter_mut() {

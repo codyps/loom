@@ -8,18 +8,35 @@ use std::time::{Duration, Instant};
 use tracing::{info, subscriber};
 use tracing_subscriber::{fmt, EnvFilter};
 
-const DEFAULT_MAX_THREADS: usize = 5;
+const DEFAULT_MAX_THREADS: usize = crate::MAX_THREADS;
 const DEFAULT_MAX_BRANCHES: usize = 1_000;
 
 /// Configure a model
 #[derive(Debug)]
 #[non_exhaustive] // Support adding more fields in the future
 pub struct Builder {
-    /// Max number of threads to check as part of the execution.
+    /// Max number of threads to check as part of the execution, including
+    /// the main thread.
     ///
-    /// This should be set as low as possible and must be less than
-    /// [`MAX_THREADS`](crate::MAX_THREADS).
+    /// Defaults to [`MAX_THREADS`](crate::MAX_THREADS), which is also the
+    /// most it can be. A lower value makes a model that spawns more threads
+    /// than intended fail instead of taking forever.
     pub max_threads: usize,
+
+    /// The number of stores to an atomic that loom keeps, and that a load
+    /// can still return.
+    ///
+    /// A load may return any store that the loading thread does not know to
+    /// be outdated, which can be one made long ago. Loom only keeps the most
+    /// recent ones of each atomic, so with more stores than this that a
+    /// thread could still read, the oldest are not returned and the
+    /// executions in which they would be are not explored. Raising the
+    /// number explores them, and makes every operation on an atomic that
+    /// has been stored to that often take longer.
+    ///
+    /// Defaults to the `LOOM_ATOMIC_HISTORY` environment variable, or 7.
+    /// At most 16.
+    pub atomic_history: usize,
 
     /// Maximum number of thread switches per permutation.
     ///
@@ -163,6 +180,10 @@ impl Builder {
 
         let sleep_sets = env::var("LOOM_SLEEP_SETS").map_or(true, |v| v != "0");
 
+        let atomic_history = env::var("LOOM_ATOMIC_HISTORY")
+            .map(|v| v.parse().expect("invalid value for `LOOM_ATOMIC_HISTORY`"))
+            .unwrap_or(7);
+
         let workers = env::var("LOOM_WORKERS")
             .map(|v| v.parse().expect("invalid value for `LOOM_WORKERS`"))
             .unwrap_or(1);
@@ -195,6 +216,7 @@ impl Builder {
 
         Builder {
             max_threads: DEFAULT_MAX_THREADS,
+            atomic_history,
             max_branches,
             max_duration,
             max_permutations,
@@ -261,15 +283,8 @@ impl Builder {
         F: FnOnce() + Send + 'static,
     {
         let _span = tracing::info_span!("iter", message = 1).entered();
-        let mut execution = Execution::new(
-            self.max_threads,
-            self.max_branches,
-            self.preemption_bound,
-            !self.expect_explicit_explore,
-        );
+        let mut execution = self.new_execution();
         execution.path.set_input(input);
-        execution.log = self.log;
-        execution.location = self.location;
 
         let mut scheduler = Scheduler::new(self.max_threads);
         run_execution(&mut execution, &mut scheduler, self.stack_size, f);
@@ -318,12 +333,7 @@ impl Builder {
         let mut i = 1;
         let mut _span = tracing::info_span!("iter", message = i).entered();
 
-        let mut execution = Execution::new(
-            self.max_threads,
-            self.max_branches,
-            self.preemption_bound,
-            !self.expect_explicit_explore,
-        );
+        let mut execution = self.new_execution();
         let mut scheduler = Scheduler::new(self.max_threads);
 
         // Identifies the model a checkpoint belongs to.
@@ -339,13 +349,10 @@ impl Builder {
                 if let Some(checkpoint) = checkpoint::load_execution_path(path, model) {
                     execution.path = checkpoint;
                     execution.path.set_max_branches(self.max_branches);
+                    execution.path.set_sleep_sets(self.sleep_sets);
                 }
             }
         }
-
-        execution.log = self.log;
-        execution.location = self.location;
-        execution.path.set_sleep_sets(self.sleep_sets);
 
         let f = Arc::new(f);
 
@@ -500,6 +507,12 @@ impl Builder {
     }
 
     fn new_execution(&self) -> Execution {
+        assert!(
+            (1..=crate::MAX_THREADS).contains(&self.max_threads),
+            "`max_threads` has to be between 1 and {}",
+            crate::MAX_THREADS
+        );
+
         let mut execution = Execution::new(
             self.max_threads,
             self.max_branches,
@@ -509,6 +522,7 @@ impl Builder {
 
         execution.log = self.log;
         execution.location = self.location;
+        execution.max_history = self.atomic_history;
         execution.path.set_sleep_sets(self.sleep_sets);
 
         execution
@@ -633,7 +647,14 @@ mod checkpoint {
                 None
             }
             // A checkpoint from before the model was recorded.
-            Err(_) => Some(serde_json::from_str(&contents).unwrap()),
+            Err(_) => Some(serde_json::from_str(&contents).unwrap_or_else(|err| {
+                panic!(
+                    "loom: cannot read checkpoint `{}`: {}. It may have been written by another \
+                     version of loom, in which case it has to be deleted.",
+                    fs_path.display(),
+                    err
+                )
+            })),
         }
     }
 

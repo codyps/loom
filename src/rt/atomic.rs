@@ -130,11 +130,16 @@ pub(super) struct State {
 
     /// The threads (as a bit set) for which a weak compare-exchange on this
     /// atomic has failed spuriously.
-    spuriously_failed: u8,
+    spuriously_failed: crate::rt::ThreadSet,
 
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
-    stores: [Store; MAX_ATOMIC_HISTORY],
+    stores: Vec<Store>,
+
+    /// How many of the slots are in use: the number of stores that are
+    /// kept, and that a load can still return. At most
+    /// `MAX_ATOMIC_HISTORY`.
+    history: usize,
 
     /// What `mo_before` returned, if nothing that it is computed from has
     /// changed since. It is asked for several times per operation.
@@ -229,7 +234,7 @@ struct Store {
     /// thread already knew of. The store exists by then, with other stores
     /// possibly ordered after it, so that cannot be expressed by changing its
     /// version vector.
-    mo_preds: u8,
+    mo_preds: StoreSet,
 
     /// The `SeqCst` operations and fences that are related to this store,
     /// which is what the order of those operations depends on.
@@ -321,47 +326,57 @@ fn product(from: &NodeSet, to: &NodeSet, edges: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// A set of the stores of an atomic, by slot: one bit each.
+type StoreSet = u16;
+
+const _: () = assert!(MAX_ATOMIC_HISTORY <= StoreSet::BITS as usize);
+
+/// A modification order: for each slot, the stores that come before the
+/// one in it.
+type MoOrder = [StoreSet; MAX_ATOMIC_HISTORY];
+
 /// A modification order as `State::mo_before` returns it, or nothing.
 ///
 /// The state of an atomic is shared between threads as far as the compiler
-/// is concerned, so this is an atomic: the bytes of the order, and a bit
-/// that says they are there.
+/// is concerned, so this is made of atomics.
 #[derive(Debug, Default)]
-struct MoCache(std::sync::atomic::AtomicU64);
+struct MoCache {
+    valid: std::sync::atomic::AtomicBool,
+    before: [std::sync::atomic::AtomicU16; MAX_ATOMIC_HISTORY],
+}
 
 impl MoCache {
-    const VALID: u64 = 1 << 63;
+    fn get(&self) -> Option<MoOrder> {
+        use std::sync::atomic::Ordering::Relaxed;
 
-    fn get(&self) -> Option<[u8; MAX_ATOMIC_HISTORY]> {
-        let packed = self.0.load(std::sync::atomic::Ordering::Relaxed);
-
-        if packed & Self::VALID == 0 {
+        if !self.valid.load(Relaxed) {
             return None;
         }
 
         let mut before = [0; MAX_ATOMIC_HISTORY];
-        before.copy_from_slice(&packed.to_le_bytes()[..MAX_ATOMIC_HISTORY]);
+
+        for (before, cached) in before.iter_mut().zip(&self.before) {
+            *before = cached.load(Relaxed);
+        }
 
         Some(before)
     }
 
-    fn set(&self, before: [u8; MAX_ATOMIC_HISTORY]) {
-        let mut bytes = [0; 8];
-        bytes[..MAX_ATOMIC_HISTORY].copy_from_slice(&before);
+    fn set(&self, before: MoOrder) {
+        use std::sync::atomic::Ordering::Relaxed;
 
-        self.0.store(
-            u64::from_le_bytes(bytes) | Self::VALID,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        for (before, cached) in before.iter().zip(&self.before) {
+            cached.store(*before, Relaxed);
+        }
+
+        self.valid.store(true, Relaxed);
     }
 
     fn clear(&self) {
-        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.valid
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
-
-// The order of seven stores and the marker have to fit.
-const _: () = assert!(MAX_ATOMIC_HISTORY < 8);
 
 #[derive(Debug)]
 struct FirstSeen([u16; MAX_THREADS]);
@@ -518,6 +533,7 @@ impl<T: Numeric> Atomic<T> {
                 &mut execution.threads,
                 &mut execution.seq_cst,
                 execution.objects.next_index(),
+                execution.max_history,
                 value.into_u64(),
                 location,
             );
@@ -590,7 +606,7 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?self.state, %location, "Atomic::unsync_load");
 
             // Return the value
-            let index = index(state.cnt - 1);
+            let index = state.index(state.cnt - 1);
             T::from_u64(state.stores[index].value)
         })
     }
@@ -715,7 +731,7 @@ impl<T: Numeric> Atomic<T> {
             trace!(state = ?self.state, %location, "Atomic::with_mut");
 
             // Return the value of the most recent store
-            let index = index(state.cnt - 1);
+            let index = state.index(state.cnt - 1);
             T::from_u64(state.stores[index].value)
         });
 
@@ -732,7 +748,7 @@ impl<T: Numeric> Atomic<T> {
 
                     // The value may have been mutated, so it must be placed
                     // back.
-                    let index = index(state.cnt - 1);
+                    let index = state.index(state.cnt - 1);
                     state.stores[index].value = T::into_u64(self.0);
 
                     if !std::thread::panicking() {
@@ -783,10 +799,18 @@ impl State {
         threads: &mut thread::Set,
         seq_cst: &mut SeqCst,
         atomic: usize,
+        history: usize,
         value: u64,
         location: Location,
     ) -> State {
+        assert!(
+            (1..=MAX_ATOMIC_HISTORY).contains(&history),
+            "the number of stores kept per atomic has to be between 1 and {}",
+            MAX_ATOMIC_HISTORY
+        );
+
         let mut state = State {
+            history,
             created_location: location,
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
@@ -800,7 +824,7 @@ impl State {
             last_load_access: Default::default(),
             last_non_load_access: None,
             spuriously_failed: 0,
-            stores: Default::default(),
+            stores: (0..history).map(|_| Store::default()).collect(),
             mo_cache: MoCache::default(),
             cnt: 0,
         };
@@ -876,7 +900,7 @@ impl State {
         ordering: Ordering,
         node: Option<usize>,
     ) {
-        let index = index(self.cnt);
+        let index = self.index(self.cnt);
 
         self.mo_cache.clear();
 
@@ -892,7 +916,7 @@ impl State {
         let mut modification_order = happens_before;
 
         // Apply coherence rules
-        for i in 0..self.stores.len() {
+        for i in 0..self.history {
             // READ-WRITE coherence
             if self.stores[i].first_seen.is_seen_by_current(threads) {
                 let mo = self.stores[i].modification_order;
@@ -926,7 +950,7 @@ impl State {
 
     /// The modification order as far as it is known: bit `i` of entry `j` is
     /// set if the store in slot `i` is ordered before the one in slot `j`.
-    fn mo_before(&self) -> [u8; MAX_ATOMIC_HISTORY] {
+    fn mo_before(&self) -> MoOrder {
         if let Some(before) = self.mo_cache.get() {
             debug_assert_eq!(
                 before,
@@ -945,9 +969,9 @@ impl State {
 
     /// The modification order as it would be if the stores in the slots of
     /// `preds` were ordered before the store in `slot` as well.
-    fn mo_before_with(&self, slot: usize, preds: u8) -> [u8; MAX_ATOMIC_HISTORY] {
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
-        let mut before = [0u8; MAX_ATOMIC_HISTORY];
+    fn mo_before_with(&self, slot: usize, preds: StoreSet) -> MoOrder {
+        let cnt = cmp::min(self.cnt as usize, self.history);
+        let mut before: MoOrder = [0; MAX_ATOMIC_HISTORY];
 
         for j in 0..cnt {
             before[j] = self.stores[j].mo_preds & !(1 << j);
@@ -1023,13 +1047,8 @@ impl State {
 
     /// The stores the current thread already knows of, which are ordered
     /// before the store in slot `index` once the thread loads that.
-    fn coherence_preds(
-        &self,
-        threads: &thread::Set,
-        index: usize,
-        before: &[u8; MAX_ATOMIC_HISTORY],
-    ) -> u8 {
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+    fn coherence_preds(&self, threads: &thread::Set, index: usize, before: &MoOrder) -> StoreSet {
+        let cnt = cmp::min(self.cnt as usize, self.history);
         let mut preds = 0;
 
         for i in 0..cnt {
@@ -1136,7 +1155,7 @@ impl State {
 
     /// The current thread has executed a `SeqCst` fence.
     fn note_fence(&mut self, threads: &thread::Set, node: usize) {
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let cnt = cmp::min(self.cnt as usize, self.history);
 
         for store in &mut self.stores[..cnt] {
             if store.happens_before <= threads.active().causality {
@@ -1151,10 +1170,7 @@ impl State {
 
     /// The edges of the order of `SeqCst` operations that follow from the
     /// modification order `before` and the given per-store nodes.
-    fn seq_cst_edges(
-        before: &[u8; MAX_ATOMIC_HISTORY],
-        nodes: &[StoreNodes],
-    ) -> Vec<(usize, usize)> {
+    fn seq_cst_edges(before: &MoOrder, nodes: &[StoreNodes]) -> Vec<(usize, usize)> {
         let mut edges = Vec::new();
 
         for (later, later_nodes) in nodes.iter().enumerate() {
@@ -1177,7 +1193,7 @@ impl State {
     }
 
     fn store_nodes(&self) -> Vec<StoreNodes> {
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let cnt = cmp::min(self.cnt as usize, self.history);
 
         self.stores[..cnt]
             .iter()
@@ -1205,8 +1221,8 @@ impl State {
 
     /// The stores (as a bit set of slots) that are ordered after the one in
     /// slot `index`.
-    fn later_stores(&self, index: usize) -> u8 {
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+    fn later_stores(&self, index: usize) -> StoreSet {
+        let cnt = cmp::min(self.cnt as usize, self.history);
         let before = self.mo_before();
 
         (0..cnt)
@@ -1223,7 +1239,7 @@ impl State {
         seq_cst: &SeqCst,
         atomic: usize,
         index: usize,
-        mo_before: &[u8; MAX_ATOMIC_HISTORY],
+        mo_before: &MoOrder,
         success: Ordering,
         failure: Ordering,
     ) -> bool {
@@ -1277,9 +1293,9 @@ impl State {
             ..StoreNodes::default()
         };
 
-        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
-        let reused = if self.cnt as usize >= MAX_ATOMIC_HISTORY {
-            Some(self.cnt as usize % MAX_ATOMIC_HISTORY)
+        let cnt = cmp::min(self.cnt as usize, self.history);
+        let reused = if self.cnt as usize >= self.history {
+            Some(self.cnt as usize % self.history)
         } else {
             None
         };
@@ -1303,7 +1319,7 @@ impl State {
         seq_cst: &SeqCst,
         atomic: usize,
         index: usize,
-        mo_before: &[u8; MAX_ATOMIC_HISTORY],
+        mo_before: &MoOrder,
         ordering: Ordering,
         is_seq_cst: bool,
     ) -> bool {
@@ -1348,11 +1364,11 @@ impl State {
     }
 
     fn forget_slot(&mut self, slot: usize) {
-        let mask = !(1u8 << slot);
+        let mask: StoreSet = !(1 << slot);
 
         self.mo_cache.clear();
 
-        for store in &mut self.stores {
+        for store in &mut self.stores[..self.history] {
             store.mo_preds &= mask;
 
             if store.rmw_of == Some(slot as u8) {
@@ -1437,7 +1453,7 @@ impl State {
 
                 // Remember which store this one replaced, unless its slot was
                 // just reused for the new store.
-                let written = (self.cnt as usize - 1) % MAX_ATOMIC_HISTORY;
+                let written = (self.cnt as usize - 1) % self.history;
 
                 self.mo_cache.clear();
 
@@ -1643,7 +1659,7 @@ impl State {
         ordering: Ordering,
     ) -> usize {
         let mut n = 0;
-        let cnt = self.cnt as usize;
+        let cnt = cmp::min(self.cnt as usize, self.history);
 
         // We only need to consider loads as old as the **most** recent load
         // seen by each thread in the current causality.
@@ -1719,7 +1735,7 @@ impl State {
         failure: Ordering,
     ) -> usize {
         let mut n = 0;
-        let cnt = self.cnt as usize;
+        let cnt = cmp::min(self.cnt as usize, self.history);
 
         // A read-modify-write writes directly after the store it reads. Like
         // a load, it cannot read a store if the thread knows of a newer one:
@@ -1776,8 +1792,35 @@ impl State {
         n
     }
 
+    /// The slot of the store that is, or was, number `cnt` of this atomic.
+    fn index(&self, cnt: u16) -> usize {
+        cnt as usize % self.history
+    }
+
+    /// The slots in use, as the two ends of the ring: the oldest store is in
+    /// slot `start`, and slots up to `end` hold stores.
+    fn range(&self) -> (usize, usize) {
+        let history = self.history as u16;
+        let start = self.index(self.cnt.saturating_sub(history));
+        let mut end = self.index(cmp::min(self.cnt, history));
+
+        if end == 0 {
+            end = self.history;
+        }
+
+        assert!(
+            start <= end,
+            "[loom internal bug] cnt = {}; start = {}; end = {}",
+            self.cnt,
+            start,
+            end
+        );
+
+        (start, end)
+    }
+
     fn stores_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Store> {
-        let (start, end) = range(self.cnt);
+        let (start, end) = self.range();
         let (two, one) = self.stores[..end].split_at_mut(start);
 
         one.iter_mut().chain(two.iter_mut())
@@ -1825,7 +1868,7 @@ impl State {
 }
 
 /// The slots in a bit set of slots.
-fn slots(set: u8) -> impl Iterator<Item = usize> {
+fn slots(set: StoreSet) -> impl Iterator<Item = usize> {
     (0..MAX_ATOMIC_HISTORY).filter(move |slot| set & (1 << slot) != 0)
 }
 
@@ -1888,27 +1931,4 @@ impl FirstSeen {
 
 fn is_seq_cst(order: Ordering) -> bool {
     order == Ordering::SeqCst
-}
-
-fn range(cnt: u16) -> (usize, usize) {
-    let start = index(cnt.saturating_sub(MAX_ATOMIC_HISTORY as u16));
-    let mut end = index(cmp::min(cnt, MAX_ATOMIC_HISTORY as u16));
-
-    if end == 0 {
-        end = MAX_ATOMIC_HISTORY;
-    }
-
-    assert!(
-        start <= end,
-        "[loom internal bug] cnt = {}; start = {}; end = {}",
-        cnt,
-        start,
-        end
-    );
-
-    (start, end)
-}
-
-fn index(cnt: u16) -> usize {
-    cnt as usize % MAX_ATOMIC_HISTORY
 }
