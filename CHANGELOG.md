@@ -33,7 +33,7 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
- - The whole RC11 reference corpus (17,946 programs) is checked in and
+ - The whole RC11 reference corpus (17,947 programs) is checked in and
    checked by the test suite, all of it in an optimized build. It used to
    be a subset of 2,067.
  - `tests/exhaustive.rs`: 22 small models of everything loom provides

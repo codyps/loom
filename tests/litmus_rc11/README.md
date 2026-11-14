@@ -18,7 +18,7 @@ continues a release sequence.
 
 ## What is covered
 
-`reference.txt` has 17,946 programs: every program of two threads with two
+`reference.txt` has 17,947 programs: every program of two threads with two
 operations each over two variables, using relaxed and `SeqCst` loads, stores
 and exchanges and `SeqCst` fences, plus random samples of larger shapes (up to
 four threads, three operations per thread, three variables, acquire /
@@ -30,7 +30,7 @@ threads or three operations per thread, and everything that is not an atomic.
 For the latter see `tests/exhaustive.rs`, which compares loom with a search
 of its own that leaves nothing out.
 
-Two of the generated programs are missing because herd did not finish them
+One of the generated programs is missing because herd did not finish it
 within 50 minutes.
 
 ## Known gaps
