@@ -267,3 +267,50 @@ fn stores_through_shared_arc_handles() {
 
     assert!((6..=8).contains(&count), "{}", count);
 }
+
+/// With a preemption bound there is less to conclude from what has been
+/// explored, but not nothing: threads that mostly keep to themselves are
+/// not interleaved every way the bound allows.
+#[test]
+fn private_work_with_a_preemption_bound() {
+    let count = std::sync::Arc::new(StdAtomicUsize::new(0));
+
+    {
+        let count = count.clone();
+
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.sleep_sets = true;
+
+        builder.check(move || {
+            count.fetch_add(1, SeqCst);
+
+            let shared = std::sync::Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    let shared = shared.clone();
+                    thread::spawn(move || {
+                        let own = AtomicUsize::new(0);
+
+                        for _ in 0..4 {
+                            own.fetch_add(1, SeqCst);
+                        }
+
+                        shared.fetch_add(1, SeqCst);
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            assert_eq!(shared.load(SeqCst), 3);
+        });
+    }
+
+    // 70 without sleep sets.
+    let count = count.load(SeqCst);
+    assert!((6..=24).contains(&count), "{}", count);
+}

@@ -100,7 +100,11 @@ pub fn outcomes_within(
 
         let mut builder = loom::model::Builder::new();
         // Litmus programs are tiny; make sure nothing cuts exploration short.
-        builder.preemption_bound = None;
+        // (`LOOM_LITMUS_PREEMPTIONS` is for comparing bounded searches with
+        // each other, not with the reference results.)
+        builder.preemption_bound = std::env::var("LOOM_LITMUS_PREEMPTIONS")
+            .ok()
+            .map(|bound| bound.parse().expect("invalid LOOM_LITMUS_PREEMPTIONS"));
         builder.max_branches = 10_000;
         builder.max_duration = budget;
         // The time limit is only looked at every `checkpoint_interval` executions.

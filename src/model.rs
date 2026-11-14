@@ -110,9 +110,10 @@ pub struct Builder {
     /// loom finds, only how many executions it takes, often by orders of
     /// magnitude.
     ///
-    /// It is not used together with a preemption bound: a bounded search
-    /// does not explore everything below a point, so nothing can be concluded
-    /// from having been there.
+    /// With a preemption bound it does less: a bounded search does not
+    /// explore everything below a point, so a thread is only left out where
+    /// the executions that were explored had at least as many preemptions to
+    /// spare as the ones being skipped.
     ///
     /// Defaults to `true`. Setting the `LOOM_SLEEP_SETS` environment variable
     /// to `0` turns it off.

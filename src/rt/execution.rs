@@ -31,6 +31,10 @@ pub(crate) struct Execution {
     /// equivalent to ones explored from that earlier point.
     sleeping: u8,
 
+    /// The position in the path of the scheduling decision that the active
+    /// thread is running from.
+    scheduled_at: Option<usize>,
+
     /// Maps raw allocations to LeakTrack objects
     pub(super) raw_allocations: HashMap<usize, Allocation>,
 
@@ -76,6 +80,7 @@ impl Execution {
             objects: object::Store::with_capacity(max_branches),
             seq_cst: SeqCst::default(),
             sleeping: 0,
+            scheduled_at: None,
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
             max_threads,
@@ -138,6 +143,7 @@ impl Execution {
             objects,
             seq_cst,
             sleeping: 0,
+            scheduled_at: None,
             lazy_statics,
             raw_allocations,
             arc_objs,
@@ -155,6 +161,12 @@ impl Execution {
         // Implementation of the DPOR algorithm.
 
         let curr_thread = self.threads.active_id();
+
+        if let Some(pos) = self.scheduled_at {
+            if !self.threads.active().is_runnable() {
+                self.path.note_stopped(pos, curr_thread.as_usize());
+            }
+        }
 
         for (th_id, th) in self.threads.iter() {
             let operation = match th.operation {
@@ -296,10 +308,11 @@ impl Execution {
         // when something happens that their next operation depends on, which
         // may be the very operation that is about to be executed.
         if self.path.sleep_sets() {
-            let visited = self.path.visited_at(path_id);
             let mut sleeping = 0;
 
             if let Some(next) = next {
+                let visited = self.path.explored_at(path_id, next.as_usize());
+
                 let executed = self.threads[next].operation;
 
                 for (i, th) in self.threads.iter() {
@@ -334,6 +347,7 @@ impl Execution {
         }
 
         self.threads.set_active(next);
+        self.scheduled_at = Some(path_id);
 
         // There is no active thread: all threads have terminated.
         if !self.threads.is_active() {

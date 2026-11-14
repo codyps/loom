@@ -2,7 +2,9 @@
 
 //! Skipping executions that repeat explored ones must not change what loom
 //! finds. Each model here is run with and without it, and has to produce the
-//! same outcomes, in no more executions.
+//! same outcomes, in no more executions. That goes for a search with a
+//! preemption bound as well, which finds less to begin with: it must not
+//! find less still.
 
 use loom::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use loom::sync::atomic::{AtomicBool, AtomicUsize};
@@ -14,7 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::AtomicUsize as StdAtomicUsize;
 
 /// Runs `f` under loom and returns the outcomes and the number of executions.
-fn explore<T, F>(sleep_sets: bool, f: F) -> (BTreeSet<T>, usize)
+fn explore<T, F>(sleep_sets: bool, bound: Option<usize>, f: F) -> (BTreeSet<T>, usize)
 where
     T: Ord + Send + 'static,
     F: Fn() -> T + Sync + Send + 'static,
@@ -27,7 +29,7 @@ where
         let count = count.clone();
 
         let mut builder = loom::model::Builder::new();
-        builder.preemption_bound = None;
+        builder.preemption_bound = bound;
         builder.sleep_sets = sleep_sets;
 
         builder.check(move || {
@@ -47,8 +49,19 @@ where
     T: Ord + Send + std::fmt::Debug + 'static,
     F: Fn() -> T + Sync + Send + Copy + 'static,
 {
-    let (with, with_count) = explore(true, f);
-    let (without, without_count) = explore(false, f);
+    // With a bound, the number of executions is not compared: a thread that
+    // is asleep where the search wants to try it makes the search try the
+    // other threads there, which now and then costs more than the sleeping
+    // saves.
+    for bound in [Some(0), Some(1), Some(2), Some(3)] {
+        let (with, _) = explore(true, bound, f);
+        let (without, _) = explore(false, bound, f);
+
+        assert_eq!(with, without, "preemption bound {:?}", bound);
+    }
+
+    let (with, with_count) = explore(true, None, f);
+    let (without, without_count) = explore(false, None, f);
 
     assert_eq!(with, without);
     assert!(

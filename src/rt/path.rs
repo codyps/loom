@@ -64,6 +64,12 @@ pub(crate) struct Schedule {
     #[cfg_attr(feature = "checkpoint", serde(default))]
     sleeping: u8,
 
+    /// The threads (as a bit set) that, when run from this point, could not
+    /// carry on after their step: switching away from them at the next
+    /// point was not a preemption.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    stopped: u8,
+
     exploring: bool,
 }
 
@@ -275,19 +281,52 @@ impl Path {
     /// Returns the thread identifier to schedule
     /// Returns `true` if threads can be put to sleep. That relies on
     /// everything below a branch having been explored once the search has
-    /// moved past it, which a preemption bound does not provide, and a single
-    /// execution chosen by input makes meaningless.
+    /// moved past it, which a single execution chosen by input makes
+    /// meaningless. With a preemption bound, what has been explored is less,
+    /// see `explored_at`.
     pub(super) fn sleep_sets(&self) -> bool {
-        self.sleep_sets && self.preemption_bound.is_none() && self.input.is_none() && !self.skipping
+        self.sleep_sets && self.input.is_none() && !self.skipping
     }
 
     pub(crate) fn set_sleep_sets(&mut self, sleep_sets: bool) {
         self.sleep_sets = sleep_sets;
     }
 
+    /// Records that `thread`, run from the schedule branch at `pos`, could
+    /// not carry on after its step.
+    pub(super) fn note_stopped(&mut self, pos: usize, thread: usize) {
+        if let Some(schedule) =
+            object::Ref::from_usize(pos, self.branches.id()).downcast::<Schedule>(&self.branches)
+        {
+            schedule.get_mut(&mut self.branches).stopped |= 1 << thread;
+        }
+    }
+
     /// The threads (as a bit set) that have been explored from the schedule
-    /// branch at `pos`, which is the next one to be taken.
-    pub(super) fn visited_at(&self, pos: usize) -> u8 {
+    /// branch at `pos`, and that do not have to be run again further down the
+    /// path that starts with `next` from there, until something happens that
+    /// their next operation depends on.
+    ///
+    /// Without a preemption bound that is every thread that has been
+    /// explored from there. With one, having explored a thread only says
+    /// something about the executions that were within the bound. Take an
+    /// execution that runs `next` and some more from here, and then gets to
+    /// the thread's step. Moving that step up to this point gives the
+    /// equivalent execution that has been explored, if it is within the
+    /// bound too, which it is if it has no more preemptions than the first
+    /// one. The two differ in three places:
+    ///
+    /// - Here: running the thread instead of `next`.
+    /// - After the thread's step: switching to `next`, which preempts the
+    ///   thread unless it cannot carry on.
+    /// - At the thread's step in the first execution: the thread that ran
+    ///   before it is preempted, or not, in favor of this thread in the one
+    ///   and of whichever runs next in the other. In the worst case that
+    ///   costs the first execution nothing more than the second.
+    ///
+    /// So the thread only sleeps if choosing it here, and leaving it after
+    /// its step, was no more of a preemption than choosing `next` is.
+    pub(super) fn explored_at(&self, pos: usize, next: usize) -> u8 {
         if pos >= self.branches.len() {
             return 0;
         }
@@ -299,11 +338,27 @@ impl Path {
             None => return 0,
         };
 
+        let bounded = self.preemption_bound.is_some();
+
+        // The cost of choosing a thread at this point.
+        let preempts = |thread: usize| {
+            schedule.initial_active.is_some() && schedule.initial_active != Some(thread as u8)
+        };
+
         schedule
             .threads
             .iter()
             .enumerate()
             .filter(|(_, th)| **th == Thread::Visited)
+            .filter(|&(i, _)| {
+                if !bounded {
+                    return true;
+                }
+
+                let carries_on = schedule.stopped & (1 << i) == 0;
+
+                preempts(i) as u8 + carries_on as u8 <= preempts(next) as u8
+            })
             .fold(0, |visited, (i, _)| visited | 1 << i)
     }
 
@@ -329,6 +384,7 @@ impl Path {
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
                 sleeping,
+                stopped: 0,
                 exploring: self.exploring,
             });
 

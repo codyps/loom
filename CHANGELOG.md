@@ -133,8 +133,7 @@ Counts below are without a preemption bound.
    join change alone), 7 now, where 6 orders exist. Three threads taking one
    lock twice each: 7,847 before, 95 now, where 90 orders exist. On by
    default; `model::Builder::sleep_sets` or `LOOM_SLEEP_SETS=0` turns it off.
-   Not used together with a preemption bound, which does not explore
-   everything below a point.
+   With a preemption bound, see the next entry.
 
    Checked by running each model in `tests/sleep_sets.rs` both ways and
    comparing the outcomes, and against the RC11 reference corpus (see
@@ -156,6 +155,21 @@ Counts below are without a preemption bound.
    model: an execution of a model with three or four threads went from about
    50 to about 30 microseconds.
 
+ - Sleep sets with a preemption bound. A bounded search does not explore
+   everything below a point, so having run a thread from there says less. A
+   thread now sleeps along another path if moving its step up to that point
+   cannot cost a preemption more: choosing it there, and leaving it after
+   its step, must be no more of a preemption than the choice the other path
+   starts with. With a bound of 3: two writers and two readers of two
+   atomics 40,572 executions to 10,950, a condition variable queue 401 to
+   117, three threads with mostly private work 70 to 18. With a bound of 1
+   there is next to nothing to gain. An exhaustive search of those three
+   takes 1,630, 38 and 7, so it is still the one to try first.
+
+   Checked on the litmus corpus at bounds 1, 2 and 3 against the same
+   search without sleep sets: no program loses an outcome. A few (68, 11
+   and 2 of 17,948) gain outcomes that are within the bound and were missed
+   before.
  - Atomics: the bookkeeping for the order of `SeqCst` operations took most
    of the time of a model that uses atomics, about ten times what an
    execution of a comparable model with locks takes. Sets of graph nodes
