@@ -141,6 +141,15 @@ Counts below are without a preemption bound.
    `tests/litmus_rc11`): all 17,930 programs that finish within the budget
    give exactly the reference outcomes, 2,736 more than finished before.
 
+ - `Arc`: only the drop that frees the value is explored against the other
+   drops. Which handle goes last is all that can be observed about the order
+   in which handles are dropped (the destructor runs on that thread), so
+   that drop is tried in place of each other thread's, and clones and the
+   remaining drops are not reordered at all. Three threads storing to an
+   atomic they share through `loom::sync::Arc` took 6,225 executions at
+   first and 27 with the two changes above; they now take 7, the same as
+   with handles loom does not see. `Arc::get_mut` is now explored against
+   clones and drops like `strong_count`.
  - Coroutines and their stacks are kept from one execution to the next.
    Mapping a stack with its guard page and unwinding the coroutine at the
    end, for every thread of every execution, was most of the time of a small

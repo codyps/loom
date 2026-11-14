@@ -276,3 +276,96 @@ fn sends_race_with_receiver_drop() {
         BTreeSet::from([(false, false), (false, true), (true, false), (true, true)])
     );
 }
+
+/// Whichever handle is dropped last frees the value, and runs its destructor
+/// on that thread. Every handle gets to be the last one.
+#[test]
+fn every_handle_can_be_dropped_last() {
+    struct DropOn(std::sync::Arc<Mutex<BTreeSet<String>>>);
+
+    impl Drop for DropOn {
+        fn drop(&mut self) {
+            let thread = format!("{:?}", thread::current().id());
+            self.0.lock().unwrap().insert(thread);
+        }
+    }
+
+    let dropped_on = std::sync::Arc::new(Mutex::new(BTreeSet::new()));
+
+    {
+        let dropped_on = dropped_on.clone();
+        loom::model(move || {
+            let value = Arc::new(DropOn(dropped_on.clone()));
+
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    let value = value.clone();
+                    thread::spawn(move || drop(value))
+                })
+                .collect();
+
+            drop(value);
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+
+    // The main thread and the three it spawned.
+    assert_eq!(dropped_on.lock().unwrap().len(), 4, "{:?}", dropped_on);
+}
+
+/// Which handle goes last has nothing to do with what else the threads did:
+/// the thread that frees the value can find any thread's store in `x`.
+#[test]
+fn last_drop_is_independent_of_other_operations() {
+    use loom::sync::atomic::AtomicUsize;
+    use loom::sync::atomic::Ordering::SeqCst;
+
+    type Seen = std::sync::Arc<Mutex<BTreeSet<(String, usize)>>>;
+
+    struct DropOn(Seen, std::sync::Arc<AtomicUsize>);
+
+    impl Drop for DropOn {
+        fn drop(&mut self) {
+            let thread = format!("{:?}", thread::current().id());
+            self.0.lock().unwrap().insert((thread, self.1.load(SeqCst)));
+        }
+    }
+
+    let seen = Seen::default();
+
+    {
+        let seen = seen.clone();
+        loom::model(move || {
+            let x = std::sync::Arc::new(AtomicUsize::new(0));
+            let value = Arc::new(DropOn(seen.clone(), x.clone()));
+
+            let handles: Vec<_> = (1..=3)
+                .map(|i| {
+                    let x = x.clone();
+                    let value = value.clone();
+                    thread::spawn(move || {
+                        x.store(i, SeqCst);
+                        drop(value);
+                    })
+                })
+                .collect();
+
+            drop(value);
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
+
+    let seen = seen.lock().unwrap();
+
+    // A spawned thread frees the value after all three stores, the last of
+    // which can be any of them: 3 x 3. The main thread does so after its own
+    // stores only, that is none: it is last when the other handles are gone,
+    // and by then the three stores have been made as well: 3 more.
+    assert_eq!(seen.len(), 12, "{:?}", seen);
+}

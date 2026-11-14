@@ -162,23 +162,31 @@ impl Execution {
                 None => continue,
             };
 
-            // Find the most recent dependent access that is not ordered
-            // before this operation: the two race, and the other order has to
-            // be explored as well.
-            let mut point = None;
+            // Find the dependent accesses that are not ordered before this
+            // operation: the two race, and the other order has to be
+            // explored as well. Usually it is enough to do that for the most
+            // recent one, see `races_with_all`.
+            let all = self.objects.races_with_all(operation);
+            let mut latest = None;
+            let path = &mut self.path;
 
             self.objects
                 .for_each_dependent_access(operation, true, |access| {
                     if access.happens_before(&th.dpor_vv) {
-                        // The previous access happened before this access, thus
-                        // there is no race.
+                        // The previous access happened before this access,
+                        // thus there is no race.
                         return;
                     }
 
-                    point = point.max(Some(access.path_id()));
+                    if all {
+                        // Track backtracking point
+                        path.backtrack(access.path_id(), th_id);
+                    } else {
+                        latest = latest.max(Some(access.path_id()));
+                    }
                 });
 
-            if let Some(point) = point {
+            if let Some(point) = latest {
                 // Track backtracking point
                 self.path.backtrack(point, th_id);
             }

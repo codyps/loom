@@ -23,29 +23,29 @@ pub(super) struct State {
     synchronize: Synchronize,
 
     /// Tracks access to the arc object, for deciding which operations to
-    /// explore in the other order.
+    /// explore in the other order. One access per thread and kind, as none
+    /// of the kinds is ordered among itself:
     ///
-    /// An inspection of the count is dependent with every change of it, but
-    /// not with other inspections. Clones are not dependent with each other
-    /// or with drops either: they commute, and a thread can only clone or
-    /// drop a handle of its own. So there is no single "last access" that
-    /// stands for all earlier ones. An inspection races with the last clone
-    /// of every other thread, and a clone or a drop races with the last
-    /// inspection of every other thread. Keeping one access per kind lets
-    /// one thread's access hide another thread's earlier one, and the
-    /// execution that reorders them is then never tried.
+    /// - Clones commute with each other and with drops. A thread can only
+    ///   clone or drop a handle of its own, so neither can make the other
+    ///   impossible.
+    /// - Drops commute with each other as well, with one exception: the drop
+    ///   that brings the count to zero frees the value, and runs its
+    ///   destructor on that thread. Which handle is the last to go is the
+    ///   only thing about the order of drops that can be observed, so the
+    ///   drop that frees the value is dependent with the last drop of every
+    ///   other thread, and no other drop is dependent with any.
+    /// - An inspection of the count is dependent with every change of it,
+    ///   and not with other inspections.
     last_ref_inc: [Option<Access>; MAX_THREADS],
+    last_ref_dec: [Option<Access>; MAX_THREADS],
     last_ref_inspect: [Option<Access>; MAX_THREADS],
-
-    /// Drops are dependent with each other (the last one frees the value), so
-    /// the last one stands for the ones before it.
-    last_ref_dec: Option<Access>,
 }
 
 /// Actions performed on the Arc
 ///
-/// Clones are only dependent with inspections. Drops are dependent between each
-/// other, and with inspections.
+/// Clones are only dependent with inspections. Drops are dependent with
+/// inspections, and the drop that frees the value with the other drops.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(super) enum Action {
     /// Clone the arc
@@ -67,8 +67,8 @@ impl Arc {
                 allocated: location,
                 synchronize: Synchronize::new(),
                 last_ref_inc: Default::default(),
+                last_ref_dec: Default::default(),
                 last_ref_inspect: Default::default(),
-                last_ref_dec: None,
             });
 
             trace!(?state, %location, "Arc::new");
@@ -90,7 +90,9 @@ impl Arc {
 
     /// Validate a `get_mut` call
     pub(crate) fn get_mut(&self, location: Location) -> bool {
-        self.branch(Action::RefDec, location);
+        // Whether this is the only handle depends on what the other handles'
+        // owners have done so far.
+        self.branch(Action::Inspect, location);
 
         rt::execution(|execution| {
             let state = self.state.get_mut(&mut execution.objects);
@@ -181,23 +183,47 @@ impl State {
         }
     }
 
+    /// Returns `true` if the next drop of a handle is the one that frees the
+    /// value.
+    fn next_drop_frees(&self) -> bool {
+        self.ref_cnt == 1
+    }
+
     /// Returns the previous accesses that `action` is dependent with.
     pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
-        let (inspections, incs, dec) = match action {
+        let (inspections, incs, decs) = match action {
             // Clones are only dependent with inspections.
-            Action::RefInc => (&self.last_ref_inspect[..], &[][..], None),
-            // Drops are dependent with each other, and with inspections.
-            Action::RefDec => (
-                &self.last_ref_inspect[..],
-                &[][..],
-                self.last_ref_dec.as_ref(),
-            ),
+            Action::RefInc => (&self.last_ref_inspect[..], &[][..], &[][..]),
+            // Drops are dependent with inspections. The one that frees the
+            // value is dependent with the other drops, too.
+            Action::RefDec if self.next_drop_frees() => {
+                (&self.last_ref_inspect[..], &[][..], &self.last_ref_dec[..])
+            }
+            Action::RefDec => (&self.last_ref_inspect[..], &[][..], &[][..]),
             // Inspections are dependent with everything that changes the
             // count.
-            Action::Inspect => (&[][..], &self.last_ref_inc[..], self.last_ref_dec.as_ref()),
+            Action::Inspect => (&[][..], &self.last_ref_inc[..], &self.last_ref_dec[..]),
         };
 
-        inspections.iter().chain(incs.iter()).flatten().chain(dec)
+        inspections
+            .iter()
+            .chain(incs.iter())
+            .chain(decs.iter())
+            .flatten()
+    }
+
+    /// Returns `true` if `action` has to be tried before each of the
+    /// accesses it is dependent with, and not only before the most recent
+    /// one.
+    ///
+    /// Trying it before the most recent one is enough when doing so turns
+    /// the access before that into the most recent one of the next
+    /// execution. That is not the case for the drop that frees the value:
+    /// moved before another drop, it is not the one that frees the value
+    /// anymore, and has nothing left to be reordered with. Each of the
+    /// other handles has to get its turn at being the last one directly.
+    pub(super) fn races_with_all(&self, action: Action) -> bool {
+        action == Action::RefDec && self.next_drop_frees()
     }
 
     /// Returns `true` unless two operations by different threads lead to the
@@ -227,7 +253,7 @@ impl State {
     ) {
         let access = match action {
             Action::RefInc => &mut self.last_ref_inc[thread],
-            Action::RefDec => &mut self.last_ref_dec,
+            Action::RefDec => &mut self.last_ref_dec[thread],
             Action::Inspect => &mut self.last_ref_inspect[thread],
         };
 

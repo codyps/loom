@@ -189,3 +189,81 @@ fn critical_sections() {
 
     assert!((90..=110).contains(&count), "{}", count);
 }
+
+/// Handing each thread a handle to a shared value should cost little. The
+/// handles are dropped in some order, of which only one thing can be
+/// observed: which one goes last.
+#[test]
+fn shared_arc_handles() {
+    use loom::sync::Arc;
+
+    let count = executions(|| {
+        let value = Arc::new(0usize);
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let value = value.clone();
+                thread::spawn(move || drop(value))
+            })
+            .collect();
+
+        drop(value);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    // One execution per handle that can be last would be 4.
+    assert!((4..=16).contains(&count), "{} executions", count);
+}
+
+/// ... and nothing at all if the threads' handles are gone before the last
+/// one is.
+#[test]
+fn arc_handles_outlived_by_owner() {
+    use loom::sync::Arc;
+
+    let count = executions(|| {
+        let value = Arc::new(0usize);
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let value = value.clone();
+                thread::spawn(move || drop(value))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        drop(value);
+    });
+
+    assert_eq!(count, 1);
+}
+
+/// A value shared through loom's `Arc` costs about what the same model costs
+/// with handles loom does not see.
+#[test]
+fn stores_through_shared_arc_handles() {
+    use loom::sync::Arc;
+
+    let count = executions(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let x = x.clone();
+                thread::spawn(move || x.store(i, SeqCst))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    assert!((6..=8).contains(&count), "{}", count);
+}

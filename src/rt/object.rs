@@ -383,6 +383,15 @@ impl Store {
         }
     }
 
+    /// Returns `true` if `operation` has to be tried before each of the
+    /// accesses it is dependent with, and not only the most recent one.
+    pub(super) fn races_with_all(&self, operation: Operation) -> bool {
+        match &self.entries[operation.obj.index] {
+            Entry::Arc(entry) => entry.races_with_all(operation.action.into()),
+            _ => false,
+        }
+    }
+
     pub(super) fn set_last_access(
         &mut self,
         operation: Operation,
