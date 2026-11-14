@@ -36,6 +36,10 @@ pub(crate) struct Path {
 
     /// How to reset the `exploring` state
     exploring_on_start: bool,
+
+    /// If true, threads may be put to sleep, see `sleep_sets`.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    sleep_sets: bool,
 }
 
 #[derive(Debug)]
@@ -53,6 +57,12 @@ pub(crate) struct Schedule {
 
     /// The previous schedule branch
     prev: Option<object::Ref<Schedule>>,
+
+    /// The threads (as a bit set) that are asleep at this point: running
+    /// them from here leads to nothing that has not been explored already,
+    /// see `Execution::schedule`.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    sleeping: u8,
 
     exploring: bool,
 }
@@ -138,6 +148,7 @@ impl Path {
             exploring,
             skipping: false,
             exploring_on_start: exploring,
+            sleep_sets: false,
         }
     }
 
@@ -262,9 +273,44 @@ impl Path {
     }
 
     /// Returns the thread identifier to schedule
+    /// Returns `true` if threads can be put to sleep. That relies on
+    /// everything below a branch having been explored once the search has
+    /// moved past it, which a preemption bound does not provide, and a single
+    /// execution chosen by input makes meaningless.
+    pub(super) fn sleep_sets(&self) -> bool {
+        self.sleep_sets && self.preemption_bound.is_none() && self.input.is_none() && !self.skipping
+    }
+
+    pub(crate) fn set_sleep_sets(&mut self, sleep_sets: bool) {
+        self.sleep_sets = sleep_sets;
+    }
+
+    /// The threads (as a bit set) that have been explored from the schedule
+    /// branch at `pos`, which is the next one to be taken.
+    pub(super) fn visited_at(&self, pos: usize) -> u8 {
+        if pos >= self.branches.len() {
+            return 0;
+        }
+
+        let schedule = match object::Ref::from_usize(pos, self.branches.id())
+            .downcast::<Schedule>(&self.branches)
+        {
+            Some(schedule) => schedule.get(&self.branches),
+            None => return 0,
+        };
+
+        schedule
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, th)| **th == Thread::Visited)
+            .fold(0, |visited, (i, _)| visited | 1 << i)
+    }
+
     pub(super) fn branch_thread(
         &mut self,
         execution_id: execution::Id,
+        sleeping: u8,
         seed: impl ExactSizeIterator<Item = Thread>,
     ) -> Option<thread::Id> {
         if self.is_traversed() {
@@ -282,6 +328,7 @@ impl Path {
                 initial_active: None,
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
+                sleeping,
                 exploring: self.exploring,
             });
 
@@ -576,11 +623,27 @@ impl Schedule {
             return;
         }
 
-        if self.threads[thread_id].is_enabled() {
+        // The thread is to be tried from here because something it does
+        // further down should come before something another thread does
+        // there. If it can run here and is awake, that is what to try.
+        //
+        // If it is asleep, running it from here has been explored from an
+        // earlier point, with nothing having happened since that would make
+        // its next step turn out differently. That does not settle the
+        // matter, though: what should come earlier may be a later step of
+        // the thread, one that some other thread has to enable or to change
+        // the outcome of first. Which thread that is, is not known here, so
+        // as when the thread cannot run at all, every thread that is awake
+        // gets tried.
+        let asleep = self.sleeping & (1 << thread_id) != 0;
+
+        if self.threads[thread_id].is_enabled() && !asleep {
             self.threads[thread_id].explore();
         } else {
-            for th in &mut self.threads {
-                th.explore();
+            for (i, th) in self.threads.iter_mut().enumerate() {
+                if self.sleeping & (1 << i) == 0 {
+                    th.explore();
+                }
             }
         }
     }
@@ -621,15 +684,19 @@ mod tests {
         path.set_input(&[5, 3]);
         let id = execution::Id::new();
         assert_eq!(
-            path.branch_thread(id, [Thread::Active].into_iter())
+            path.branch_thread(id, 0, [Thread::Active].into_iter())
                 .unwrap()
                 .as_usize(),
             0
         );
         assert_eq!(
-            path.branch_thread(id, [Thread::Active, Thread::Skip, Thread::Skip].into_iter())
-                .unwrap()
-                .as_usize(),
+            path.branch_thread(
+                id,
+                0,
+                [Thread::Active, Thread::Skip, Thread::Skip].into_iter()
+            )
+            .unwrap()
+            .as_usize(),
             2
         );
         path.push_load(&[4]);
@@ -663,7 +730,7 @@ mod tests {
         path.set_input(&[1, 0, 1]);
         let id = execution::Id::new();
         let next = |path: &mut Path, threads: [Thread; 2]| {
-            path.branch_thread(id, threads.into_iter())
+            path.branch_thread(id, 0, threads.into_iter())
                 .unwrap()
                 .as_usize()
         };
@@ -681,7 +748,7 @@ mod tests {
         path.set_input(&[1]);
         let id = execution::Id::new();
         assert_eq!(
-            path.branch_thread(id, [Thread::Yield, Thread::Active].into_iter())
+            path.branch_thread(id, 0, [Thread::Yield, Thread::Active].into_iter())
                 .unwrap()
                 .as_usize(),
             1

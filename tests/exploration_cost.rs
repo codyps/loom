@@ -26,6 +26,7 @@ fn executions(f: impl Fn() + Sync + Send + 'static) -> usize {
 
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = None;
+        builder.sleep_sets = true;
 
         builder.check(move || {
             count.fetch_add(1, SeqCst);
@@ -139,4 +140,52 @@ fn operations_after_join_are_ordered() {
     });
 
     assert_eq!(count, 1);
+}
+
+/// Three stores to one atomic can be ordered six ways. The search may repeat
+/// itself a little on the way, but not by much.
+#[test]
+fn stores_to_a_shared_atomic() {
+    let count = executions(|| {
+        let x = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let x = x.clone();
+                thread::spawn(move || x.store(i, SeqCst))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    assert!((6..=8).contains(&count), "{}", count);
+}
+
+/// Three threads taking a lock twice each: 6! / (2! 2! 2!) = 90 orders.
+#[test]
+fn critical_sections() {
+    let count = executions(|| {
+        let x = std::sync::Arc::new(Mutex::new(0));
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let x = x.clone();
+                thread::spawn(move || {
+                    *x.lock().unwrap() += 1;
+                    *x.lock().unwrap() += 1;
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(*x.lock().unwrap(), 6);
+    });
+
+    assert!((90..=110).contains(&count), "{}", count);
 }

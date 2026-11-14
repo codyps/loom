@@ -24,6 +24,13 @@ pub(crate) struct Execution {
     /// The order of `SeqCst` operations.
     pub(super) seq_cst: SeqCst,
 
+    /// The threads (as a bit set) that are asleep: each is about to execute
+    /// an operation that has already been explored from an earlier point of
+    /// this execution, with nothing dependent on it having happened since.
+    /// Scheduling such a thread now can only lead to executions that are
+    /// equivalent to ones explored from that earlier point.
+    sleeping: u8,
+
     /// Maps raw allocations to LeakTrack objects
     pub(super) raw_allocations: HashMap<usize, Allocation>,
 
@@ -68,6 +75,7 @@ impl Execution {
             lazy_statics: lazy_static::Set::new(),
             objects: object::Store::with_capacity(max_branches),
             seq_cst: SeqCst::default(),
+            sleeping: 0,
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
             max_threads,
@@ -129,6 +137,7 @@ impl Execution {
             threads,
             objects,
             seq_cst,
+            sleeping: 0,
             lazy_statics,
             raw_allocations,
             arc_objs,
@@ -178,29 +187,54 @@ impl Execution {
         // It's important to avoid pre-emption as much as possible
         let mut initial = Some(self.threads.active_id());
 
+        if !self.path.sleep_sets() {
+            self.sleeping = 0;
+        }
+
         // If the thread is not runnable, then we can pick any arbitrary other
         // runnable thread.
         if !self.threads.active().is_runnable() {
             initial = None;
 
-            for (i, th) in self.threads.iter() {
-                if !th.is_runnable() {
-                    continue;
+            // A thread that is awake, if there is one.
+            for asleep in [false, true] {
+                for (i, th) in self.threads.iter() {
+                    if !th.is_runnable() {
+                        continue;
+                    }
+
+                    if (self.sleeping & (1 << i.as_usize()) != 0) != asleep {
+                        continue;
+                    }
+
+                    if let Some(ref mut init) = initial {
+                        if th.yield_count < self.threads[*init].yield_count {
+                            *init = i;
+                        }
+                    } else {
+                        initial = Some(i)
+                    }
                 }
 
-                if let Some(ref mut init) = initial {
-                    if th.yield_count < self.threads[*init].yield_count {
-                        *init = i;
+                if initial.is_some() {
+                    if asleep && self.path.is_traversed() {
+                        // Everything that can run is asleep, so this
+                        // execution is going to repeat one that has been
+                        // explored. It still has to run to its end, but
+                        // there is nothing to be explored on the way.
+                        self.path.skip_branch();
+                        self.sleeping = 0;
                     }
-                } else {
-                    initial = Some(i)
+
+                    break;
                 }
             }
         }
 
         let path_id = self.path.pos();
+        let sleeping = self.sleeping;
 
-        let next = self.path.branch_thread(self.id, {
+        let next = self.path.branch_thread(self.id, sleeping, {
             self.threads.iter().map(|(i, th)| {
                 if initial.is_none() && th.is_runnable() {
                     initial = Some(i);
@@ -248,6 +282,48 @@ impl Execution {
         }
 
         let switched = Some(self.threads.active_id()) != next;
+
+        // The threads that have been run from this point before are asleep
+        // from here on, along with the ones that already were. They wake up
+        // when something happens that their next operation depends on, which
+        // may be the very operation that is about to be executed.
+        if self.path.sleep_sets() {
+            let visited = self.path.visited_at(path_id);
+            let mut sleeping = 0;
+
+            if let Some(next) = next {
+                let executed = self.threads[next].operation;
+
+                for (i, th) in self.threads.iter() {
+                    let bit = 1 << i.as_usize();
+
+                    if i == next || (self.sleeping | visited) & bit == 0 {
+                        continue;
+                    }
+
+                    let independent = match (th.operation, executed) {
+                        (Some(pending), Some(executed)) => {
+                            !self.objects.dependent(pending, executed)
+                        }
+                        // A thread without a pending operation is not at an
+                        // operation at all: it is starting, or continuing
+                        // after having been woken, and its step ends at the
+                        // next operation it gets to, before executing it.
+                        // Such a step touches nothing loom models, so it
+                        // commutes with everything.
+                        _ => true,
+                    };
+
+                    if independent && th.is_runnable() {
+                        sleeping |= bit;
+                    }
+                }
+            }
+
+            self.sleeping = sleeping;
+        } else {
+            self.sleeping = 0;
+        }
 
         self.threads.set_active(next);
 

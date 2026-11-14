@@ -99,6 +99,24 @@ pub struct Builder {
     ///
     /// Defaults to existence of `LOOM_LOG` environment variable.
     pub log: bool,
+
+    /// Skip executions that can only repeat ones already explored.
+    ///
+    /// Once every execution in which some thread runs next has been explored
+    /// from a point, loom remembers, further down every other path from that
+    /// point, that running this thread leads to nothing new, until something
+    /// happens that the thread's next operation depends on. (These are the
+    /// "sleep sets" of partial order reduction.) This does not change what
+    /// loom finds, only how many executions it takes, often by orders of
+    /// magnitude.
+    ///
+    /// It is not used together with a preemption bound: a bounded search
+    /// does not explore everything below a point, so nothing can be concluded
+    /// from having been there.
+    ///
+    /// Defaults to `true`. Setting the `LOOM_SLEEP_SETS` environment variable
+    /// to `0` turns it off.
+    pub sleep_sets: bool,
 }
 
 impl Builder {
@@ -120,6 +138,8 @@ impl Builder {
         let location = env::var("LOOM_LOCATION").is_ok();
 
         let log = env::var("LOOM_LOG").is_ok();
+
+        let sleep_sets = env::var("LOOM_SLEEP_SETS").map_or(true, |v| v != "0");
 
         let max_duration = env::var("LOOM_MAX_DURATION")
             .map(|v| {
@@ -159,6 +179,7 @@ impl Builder {
             expect_explicit_explore: false,
             location,
             log,
+            sleep_sets,
         }
     }
 
@@ -293,6 +314,7 @@ impl Builder {
 
         execution.log = self.log;
         execution.location = self.location;
+        execution.path.set_sleep_sets(self.sleep_sets);
 
         let f = Arc::new(f);
 

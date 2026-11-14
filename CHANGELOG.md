@@ -115,6 +115,32 @@ and release, and on the lowest allowed direct dependency versions.
    uses `-Z direct-minimal-versions`: with transitive minimal versions,
    `sharded-slab` picks a `lazy_static` it cannot compile against.
 
+### Performance
+
+How many executions a model takes decides how large a model can be checked.
+Counts below are without a preemption bound.
+
+ - Joining a thread no longer races with that thread's exit. Whether the
+   thread has finished by the time it is joined cannot be observed, but both
+   orders used to be explored, for every join: three threads that do nothing
+   took 26 executions and now take 1. `JoinHandle::is_finished` can observe
+   it and is still explored against the exit.
+ - Sleep sets: once everything that follows from running a thread at some
+   point has been explored, that thread is not run again along the other
+   paths from that point until something happens that its next operation
+   depends on. An execution in which only such threads can run is cut short.
+   Three threads storing to one atomic: 6,225 executions before (414 with the
+   join change alone), 7 now, where 6 orders exist. Three threads taking one
+   lock twice each: 7,847 before, 95 now, where 90 orders exist. On by
+   default; `model::Builder::sleep_sets` or `LOOM_SLEEP_SETS=0` turns it off.
+   Not used together with a preemption bound, which does not explore
+   everything below a point.
+
+   Checked by running each model in `tests/sleep_sets.rs` both ways and
+   comparing the outcomes, and against the RC11 reference corpus (see
+   `tests/litmus_rc11`): all 17,930 programs that finish within the budget
+   give exactly the reference outcomes, 2,736 more than finished before.
+
 ### Documented
 
  - Mock `lazy_static` values, and loom objects generally, do not outlive the

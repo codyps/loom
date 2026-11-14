@@ -186,7 +186,7 @@ impl Action {
         }
     }
 
-    fn is_load(self) -> bool {
+    pub(super) fn is_load(self) -> bool {
         matches!(self, Action::Load | Action::LoadSeqCst)
     }
 

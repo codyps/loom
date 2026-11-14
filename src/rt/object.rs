@@ -350,6 +350,39 @@ impl Store {
         }
     }
 
+    /// Returns `true` unless executing `a` and `b`, which are operations
+    /// different threads are about to execute, in either order is known to
+    /// lead to the same state. This is deliberately coarse: when in doubt,
+    /// the operations are dependent.
+    pub(super) fn dependent(&self, a: Operation, b: Operation) -> bool {
+        let entry_a = &self.entries[a.obj.index];
+        let entry_b = &self.entries[b.obj.index];
+
+        if a.obj.index != b.obj.index {
+            return match (entry_a, entry_b) {
+                // Waiting on a condition variable releases and reacquires a
+                // mutex.
+                (Entry::Condvar(_), Entry::Mutex(_)) | (Entry::Mutex(_), Entry::Condvar(_)) => true,
+                // A `SeqCst` fence concerns every atomic.
+                (Entry::SeqCstFences(_), Entry::Atomic(_))
+                | (Entry::Atomic(_), Entry::SeqCstFences(_)) => true,
+                _ => false,
+            };
+        }
+
+        match entry_a {
+            Entry::Atomic(_) => {
+                let (a, b): (rt::atomic::Action, rt::atomic::Action) =
+                    (a.action.into(), b.action.into());
+
+                // Loads do not affect each other.
+                !(a.is_load() && b.is_load())
+            }
+            Entry::Arc(entry) => entry.dependent(a.action.into(), b.action.into()),
+            _ => true,
+        }
+    }
+
     pub(super) fn set_last_access(
         &mut self,
         operation: Operation,

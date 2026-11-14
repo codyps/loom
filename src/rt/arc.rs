@@ -200,6 +200,24 @@ impl State {
         inspections.iter().chain(incs.iter()).flatten().chain(dec)
     }
 
+    /// Returns `true` unless two operations by different threads lead to the
+    /// same state in either order.
+    pub(super) fn dependent(&self, a: Action, b: Action) -> bool {
+        use Action::*;
+
+        match (a, b) {
+            // Clones commute with each other and with drops.
+            (RefInc, RefInc) | (RefInc, RefDec) | (RefDec, RefInc) => false,
+            // Drops commute unless the second one frees the value, in which
+            // case the order decides which thread that is.
+            (RefDec, RefDec) => self.ref_cnt <= 2,
+            // Inspections do not affect each other.
+            (Inspect, Inspect) => false,
+            // An inspection sees the count change.
+            _ => true,
+        }
+    }
+
     pub(super) fn set_last_access(
         &mut self,
         action: Action,

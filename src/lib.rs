@@ -352,6 +352,10 @@
 //! LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test --test loom_my_struct --release
 //! ```
 //!
+//! Without a bound, loom skips executions that can only repeat ones it has already explored
+//! (see [`Builder::sleep_sets`](model::Builder::sleep_sets)). A bounded search cannot do that, so
+//! for a small model the exhaustive check may well be the faster one: try it first.
+//!
 //! ## Relaxed Memory Ordering
 //!
 //! The [`Relaxed` memory ordering](std::sync::atomic::Ordering::Relaxed) allows particularly
