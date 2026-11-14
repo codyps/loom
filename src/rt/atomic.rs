@@ -136,6 +136,10 @@ pub(super) struct State {
     /// recent stores to the atomic cell in loom execution order.
     stores: [Store; MAX_ATOMIC_HISTORY],
 
+    /// What `mo_before` returned, if nothing that it is computed from has
+    /// changed since. It is asked for several times per operation.
+    mo_cache: MoCache,
+
     /// The total number of stores to the cell.
     cnt: u16,
 }
@@ -316,6 +320,48 @@ fn product(from: &NodeSet, to: &NodeSet, edges: &mut Vec<(usize, usize)>) {
         }
     }
 }
+
+/// A modification order as `State::mo_before` returns it, or nothing.
+///
+/// The state of an atomic is shared between threads as far as the compiler
+/// is concerned, so this is an atomic: the bytes of the order, and a bit
+/// that says they are there.
+#[derive(Debug, Default)]
+struct MoCache(std::sync::atomic::AtomicU64);
+
+impl MoCache {
+    const VALID: u64 = 1 << 63;
+
+    fn get(&self) -> Option<[u8; MAX_ATOMIC_HISTORY]> {
+        let packed = self.0.load(std::sync::atomic::Ordering::Relaxed);
+
+        if packed & Self::VALID == 0 {
+            return None;
+        }
+
+        let mut before = [0; MAX_ATOMIC_HISTORY];
+        before.copy_from_slice(&packed.to_le_bytes()[..MAX_ATOMIC_HISTORY]);
+
+        Some(before)
+    }
+
+    fn set(&self, before: [u8; MAX_ATOMIC_HISTORY]) {
+        let mut bytes = [0; 8];
+        bytes[..MAX_ATOMIC_HISTORY].copy_from_slice(&before);
+
+        self.0.store(
+            u64::from_le_bytes(bytes) | Self::VALID,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn clear(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// The order of seven stores and the marker have to fit.
+const _: () = assert!(MAX_ATOMIC_HISTORY < 8);
 
 #[derive(Debug)]
 struct FirstSeen([u16; MAX_THREADS]);
@@ -755,6 +801,7 @@ impl State {
             last_non_load_access: None,
             spuriously_failed: 0,
             stores: Default::default(),
+            mo_cache: MoCache::default(),
             cnt: 0,
         };
 
@@ -831,6 +878,8 @@ impl State {
     ) {
         let index = index(self.cnt);
 
+        self.mo_cache.clear();
+
         // Increment the count
         self.cnt += 1;
 
@@ -878,7 +927,20 @@ impl State {
     /// The modification order as far as it is known: bit `i` of entry `j` is
     /// set if the store in slot `i` is ordered before the one in slot `j`.
     fn mo_before(&self) -> [u8; MAX_ATOMIC_HISTORY] {
-        self.mo_before_with(0, 0)
+        if let Some(before) = self.mo_cache.get() {
+            debug_assert_eq!(
+                before,
+                self.mo_before_with(0, 0),
+                "[loom internal bug] stale modification order"
+            );
+
+            return before;
+        }
+
+        let before = self.mo_before_with(0, 0);
+        self.mo_cache.set(before);
+
+        before
     }
 
     /// The modification order as it would be if the stores in the slots of
@@ -1161,6 +1223,7 @@ impl State {
         seq_cst: &SeqCst,
         atomic: usize,
         index: usize,
+        mo_before: &[u8; MAX_ATOMIC_HISTORY],
         success: Ordering,
         failure: Ordering,
     ) -> bool {
@@ -1196,7 +1259,7 @@ impl State {
             nodes[index].loads.insert(seq_cst.len());
         }
 
-        let preds = self.coherence_preds(threads, index, &self.mo_before());
+        let preds = self.coherence_preds(threads, index, mo_before);
         let before = self.mo_before_with(index, preds);
 
         let mut edges = Self::seq_cst_edges(&before, &nodes);
@@ -1240,6 +1303,7 @@ impl State {
         seq_cst: &SeqCst,
         atomic: usize,
         index: usize,
+        mo_before: &[u8; MAX_ATOMIC_HISTORY],
         ordering: Ordering,
         is_seq_cst: bool,
     ) -> bool {
@@ -1273,7 +1337,7 @@ impl State {
             nodes[index].loads.insert(seq_cst.len());
         }
 
-        let preds = self.coherence_preds(threads, index, &self.mo_before());
+        let preds = self.coherence_preds(threads, index, mo_before);
         let before = self.mo_before_with(index, preds);
 
         // ... and whether the order of `SeqCst` operations can accommodate
@@ -1285,6 +1349,8 @@ impl State {
 
     fn forget_slot(&mut self, slot: usize) {
         let mask = !(1u8 << slot);
+
+        self.mo_cache.clear();
 
         for store in &mut self.stores {
             store.mo_preds &= mask;
@@ -1373,6 +1439,8 @@ impl State {
                 // just reused for the new store.
                 let written = (self.cnt as usize - 1) % MAX_ATOMIC_HISTORY;
 
+                self.mo_cache.clear();
+
                 if written != index {
                     self.stores[written].rmw_of = Some(index as u8);
                 }
@@ -1416,6 +1484,7 @@ impl State {
         let before = self.mo_before();
 
         self.stores[index].mo_preds |= self.coherence_preds(threads, index, &before);
+        self.mo_cache.clear();
     }
 
     /// Track an atomic load
@@ -1613,7 +1682,15 @@ impl State {
                 }
             }
 
-            if !self.load_admissible(threads, seq_cst, atomic, i, ordering, is_seq_cst(ordering)) {
+            if !self.load_admissible(
+                threads,
+                seq_cst,
+                atomic,
+                i,
+                &before,
+                ordering,
+                is_seq_cst(ordering),
+            ) {
                 // Returning this store contradicts the order of `SeqCst`
                 // operations.
                 continue 'outer;
@@ -1682,7 +1759,7 @@ impl State {
                 }
             }
 
-            if !self.rmw_admissible(threads, seq_cst, atomic, i, success, failure) {
+            if !self.rmw_admissible(threads, seq_cst, atomic, i, &before, success, failure) {
                 continue 'outer;
             }
 

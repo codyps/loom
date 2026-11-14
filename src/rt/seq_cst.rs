@@ -37,46 +37,77 @@
 use crate::rt::{VersionVec, MAX_THREADS};
 
 /// A set of nodes of the graph.
+///
+/// These are created, copied and merged for every atomic operation, and
+/// nearly always hold only a few low-numbered nodes: the first 64 are kept
+/// in place, without an allocation.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct NodeSet(Vec<u64>);
+pub(crate) struct NodeSet {
+    /// Nodes 0 to 63.
+    first: u64,
+
+    /// Nodes from 64 on.
+    rest: Vec<u64>,
+}
 
 impl NodeSet {
     pub(crate) fn insert(&mut self, node: usize) {
-        let word = node / 64;
-
-        if self.0.len() <= word {
-            self.0.resize(word + 1, 0);
+        if node < 64 {
+            self.first |= 1 << node;
+            return;
         }
 
-        self.0[word] |= 1 << (node % 64);
+        let word = node / 64 - 1;
+
+        if self.rest.len() <= word {
+            self.rest.resize(word + 1, 0);
+        }
+
+        self.rest[word] |= 1 << (node % 64);
     }
 
     pub(crate) fn contains(&self, node: usize) -> bool {
-        self.0
-            .get(node / 64)
+        if node < 64 {
+            return self.first & (1 << node) != 0;
+        }
+
+        self.rest
+            .get(node / 64 - 1)
             .map_or(false, |word| word & (1 << (node % 64)) != 0)
     }
 
     pub(crate) fn union_with(&mut self, other: &NodeSet) {
-        if self.0.len() < other.0.len() {
-            self.0.resize(other.0.len(), 0);
+        self.first |= other.first;
+
+        if self.rest.len() < other.rest.len() {
+            self.rest.resize(other.rest.len(), 0);
         }
 
-        for (word, other) in self.0.iter_mut().zip(&other.0) {
+        for (word, other) in self.rest.iter_mut().zip(&other.rest) {
             *word |= other;
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.iter().all(|word| *word == 0)
+        self.first == 0 && self.rest.iter().all(|word| *word == 0)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(i, word)| {
-            (0..64)
-                .filter(move |bit| word & (1 << bit) != 0)
-                .map(move |bit| i * 64 + bit)
-        })
+        std::iter::once(self.first)
+            .chain(self.rest.iter().copied())
+            .enumerate()
+            .flat_map(|(i, mut word)| {
+                std::iter::from_fn(move || {
+                    if word == 0 {
+                        return None;
+                    }
+
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+
+                    Some(i * 64 + bit)
+                })
+            })
     }
 }
 

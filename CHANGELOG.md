@@ -156,6 +156,15 @@ Counts below are without a preemption bound.
    model: an execution of a model with three or four threads went from about
    50 to about 30 microseconds.
 
+ - Atomics: the bookkeeping for the order of `SeqCst` operations took most
+   of the time of a model that uses atomics, about ten times what an
+   execution of a comparable model with locks takes. Sets of graph nodes
+   are kept in place instead of on the heap and iterated without scanning
+   for empty bits, and the modification order is computed once per change
+   instead of once per question. An execution of four threads doing three
+   `fetch_add` each goes from 47 to 19 microseconds (372,939 executions:
+   17.7 s to 7.3 s).
+
 ### Documented
 
  - Mock `lazy_static` values, and loom objects generally, do not outlive the
