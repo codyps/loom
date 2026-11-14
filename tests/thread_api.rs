@@ -173,6 +173,57 @@ fn global_stack_size() {
     })
 }
 
+/// Stacks are kept from one execution to the next, and a thread must not be
+/// given one that is smaller than what it asked for, whatever order the
+/// threads are spawned in.
+#[test]
+fn stack_sizes_across_executions() {
+    use loom::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
+    use std::sync::Arc;
+
+    const STACK_SIZE: usize = 1 << 16;
+
+    let executions = Arc::new(StdAtomicUsize::new(0));
+    let count = executions.clone();
+
+    let mut builder = loom::model::Builder::new();
+    builder.stack_size = Some(1 << 13);
+    builder.check(move || {
+        let execution = count.fetch_add(1, SeqCst);
+        let value = Arc::new(AtomicUsize::new(0));
+
+        let large = |value: Arc<AtomicUsize>| {
+            thread::Builder::new()
+                .stack_size(2 * STACK_SIZE)
+                .spawn(move || {
+                    std::hint::black_box(&mut [0usize; STACK_SIZE]);
+                    value.fetch_add(1, SeqCst);
+                })
+                .unwrap()
+        };
+        let small = |value: Arc<AtomicUsize>| {
+            thread::spawn(move || {
+                value.fetch_add(1, SeqCst);
+            })
+        };
+
+        let handles = if execution % 2 == 0 {
+            [large(value.clone()), small(value.clone())]
+        } else {
+            [small(value.clone()), large(value.clone())]
+        };
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(value.load(SeqCst), 2);
+    });
+
+    assert!(executions.load(SeqCst) > 1);
+}
+
 #[test]
 fn park_unpark_loom() {
     loom::model(|| {

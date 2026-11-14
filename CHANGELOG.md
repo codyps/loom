@@ -141,6 +141,12 @@ Counts below are without a preemption bound.
    `tests/litmus_rc11`): all 17,930 programs that finish within the budget
    give exactly the reference outcomes, 2,736 more than finished before.
 
+ - Coroutines and their stacks are kept from one execution to the next.
+   Mapping a stack with its guard page and unwinding the coroutine at the
+   end, for every thread of every execution, was most of the time of a small
+   model: an execution of a model with three or four threads went from about
+   50 to about 30 microseconds.
+
 ### Documented
 
  - Mock `lazy_static` values, and loom objects generally, do not outlive the

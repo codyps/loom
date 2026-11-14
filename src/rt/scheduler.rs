@@ -9,6 +9,16 @@ use std::collections::VecDeque;
 
 pub(crate) struct Scheduler {
     max_threads: usize,
+
+    /// Coroutines left over from earlier executions, each with the stack
+    /// size it was created with. They have run their thread to its end and
+    /// are waiting to be handed another one.
+    ///
+    /// Setting up a coroutine means mapping a stack and its guard page, and
+    /// finishing one means unwinding it. A model is executed a great many
+    /// times with the same few threads, and doing both for every thread of
+    /// every execution took most of the time of a small model.
+    idle: Vec<(Option<usize>, Thread)>,
 }
 
 type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
@@ -32,6 +42,7 @@ impl Scheduler {
     pub(crate) fn new(capacity: usize) -> Scheduler {
         Scheduler {
             max_threads: capacity,
+            idle: Vec::new(),
         }
     }
 
@@ -97,22 +108,23 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
+        // If the execution panics, the coroutines are dropped right here,
+        // which unwinds whatever is still on their stacks.
         let mut threads = Vec::new();
-        threads.push(spawn_thread(Box::new(f), stack_size));
-        threads[0].resume();
+        threads.push(self.spawn_thread(Box::new(f), stack_size));
+        threads[0].1.resume();
 
         loop {
             if execution.threads.is_complete() {
-                for thread in &mut threads {
-                    thread.resume();
-                    assert!(thread.is_done());
-                }
+                // Every thread has returned, so every coroutine is back
+                // where it waits for a thread to run.
+                self.idle.append(&mut threads);
                 return;
             }
 
             let active = execution.threads.active_id();
 
-            let mut queued_spawn = Self::tick(&mut threads[active.as_usize()], execution);
+            let mut queued_spawn = Self::tick(&mut threads[active.as_usize()].1, execution);
 
             while let Some(th) = queued_spawn.pop_front() {
                 assert!(threads.len() < self.max_threads);
@@ -123,10 +135,31 @@ impl Scheduler {
                     stack_size: thread_stack_size,
                 } = th;
 
-                threads.push(spawn_thread(f, thread_stack_size.or(stack_size)));
-                threads[thread_id].resume();
+                threads.push(self.spawn_thread(f, thread_stack_size.or(stack_size)));
+                threads[thread_id].1.resume();
             }
         }
+    }
+
+    /// Returns a coroutine that is about to run `f`, reusing an idle one
+    /// with the same stack size if there is one.
+    fn spawn_thread(
+        &mut self,
+        f: Box<dyn FnOnce()>,
+        stack_size: Option<usize>,
+    ) -> (Option<usize>, Thread) {
+        let idle = self.idle.iter().rposition(|(size, _)| *size == stack_size);
+
+        let thread = match idle {
+            Some(idle) => {
+                let (_, mut thread) = self.idle.swap_remove(idle);
+                thread.set_para(Some(f));
+                thread
+            }
+            None => spawn_thread(f, stack_size),
+        };
+
+        (stack_size, thread)
     }
 
     fn tick(thread: &mut Thread, execution: &mut Execution) -> VecDeque<QueuedSpawn> {
@@ -182,6 +215,21 @@ impl Scheduler {
             let mut guard = DropGuard(state.borrow_mut(), Default::default());
             guard.run(f)
         })
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Dropping the coroutines cancels them.
+            return;
+        }
+
+        // Let the idle coroutines run to their end.
+        for (_, thread) in &mut self.idle {
+            thread.resume();
+            assert!(thread.is_done());
+        }
     }
 }
 
