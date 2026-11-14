@@ -105,6 +105,8 @@ pub fn outcomes_within(
         builder.preemption_bound = std::env::var("LOOM_LITMUS_PREEMPTIONS")
             .ok()
             .map(|bound| bound.parse().expect("invalid LOOM_LITMUS_PREEMPTIONS"));
+        // (`LOOM_LITMUS_EXHAUSTIVE` gives what such a search has to find.)
+        builder.exhaustive = std::env::var_os("LOOM_LITMUS_EXHAUSTIVE").is_some();
         builder.max_branches = 10_000;
         builder.max_duration = budget;
         // The time limit is only looked at every `checkpoint_interval` executions.

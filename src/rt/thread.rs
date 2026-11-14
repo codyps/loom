@@ -54,6 +54,10 @@ pub(crate) struct Thread {
     /// Number of times the thread yielded
     pub yield_count: usize,
 
+    /// True from when the thread yields until it runs again. When it can do
+    /// that depends on what the other threads do, whatever that is.
+    pub(super) yielded: bool,
+
     /// The position in the path of the scheduling decision that the thread
     /// last ran from, if it has run.
     pub(super) last_step: Option<usize>,
@@ -138,6 +142,7 @@ impl Thread {
             last_yield: None,
             yield_count: 0,
             yield_waits: 0,
+            yielded: false,
             last_step: None,
             locals: HashMap::new(),
         }
@@ -192,6 +197,7 @@ impl Thread {
 
     pub(crate) fn set_yield(&mut self) {
         self.state = State::Yield;
+        self.yielded = true;
         self.last_yield = Some(self.causality[self.id]);
         self.yield_count += 1;
     }

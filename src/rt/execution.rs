@@ -164,10 +164,11 @@ impl Execution {
         let curr_thread = self.threads.active_id();
 
         self.release_yielded();
+        self.backtrack_yield();
 
         if let Some(pos) = self.scheduled_at {
-            if !self.threads.active().is_runnable() {
-                self.path.note_stopped(pos, curr_thread.as_usize());
+            if self.threads.active().is_runnable() {
+                self.path.note_carried_on(pos, curr_thread.as_usize());
             }
         }
 
@@ -338,7 +339,10 @@ impl Execution {
                         _ => true,
                     };
 
-                    if independent && th.is_runnable() {
+                    // A thread that has yielded can run again because of
+                    // what other threads did since, so it does not have
+                    // nothing to do with them.
+                    if independent && th.is_runnable() && !th.yielded {
                         sleeping |= bit;
                     }
                 }
@@ -354,6 +358,7 @@ impl Execution {
 
         if let Some(next) = next {
             self.threads[next].last_step = Some(path_id);
+            self.threads[next].yielded = false;
         }
 
         // There is no active thread: all threads have terminated.
@@ -393,6 +398,46 @@ impl Execution {
         }
 
         curr_thread != self.threads.active_id()
+    }
+
+    /// When the active thread has just yielded: asks for it to be tried
+    /// before the last step of each other thread.
+    ///
+    /// A thread that yields runs again once the others have taken a step
+    /// (see `release_yielded`), so where it yields relative to their steps
+    /// decides what it gets to do before their next ones. No object says
+    /// so: the yield and the step may have nothing else in common.
+    fn backtrack_yield(&mut self) {
+        let active = self.threads.active_id();
+
+        if !self.threads.active().is_yield() {
+            return;
+        }
+
+        let yielding = self.threads.active();
+        let (last_step, dpor_vv) = (yielding.last_step, yielding.dpor_vv);
+
+        // The threads it waits for are not asleep anymore: their next step
+        // lets this thread run again, which it did not when it was explored.
+        self.sleeping &= !yielding.yield_waits;
+
+        for (id, th) in self.threads.iter() {
+            if id == active {
+                continue;
+            }
+
+            let point = match th.last_step {
+                Some(point) => point,
+                None => continue,
+            };
+
+            // Not if the yielding thread could not have come first.
+            if th.dpor_vv <= dpor_vv {
+                continue;
+            }
+
+            self.path.backtrack(point, active, last_step);
+        }
     }
 
     /// Decides which of the threads that have yielded can run again.

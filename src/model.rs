@@ -27,12 +27,14 @@ pub struct Builder {
     /// can still return.
     ///
     /// A load may return any store that the loading thread does not know to
-    /// be outdated, which can be one made long ago. Loom only keeps the most
-    /// recent ones of each atomic, so with more stores than this that a
-    /// thread could still read, the oldest are not returned and the
-    /// executions in which they would be are not explored. Raising the
-    /// number explores them, and makes every operation on an atomic that
-    /// has been stored to that often take longer.
+    /// be outdated, which can be one made long ago. Loom only keeps so many
+    /// stores of each atomic. When another one is made, the store that is
+    /// earliest in the order of the atomic's stores is given up: it is not
+    /// returned anymore, and the executions in which it would be are not
+    /// explored. If a load can return no other store, the model fails with
+    /// a message that says so. Raising the number explores those
+    /// executions, and makes every operation on an atomic that has been
+    /// stored to that often take longer.
     ///
     /// Defaults to the `LOOM_ATOMIC_HISTORY` environment variable, or 7.
     /// At most 16.
@@ -136,6 +138,15 @@ pub struct Builder {
     /// to `0` turns it off.
     pub sleep_sets: bool,
 
+    /// Try every thread at every point where the preemption bound allows
+    /// it, instead of only the ones that loom can tell make a difference.
+    ///
+    /// This is for testing loom: the outcomes of a search like that are
+    /// what the usual one has to find as well. It is far too slow for
+    /// anything but the smallest models.
+    #[doc(hidden)]
+    pub exhaustive: bool,
+
     /// The number of OS threads to explore executions with.
     ///
     /// With more than one, the executions of a model are divided among that
@@ -228,6 +239,7 @@ impl Builder {
             location,
             log,
             sleep_sets,
+            exhaustive: false,
             workers,
         }
     }
@@ -350,6 +362,7 @@ impl Builder {
                     execution.path = checkpoint;
                     execution.path.set_max_branches(self.max_branches);
                     execution.path.set_sleep_sets(self.sleep_sets);
+                    execution.path.set_exhaustive(self.exhaustive);
                 }
             }
         }
@@ -524,6 +537,7 @@ impl Builder {
         execution.location = self.location;
         execution.max_history = self.atomic_history;
         execution.path.set_sleep_sets(self.sleep_sets);
+        execution.path.set_exhaustive(self.exhaustive);
 
         execution
     }

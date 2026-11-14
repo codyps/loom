@@ -56,6 +56,7 @@ fn eight_threads_on_a_lock() {
 
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = None;
+        builder.sleep_sets = true;
         builder.workers = 4;
 
         builder.check(move || {

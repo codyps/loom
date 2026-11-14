@@ -45,6 +45,12 @@ pub(crate) struct Path {
     #[cfg_attr(feature = "checkpoint", serde(default))]
     sleep_sets: bool,
 
+    /// If true, every thread that can run is tried at every scheduling
+    /// decision, as far as the preemption bound allows, whether or not
+    /// anything suggests that it makes a difference.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    exhaustive: bool,
+
     /// What this path has in common with the paths of the other workers of
     /// a search that is run by several, see `Shared`.
     #[cfg_attr(feature = "checkpoint", serde(skip))]
@@ -112,11 +118,14 @@ pub(crate) struct Schedule {
     #[cfg_attr(feature = "checkpoint", serde(default))]
     sleeping: ThreadSet,
 
-    /// The threads (as a bit set) that, when run from this point, could not
+    /// The threads (as a bit set) that, when run from this point, could
     /// carry on after their step: switching away from them at the next
-    /// point was not a preemption.
+    /// point was a preemption. A step can include choices of its own (which
+    /// store a load returns, whether a wakeup is spurious), and end
+    /// differently depending on them: this holds every thread that carried
+    /// on for some of those.
     #[cfg_attr(feature = "checkpoint", serde(default))]
-    stopped: ThreadSet,
+    carried_on: ThreadSet,
 
     exploring: bool,
 }
@@ -369,6 +378,7 @@ impl Path {
             skipping: false,
             exploring_on_start: exploring,
             sleep_sets: false,
+            exhaustive: false,
             shared: None,
         }
     }
@@ -502,20 +512,24 @@ impl Path {
     /// meaningless. With a preemption bound, what has been explored is less,
     /// see `explored_at`.
     pub(super) fn sleep_sets(&self) -> bool {
-        self.sleep_sets && self.input.is_none() && !self.skipping
+        self.sleep_sets && !self.exhaustive && self.input.is_none() && !self.skipping
     }
 
     pub(crate) fn set_sleep_sets(&mut self, sleep_sets: bool) {
         self.sleep_sets = sleep_sets;
     }
 
+    pub(crate) fn set_exhaustive(&mut self, exhaustive: bool) {
+        self.exhaustive = exhaustive;
+    }
+
     /// Records that `thread`, run from the schedule branch at `pos`, could
-    /// not carry on after its step.
-    pub(super) fn note_stopped(&mut self, pos: usize, thread: usize) {
+    /// carry on after its step.
+    pub(super) fn note_carried_on(&mut self, pos: usize, thread: usize) {
         if let Some(schedule) =
             object::Ref::from_usize(pos, self.branches.id()).downcast::<Schedule>(&self.branches)
         {
-            schedule.get_mut(&mut self.branches).stopped |= 1 << thread;
+            schedule.get_mut(&mut self.branches).carried_on |= 1 << thread;
         }
     }
 
@@ -572,7 +586,10 @@ impl Path {
                     return true;
                 }
 
-                let carries_on = schedule.stopped & (1 << i) == 0;
+                // Other workers may have explored some of what the
+                // thread does from here. What they found is not known to
+                // this one, so assume the worst.
+                let carries_on = schedule.node.shared || schedule.carried_on & (1 << i) != 0;
 
                 preempts(i) as u8 + carries_on as u8 <= preempts(next) as u8
             })
@@ -602,7 +619,7 @@ impl Path {
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
                 sleeping,
-                stopped: 0,
+                carried_on: 0,
                 exploring: self.exploring,
             });
 
@@ -669,6 +686,19 @@ impl Path {
             let schedule = schedule_ref.get_mut(&mut self.branches);
             schedule.initial_active = initial_active;
             schedule.preemptions = preemptions;
+
+            if self.exhaustive && schedule.exploring {
+                // Try every thread, unless that would be a preemption and
+                // there are none left.
+                let out_of_preemptions =
+                    self.preemption_bound == Some(preemptions) && initial_active.is_some();
+
+                if !out_of_preemptions {
+                    for thread in schedule.threads.iter_mut() {
+                        thread.explore();
+                    }
+                }
+            }
 
             if self.input.is_some() && self.exploring {
                 self.select_thread_from_input(schedule_ref);
@@ -1019,6 +1049,7 @@ impl Path {
                     skipping: false,
                     exploring_on_start: self.exploring_on_start,
                     sleep_sets: self.sleep_sets,
+                    exhaustive: self.exhaustive,
                     shared: Some(shared.clone()),
                 });
             }
@@ -1100,7 +1131,12 @@ impl Schedule {
             return;
         }
 
-        if self.threads[thread_id].is_enabled() && !asleep {
+        // A thread that has yielded and is waiting for the others to take a
+        // step cannot run here any more than one that is blocked.
+        let can_run =
+            self.threads[thread_id].is_enabled() && self.threads[thread_id] != Thread::Yield;
+
+        if can_run && !asleep {
             self.threads[thread_id].explore();
         } else {
             for (i, th) in self.threads.iter_mut().enumerate() {
