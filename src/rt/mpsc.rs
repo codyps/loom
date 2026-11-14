@@ -1,4 +1,4 @@
-use crate::rt::{object, Access, Location, Synchronize, VersionVec};
+use crate::rt::{object, Access, Location, Synchronize, VersionVec, MAX_THREADS};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering::{Acquire, Release};
 
@@ -21,8 +21,10 @@ pub(super) struct State {
     /// fails.
     receiver_alive: bool,
 
-    /// Last access that was a send operation, or the drop of the last sender.
+    /// Last access that was a send operation.
     last_send_access: Option<Access>,
+    /// Each thread's last drop of a sender.
+    last_sender_drop: [Option<Access>; MAX_THREADS],
     /// Last access that was a receive operation.
     last_recv_access: Option<Access>,
     /// Last access by the receiver that observed whether a message was
@@ -86,6 +88,7 @@ impl Channel {
                 senders: 1,
                 receiver_alive: true,
                 last_send_access: None,
+                last_sender_drop: Default::default(),
                 last_recv_access: None,
                 last_observe_access: None,
                 sender_synchronize: Synchronize::new(),
@@ -310,30 +313,95 @@ impl State {
 
     /// Returns the previous accesses that `action` is dependent with.
     ///
-    /// Sends (and sender drops) are ordered among themselves, as are the
-    /// receiver's operations. A blocking receive never observes a send "not
-    /// having happened yet", it just waits, so the two do not race. A
-    /// `try_recv` does observe that, as does dropping the receiver (which
-    /// destroys what was sent before it and fails what is sent after it), so
-    /// those race with sends, in both directions.
+    /// Sends are ordered among themselves, as are the receiver's operations.
+    /// A blocking receive never observes a send "not having happened yet",
+    /// it just waits, so the two do not race. A `try_recv` does observe
+    /// that, as does dropping the receiver (which destroys what was sent
+    /// before it and fails what is sent after it), so those race with sends,
+    /// in both directions.
+    ///
+    /// Dropping a sender matters to nobody else, except for the drop of the
+    /// last one: that disconnects the channel, which the receiver can
+    /// observe like a send, and it hands the receiver what its thread
+    /// knows. Which sender is the last to go is decided by the order of the
+    /// drops, so the drop that disconnects is dependent with the last drop
+    /// of every other thread.
     pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
-        let (first, second) = match action {
-            Action::MsgSend | Action::SenderDrop => {
-                (&self.last_send_access, &self.last_observe_access)
+        let none = &[][..];
+
+        let (first, second, drops) = match action {
+            Action::MsgSend => (&self.last_send_access, &self.last_observe_access, none),
+            Action::SenderDrop if self.next_drop_disconnects() => {
+                (&None, &self.last_observe_access, &self.last_sender_drop[..])
             }
-            Action::MsgRecv => (&self.last_recv_access, &None),
-            Action::MsgTryRecv | Action::ReceiverDrop => {
-                (&self.last_recv_access, &self.last_send_access)
-            }
+            Action::SenderDrop => (&None, &None, none),
+            Action::MsgRecv => (&self.last_recv_access, &None, none),
+            Action::MsgTryRecv | Action::ReceiverDrop => (
+                &self.last_recv_access,
+                &self.last_send_access,
+                &self.last_sender_drop[..],
+            ),
         };
 
-        first.iter().chain(second.iter())
+        first
+            .iter()
+            .chain(second.iter())
+            .chain(drops.iter().flatten())
     }
 
-    pub(super) fn set_last_access(&mut self, action: Action, path_id: usize, version: &VersionVec) {
+    /// Returns `true` if the next drop of a sender disconnects the channel.
+    fn next_drop_disconnects(&self) -> bool {
+        self.senders == 1
+    }
+
+    /// Returns `true` if `action` has to be tried before each of the
+    /// accesses it is dependent with, and not only before the most recent
+    /// one. That goes for the drop that disconnects the channel: moved
+    /// before another drop it is not the last one anymore, and has nothing
+    /// left to be reordered with. See `rt::arc`, where the drop that frees
+    /// the value is in the same position.
+    pub(super) fn races_with_all(&self, action: Action) -> bool {
+        action == Action::SenderDrop && self.next_drop_disconnects()
+    }
+
+    /// Returns `true` unless two operations that different threads are about
+    /// to execute lead to the same state in either order.
+    pub(super) fn dependent(&self, a: Action, b: Action) -> bool {
+        use Action::*;
+
+        let is_send = |action| matches!(action, MsgSend | SenderDrop);
+        let is_recv = |action| matches!(action, MsgRecv | MsgTryRecv);
+
+        match (a, b) {
+            // The order of messages is the order in which they were sent.
+            (MsgSend, MsgSend) => true,
+            // A sender going away does not matter to the others, unless it
+            // is the last one, which disconnects the channel.
+            (MsgSend, SenderDrop) | (SenderDrop, MsgSend) => self.senders <= 1,
+            // Which of the last two goes last decides whose knowledge the
+            // receiver gets along with the disconnect.
+            (SenderDrop, SenderDrop) => self.senders <= 2,
+            // A receive takes a message from the front, a send adds one at
+            // the back: as long as there is a message, they do not get in
+            // each other's way. With the channel empty the receive finds
+            // nothing, or the end of the channel, depending on what the
+            // senders have done.
+            (a, b) if (is_recv(a) && is_send(b)) || (is_send(a) && is_recv(b)) => self.msg_cnt == 0,
+            _ => true,
+        }
+    }
+
+    pub(super) fn set_last_access(
+        &mut self,
+        action: Action,
+        thread: usize,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
         match action {
-            Action::MsgSend | Action::SenderDrop => {
-                Access::set_or_create(&mut self.last_send_access, path_id, version)
+            Action::MsgSend => Access::set_or_create(&mut self.last_send_access, path_id, version),
+            Action::SenderDrop => {
+                Access::set_or_create(&mut self.last_sender_drop[thread], path_id, version)
             }
             Action::MsgRecv => Access::set_or_create(&mut self.last_recv_access, path_id, version),
             Action::MsgTryRecv | Action::ReceiverDrop => {

@@ -398,3 +398,125 @@ fn reordering_needs_another_thread_first() {
     assert!(seen.contains(&((3, 1), 2)), "{:?}", seen);
     assert_eq!(seen.len(), 9, "{:?}", seen);
 }
+
+/// Senders that go away on their own threads, the last of which disconnects
+/// the channel, and a receiver that looks without waiting.
+#[test]
+fn channel_disconnected_by_sender_threads() {
+    use std::sync::mpsc::TryRecvError;
+
+    let seen = same_outcomes(|| {
+        let (tx, rx) = channel();
+
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let tx = tx.clone();
+                thread::spawn(move || tx.send(i).unwrap())
+            })
+            .collect();
+
+        drop(tx);
+
+        let received: Vec<_> = (0..3)
+            .map(|_| match rx.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => 8,
+                Err(TryRecvError::Disconnected) => 9,
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        received
+    });
+
+    // Both messages and then the disconnect, in either order of the
+    // messages; or anything short of that, with the channel found empty
+    // at any point.
+    assert!(seen.contains(&vec![0, 1, 9]) && seen.contains(&vec![1, 0, 9]));
+    assert!(seen.contains(&vec![8, 8, 8]));
+    assert_eq!(seen.len(), 15, "{:?}", seen);
+}
+
+/// Messages arrive in every order the senders can send them in, whatever
+/// else the senders do after dropping their handle.
+#[test]
+fn channel_drained_until_disconnected() {
+    let seen = same_outcomes(|| {
+        let (tx, rx) = channel();
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (1..=2)
+            .map(|i| {
+                let tx = tx.clone();
+                let x = x.clone();
+
+                thread::spawn(move || {
+                    tx.send(i).unwrap();
+                    drop(tx);
+                    x.store(i, SeqCst);
+                })
+            })
+            .collect();
+
+        drop(tx);
+
+        let mut received = vec![];
+
+        while let Ok(message) = rx.recv() {
+            received.push(message);
+        }
+
+        received.push(x.load(SeqCst));
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        received
+    });
+
+    // Two orders of the messages, and three values of `x` with each.
+    assert_eq!(seen.len(), 6, "{:?}", seen);
+}
+
+/// Readers that take the lock twice each see the writer's two increments at
+/// any point.
+#[test]
+fn rwlock_readers_between_writes() {
+    let seen = same_outcomes(|| {
+        let lock = Arc::new(RwLock::new(0usize));
+
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let lock = lock.clone();
+                thread::spawn(move || {
+                    let first = *lock.read().unwrap();
+                    let second = *lock.read().unwrap();
+                    (first, second)
+                })
+            })
+            .collect();
+
+        let writer = {
+            let lock = lock.clone();
+            thread::spawn(move || {
+                *lock.write().unwrap() += 1;
+                *lock.write().unwrap() += 1;
+            })
+        };
+
+        let read: Vec<_> = readers
+            .into_iter()
+            .map(|reader| reader.join().unwrap())
+            .collect();
+        writer.join().unwrap();
+
+        read
+    });
+
+    // Each reader sees one of the six non-decreasing pairs of 0, 1 and 2.
+    assert_eq!(seen.len(), 36, "{:?}", seen);
+}

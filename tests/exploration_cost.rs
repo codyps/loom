@@ -314,3 +314,40 @@ fn private_work_with_a_preemption_bound() {
     let count = count.load(SeqCst);
     assert!((6..=80).contains(&count), "{}", count);
 }
+
+/// Three threads that each send one message: six orders of the messages.
+/// The receiver taking a message that is there does not interact with the
+/// next one being sent, and the senders' handles going away matters only
+/// for the last of them.
+#[test]
+fn channel_with_three_senders() {
+    use loom::sync::mpsc::channel;
+
+    let count = executions(|| {
+        let (tx, rx) = channel();
+
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let tx = tx.clone();
+                thread::spawn(move || tx.send(i).unwrap())
+            })
+            .collect();
+
+        drop(tx);
+
+        let mut received = 0;
+
+        while rx.recv().is_ok() {
+            received += 1;
+        }
+
+        assert_eq!(received, 3);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
+
+    // 835 with every pair of channel operations taken to be dependent.
+    assert!((6..=48).contains(&count), "{}", count);
+}

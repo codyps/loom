@@ -374,6 +374,17 @@ impl State {
         self.last_access.iter().chain(release)
     }
 
+    /// Returns `true` unless two operations that different threads are about
+    /// to execute lead to the same state in either order.
+    ///
+    /// That is the case for two threads taking the lock for reading: both
+    /// get it, or neither does, and each learns what the last writer knew.
+    pub(super) fn dependent(&self, a: object::Action, b: object::Action) -> bool {
+        let is_read = |action| action == Action::Read || action == Action::TryRead;
+
+        !(is_read(a) && is_read(b))
+    }
+
     pub(crate) fn set_last_access(
         &mut self,
         action: object::Action,

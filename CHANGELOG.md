@@ -168,6 +168,19 @@ Counts below are without a preemption bound.
    first and 27 with the two changes above; they now take 7, the same as
    with handles loom does not see. `Arc::get_mut` is now explored against
    clones and drops like `strong_count`.
+ - Channels: a receive that finds a message and a send, which adds one at
+   the other end, are not explored in both orders, and neither is a sender
+   going away against anything else, unless it is the last one, which
+   disconnects the channel. Each remaining sender gets to be the last, as
+   with the handles of an `Arc`. `RwLock`: two threads taking the lock for
+   reading are not explored in both orders once one of them has been.
+ - A thread is not tried from an earlier point for the sake of its next
+   step if it is asleep there: that it is asleep says that this has been
+   explored. Such requests used to start executions that were found to be
+   repeats only further down. Three threads sending one message each to a
+   receiver that drains the channel: 835 executions before these two
+   changes, 38 now (228 instead of 2,112 with a preemption bound of 3). Two
+   writers and two readers of two atomics: 1,630 to 999.
  - Coroutines and their stacks are kept from one execution to the next.
    Mapping a stack with its guard page and unwinding the coroutine at the
    end, for every thread of every execution, was most of the time of a small

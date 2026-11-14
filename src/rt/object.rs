@@ -379,6 +379,8 @@ impl Store {
                 !(a.is_load() && b.is_load())
             }
             Entry::Arc(entry) => entry.dependent(a.action.into(), b.action.into()),
+            Entry::Channel(entry) => entry.dependent(a.action.into(), b.action.into()),
+            Entry::RwLock(entry) => entry.dependent(a.action, b.action),
             _ => true,
         }
     }
@@ -388,6 +390,7 @@ impl Store {
     pub(super) fn races_with_all(&self, operation: Operation) -> bool {
         match &self.entries[operation.obj.index] {
             Entry::Arc(entry) => entry.races_with_all(operation.action.into()),
+            Entry::Channel(entry) => entry.races_with_all(operation.action.into()),
             _ => false,
         }
     }
@@ -425,7 +428,7 @@ impl Store {
             Entry::SeqCstFences(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::RwLock(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Channel(entry) => {
-                entry.set_last_access(operation.action.into(), path_id, dpor_vv)
+                entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
             }
             _ => panic!("object is not branchable"),
         }
