@@ -164,6 +164,24 @@ Fixed:
  - Double frees through `loom::alloc::dealloc` are reported as double frees,
    with locations (upstream issue 384).
 
+Memory model, checked against RC11 with the herd7 simulator on about 18,000
+generated litmus programs (`tests/litmus_rc11`):
+
+ - `SeqCst` loads and stores are ordered per atomic instead of being treated
+   as `AcqRel` (upstream issues 180, 191). Store buffering, Dekker / Peterson
+   style exclusion and the cppreference `SeqCst` example now pass, without
+   the outcomes `SeqCst` does allow being lost.
+ - Loom allowed outcomes no execution has, in 296 of the programs, some of
+   them using only `Relaxed`: observing a store could lose the fact that
+   another store comes after it, and a store could end up between the two
+   halves of a read-modify-write. It also hit an internal assertion on 4
+   programs. With the fixes loom produces no forbidden outcome on the corpus.
+ - Loom still misses allowed outcomes in 359 of the 15,658 programs it
+   explores fully: a read-modify-write is always placed last in the
+   modification order (200 programs before these changes, unchanged), and
+   the execution order of `SeqCst` operations is used as their total order
+   (new with the `SeqCst` change). Both are documented in the README.
+
 Added:
 
  - `RwLockWriteGuard::downgrade`, for the `std` style lock and, through
@@ -198,9 +216,7 @@ Already resolved by the merged pull requests:
 
 Not addressed:
 
- - `SeqCst` loads and stores are still treated as `AcqRel` (upstream issues
-   180, 191, 6), and load buffering is not modeled. These need a different
-   memory model implementation, not a fix.
+ - Load buffering is not modeled (part of upstream issue 6).
  - Requests that cannot be met by a mock that carries tracking state:
    `repr(transparent)` atomics and cells (51, 317), `const fn new` (170),
    `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
