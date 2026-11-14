@@ -50,6 +50,18 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - Preemption bound: outcomes within the bound were missed. Once the
+   allowed preemptions were used up, no other thread was tried at any later
+   point, including the points where the running thread had blocked or
+   finished and choosing the next one preempts nobody. The first such choice
+   of an execution, typically when the main thread starts to wait for the
+   threads it spawned, was counted as a preemption as well. With a bound of
+   0, three threads were run in two of their six orders. Of 600 random
+   litmus programs, 24 missed outcomes with a bound of 1, 2 with a bound of
+   2, and 1 with a bound of 3; now none does, compared with a search that
+   tries every thread at every point the bound allows. A bounded search
+   therefore takes more executions than it did: it explores what it left
+   out.
  - Atomics: a plain store could land between the read and the write of a
    concurrent `swap` / `fetch_*` / successful `compare_exchange`, producing
    outcomes no real execution has, typically spurious failures of try-lock
@@ -161,15 +173,14 @@ Counts below are without a preemption bound.
    cannot cost a preemption more: choosing it there, and leaving it after
    its step, must be no more of a preemption than the choice the other path
    starts with. With a bound of 3: two writers and two readers of two
-   atomics 40,572 executions to 10,950, a condition variable queue 401 to
-   117, three threads with mostly private work 70 to 18. With a bound of 1
+   atomics 149,868 executions to 64,795, a condition variable queue 851 to
+   353, three threads with mostly private work 114 to 52. With a bound of 1
    there is next to nothing to gain. An exhaustive search of those three
    takes 1,630, 38 and 7, so it is still the one to try first.
 
-   Checked on the litmus corpus at bounds 1, 2 and 3 against the same
-   search without sleep sets: no program loses an outcome. A few (68, 11
-   and 2 of 17,948) gain outcomes that are within the bound and were missed
-   before.
+   Checked against a search that tries every thread at every point the
+   bound allows, on 670 litmus programs at bounds 0 to 3: the same outcomes,
+   with and without sleep sets.
  - Atomics: the bookkeeping for the order of `SeqCst` operations took most
    of the time of a model that uses atomics, about ten times what an
    execution of a comparable model with locks takes. Sets of graph nodes

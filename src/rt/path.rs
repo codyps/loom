@@ -421,13 +421,17 @@ impl Path {
                 }
             }
 
-            let mut initial_active = active;
+            // The thread that is active to begin with is the one that ran up
+            // to here, if it can carry on: choosing another one preempts it.
+            // Otherwise a thread had to be picked, and no choice is a
+            // preemption. Up to the first decision of an execution it is the
+            // main thread that ran.
+            let ran = match prev {
+                Some(prev) => prev.get(&self.branches).active_thread_index(),
+                None => Some(0),
+            };
 
-            if let Some(prev) = prev {
-                if initial_active != prev.get(&self.branches).active_thread_index() {
-                    initial_active = None;
-                }
-            }
+            let initial_active = if active == ran { active } else { None };
 
             let preemptions = if self.input.is_some() && self.preemption_bound.is_none() {
                 // An unbounded input can force more preemptions than fit in u8.
@@ -668,7 +672,11 @@ impl Schedule {
                 bound
             );
 
-            if self.preemptions == bound {
+            // Out of preemptions, and choosing another thread here would
+            // be one. It is not if the thread that ran up to here cannot
+            // carry on: then some thread has to be chosen, and any of them
+            // is as good as the next.
+            if self.preemptions == bound && self.initial_active.is_some() {
                 return;
             }
         }

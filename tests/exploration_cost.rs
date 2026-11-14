@@ -310,7 +310,7 @@ fn private_work_with_a_preemption_bound() {
         });
     }
 
-    // 70 without sleep sets.
+    // 114 without sleep sets.
     let count = count.load(SeqCst);
-    assert!((6..=24).contains(&count), "{}", count);
+    assert!((6..=80).contains(&count), "{}", count);
 }
