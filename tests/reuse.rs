@@ -19,10 +19,20 @@ thread_local! {
 #[should_panic(expected = "does not belong to the current execution")]
 fn cell_reused_across_executions() {
     loom::model(|| {
-        let handle_a = loom::thread::spawn(|| {
-            let _ = STALE_CELL.with(Cell::get);
-        });
-        let handle_b = loom::thread::spawn(|| ());
+        // Two threads racing on an atomic, so that the model takes more than
+        // one execution: the cell is created in the first and found again in
+        // the second.
+        let racy = loom::sync::Arc::new(AtomicUsize::new(0));
+
+        let handle_a = {
+            let racy = racy.clone();
+            loom::thread::spawn(move || {
+                racy.store(1, SeqCst);
+                let _ = STALE_CELL.with(Cell::get);
+            })
+        };
+        let handle_b = loom::thread::spawn(move || racy.store(2, SeqCst));
+
         handle_a.join().unwrap();
         handle_b.join().unwrap();
     });

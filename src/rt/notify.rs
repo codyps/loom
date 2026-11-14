@@ -26,6 +26,21 @@ pub(super) struct State {
     /// `true` if there is a pending notification to consume.
     notified: bool,
 
+    /// `true` if the object is only ever notified once, and waited for once
+    /// per notification that is sent: a thread's exit.
+    ///
+    /// For such an object the wait and the notification commute. Whether the
+    /// waiter gets there first and blocks, or finds the notification already
+    /// there, the result is the same: the notification is consumed and the
+    /// waiter continues after it. There is nothing to gain from exploring
+    /// both orders, and with a `join` per thread in almost every model, a lot
+    /// to lose.
+    ///
+    /// This does not hold in general. With several notifications, one that
+    /// arrives while another is still pending is absorbed, so it matters
+    /// whether a wait comes in between.
+    one_shot: bool,
+
     /// Tracks access to the notify object
     last_access: Option<Access>,
 
@@ -35,12 +50,22 @@ pub(super) struct State {
 
 impl Notify {
     pub(crate) fn new(seq_cst: bool, spurious: bool) -> Notify {
+        Self::with(seq_cst, spurious, false)
+    }
+
+    /// A notification that is sent exactly once, such as a thread's exit.
+    pub(crate) fn one_shot() -> Notify {
+        Self::with(true, false, true)
+    }
+
+    fn with(seq_cst: bool, spurious: bool, one_shot: bool) -> Notify {
         super::execution(|execution| {
             let state = execution.objects.insert(State {
                 spurious,
                 did_spur: false,
                 seq_cst,
                 notified: false,
+                one_shot,
                 last_access: None,
                 synchronize: Synchronize::new(),
             });
@@ -134,12 +159,8 @@ impl Notify {
             return;
         }
 
-        if notified {
-            self.state.branch_opaque(location);
-        } else {
-            // This should become branch_disable
-            self.state.branch_acquire(true, location)
-        }
+        self.state
+            .branch_disable(object::Action::Wait, !notified, location);
 
         // Thread was notified
         super::execution(|execution| {
@@ -165,11 +186,43 @@ impl State {
         self.spurious && !self.did_spur
     }
 
-    pub(crate) fn last_dependent_access(&self) -> Option<&Access> {
+    /// Returns `true` if `action` is a wait that commutes with the
+    /// notification it waits for.
+    fn is_one_shot_wait(&self, action: object::Action) -> bool {
+        self.one_shot && action == object::Action::Wait
+    }
+
+    /// Returns the previous access that `action` is dependent with.
+    ///
+    /// With `racing` set, this leaves out an access that `action` comes
+    /// after but cannot be reordered with. A wait for a one-shot
+    /// notification is ordered after the notification, which matters for
+    /// what the waiting thread does next: all of that comes after everything
+    /// the notifying thread did. But there is no execution to be found by
+    /// trying the wait first.
+    pub(crate) fn last_dependent_access(
+        &self,
+        action: object::Action,
+        racing: bool,
+    ) -> Option<&Access> {
+        if racing && self.is_one_shot_wait(action) {
+            return None;
+        }
+
         self.last_access.as_ref()
     }
 
-    pub(crate) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
+    pub(crate) fn set_last_access(
+        &mut self,
+        action: object::Action,
+        path_id: usize,
+        version: &VersionVec,
+    ) {
+        if self.is_one_shot_wait(action) {
+            // Nothing is to be reordered with the wait either.
+            return;
+        }
+
         Access::set_or_create(&mut self.last_access, path_id, version);
     }
 }

@@ -167,7 +167,7 @@ where
     T: 'a,
 {
     let result = Arc::new(Mutex::new(None));
-    let notify = rt::Notify::new(true, false);
+    let notify = rt::Notify::one_shot();
 
     let body: Box<dyn FnOnce() + 'a> = {
         let name = name.clone();
@@ -268,7 +268,7 @@ impl Builder {
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
-        let done = rt::Notify::new(true, false);
+        let done = rt::Notify::one_shot();
         scope.pending.lock().unwrap().push(done);
 
         // Safety: a `&'scope Scope` only exists inside a call to `scope()`,

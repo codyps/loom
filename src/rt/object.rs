@@ -91,6 +91,10 @@ pub(super) enum Action {
     /// not be blocked when another thread acquires the object first.
     OpaqueNonBlocking,
 
+    /// Waiting for an object to be signalled (e.g. waiting for a
+    /// notification).
+    Wait,
+
     /// Giving up an object held by the thread (e.g. unlocking a `Mutex`).
     /// This never blocks either. It only exists as an action so that an
     /// attempt on the object by another thread can be scheduled *before* it,
@@ -334,7 +338,7 @@ impl Store {
                 return;
             }
             Entry::Condvar(entry) => entry.last_dependent_access(),
-            Entry::Notify(entry) => entry.last_dependent_access(),
+            Entry::Notify(entry) => entry.last_dependent_access(operation.action, racing),
             obj => panic!(
                 "object is not branchable {:?}; ref = {:?}",
                 obj, operation.obj
@@ -375,7 +379,7 @@ impl Store {
             }
             Entry::Mutex(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
-            Entry::Notify(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::Notify(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::SeqCstFences(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::RwLock(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Channel(entry) => {
