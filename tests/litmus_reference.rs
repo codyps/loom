@@ -30,10 +30,20 @@ const REFERENCE: &str = include_str!("litmus_rc11/reference.txt");
 /// The programs are split over a few tests to run in parallel.
 const PARTS: usize = 8;
 
+/// An unoptimized build takes minutes for all of the programs, and checks
+/// one in this many. An optimized one checks every program.
+const DEBUG_SAMPLE: usize = 8;
+
 fn check(part: usize) {
     let mut failures = Vec::new();
 
-    for line in REFERENCE.lines().skip(part).step_by(PARTS) {
+    let sample = if cfg!(debug_assertions) {
+        DEBUG_SAMPLE
+    } else {
+        1
+    };
+
+    for line in REFERENCE.lines().skip(part).step_by(PARTS).step_by(sample) {
         let mut fields = line.split(" | ");
 
         let program = fields.next().unwrap();

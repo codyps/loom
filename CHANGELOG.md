@@ -33,6 +33,18 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
+ - The whole RC11 reference corpus (17,946 programs) is checked in and
+   checked by the test suite, all of it in an optimized build. It used to
+   be a subset of 2,067.
+ - `tests/exhaustive.rs`: 22 small models of everything loom provides
+   (mutex, condition variable, channel, `RwLock`, `Notify`, park, `Arc`,
+   atomics, yielding, `block_on`, scoped threads), each explored the usual
+   way and by a search that tries every thread at every point the
+   preemption bound allows (`Builder::exhaustive`, hidden), with and
+   without several workers. The outcomes have to be the same. This is the
+   reference for what the litmus corpus cannot cover, and it found the
+   three bugs listed under "Fixed" for yielding and for sleep sets with a
+   preemption bound.
  - A model can have 16 threads, counting the main one, instead of 5
    (`MAX_THREADS`), and that is the default for `model::Builder::max_threads`
    as well. The limit is what the bookkeeping per thread is sized for; with
@@ -67,6 +79,33 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - Atomics with more stores than loom keeps (7 by default) could produce
+   outcomes that cannot happen. The store given up for a new one was the
+   one made first, which can be anywhere in the order of the atomic's
+   stores; what was known about the order of the others through it was
+   lost, and a thread that had read it could go back to an older value. Now
+   the store that is earliest in that order is given up, the one that a
+   read-modify-write wrote directly after it takes its place, and what it
+   meant for the order of `SeqCst` operations is kept. A load that could
+   only return a store that is gone fails with a message saying to raise
+   `atomic_history`, instead of returning something else. Found by a
+   litmus program with eight stores to one variable that herd needed 16
+   minutes for. With `LOOM_ATOMIC_HISTORY=3` on the whole corpus, 2,770
+   programs had outcomes that are not allowed; 2 still do.
+ - Yielding: a thread that yields runs again after the others have taken a
+   step, so what it gets to do depends on where its yield falls between
+   their steps, whatever those are. The search did not know: a thread that
+   yields once and then carries on (which is what a spurious wakeup of
+   `Notify::wait` or `block_on` does) was not tried ahead of the other
+   threads' earlier steps, and a thread still waiting after a yield was
+   taken to be runnable where the search wanted to try it. Both lost
+   outcomes. Exploring them costs: three threads on a spin lock take 67,694
+   executions instead of 218.
+ - Preemption bound with sleep sets: whether a thread could carry on after
+   a step was recorded once per scheduling decision, although a step can
+   include a load, and end with the thread blocked for one value and
+   running for another. Outcomes were lost when the first was taken for
+   both.
  - Preemption bound: outcomes within the bound were missed. Once the
    allowed preemptions were used up, no other thread was tried at any later
    point, including the points where the running thread had blocked or
