@@ -501,7 +501,19 @@ impl Path {
         schedule.threads[selected] = Thread::Active;
     }
 
-    pub(super) fn backtrack(&mut self, mut point: usize, thread_id: thread::Id) {
+    /// Asks for `thread_id` to be tried from the scheduling decision at
+    /// `point`, or the closest one before it. `last_step` is the decision
+    /// the thread last ran from, if it has run at all.
+    pub(super) fn backtrack(
+        &mut self,
+        mut point: usize,
+        thread_id: thread::Id,
+        last_step: Option<usize>,
+    ) {
+        // Whether the thread is, at the given decision, about to do what it
+        // is about to do now.
+        let same_step = |decision: usize| last_step.map_or(true, |last| last < decision);
+
         if self.input.is_some() {
             return;
         }
@@ -512,7 +524,7 @@ impl Path {
                 let schedule = schedule_ref.get_mut(&mut self.branches);
 
                 if schedule.exploring {
-                    schedule.backtrack(thread_id, self.preemption_bound);
+                    schedule.backtrack(thread_id, self.preemption_bound, same_step(point));
                     break schedule;
                 }
             }
@@ -539,8 +551,13 @@ impl Path {
                     let active_b = prev.get(&self.branches).active_thread_index();
 
                     if active_a != active_b && curr.get_mut(&mut self.branches).exploring {
-                        curr.get_mut(&mut self.branches)
-                            .backtrack(thread_id, self.preemption_bound);
+                        let same_step = same_step(curr.index());
+
+                        curr.get_mut(&mut self.branches).backtrack(
+                            thread_id,
+                            self.preemption_bound,
+                            same_step,
+                        );
                         return;
                     }
 
@@ -548,8 +565,13 @@ impl Path {
                 } else {
                     if curr.get(&mut self.branches).exploring {
                         // This is the very first schedule
-                        curr.get_mut(&mut self.branches)
-                            .backtrack(thread_id, self.preemption_bound);
+                        let same_step = same_step(curr.index());
+
+                        curr.get_mut(&mut self.branches).backtrack(
+                            thread_id,
+                            self.preemption_bound,
+                            same_step,
+                        );
                     }
                     return;
                 }
@@ -661,7 +683,9 @@ impl Schedule {
         self.preemptions
     }
 
-    fn backtrack(&mut self, thread_id: thread::Id, preemption_bound: Option<u8>) {
+    /// `same_step` says that the thread has not run since this decision:
+    /// what it would do from here is the step that is wanted earlier.
+    fn backtrack(&mut self, thread_id: thread::Id, preemption_bound: Option<u8>, same_step: bool) {
         assert!(self.exploring);
 
         if let Some(bound) = preemption_bound {
@@ -700,6 +724,13 @@ impl Schedule {
         // as when the thread cannot run at all, every thread that is awake
         // gets tried.
         let asleep = self.sleeping & (1 << thread_id) != 0;
+
+        if asleep && same_step {
+            // The step that is wanted here is the thread's next one, and
+            // the thread being asleep says that running it from here has
+            // been explored. There is nothing to add.
+            return;
+        }
 
         if self.threads[thread_id].is_enabled() && !asleep {
             self.threads[thread_id].explore();

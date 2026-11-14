@@ -194,7 +194,7 @@ impl Execution {
 
                     if all {
                         // Track backtracking point
-                        path.backtrack(access.path_id(), th_id);
+                        path.backtrack(access.path_id(), th_id, th.last_step);
                     } else {
                         latest = latest.max(Some(access.path_id()));
                     }
@@ -202,7 +202,7 @@ impl Execution {
 
             if let Some(point) = latest {
                 // Track backtracking point
-                self.path.backtrack(point, th_id);
+                self.path.backtrack(point, th_id, th.last_step);
             }
         }
 
@@ -350,6 +350,10 @@ impl Execution {
 
         self.threads.set_active(next);
         self.scheduled_at = Some(path_id);
+
+        if let Some(next) = next {
+            self.threads[next].last_step = Some(path_id);
+        }
 
         // There is no active thread: all threads have terminated.
         if !self.threads.is_active() {

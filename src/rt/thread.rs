@@ -54,6 +54,10 @@ pub(crate) struct Thread {
     /// Number of times the thread yielded
     pub yield_count: usize,
 
+    /// The position in the path of the scheduling decision that the thread
+    /// last ran from, if it has run.
+    pub(super) last_step: Option<usize>,
+
     /// The threads (as a bit set) that the thread, having yielded, waits
     /// for: it does not run again before each of them has taken a step or
     /// has become unable to.
@@ -134,6 +138,7 @@ impl Thread {
             last_yield: None,
             yield_count: 0,
             yield_waits: 0,
+            last_step: None,
             locals: HashMap::new(),
         }
     }
