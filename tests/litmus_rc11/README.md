@@ -58,7 +58,18 @@ with the reference on all of them.
 ## Regenerating
 
 This needs `herd7` (herdtools7; build `herd/herd.exe` with dune) and its
-`libdir`, with the modified model saved there as `rc11_cxx20.cat`.
+`libdir`, with the modified model saved there as `rc11_cxx20.cat`:
+
+    git clone --depth 1 https://github.com/herd/herdtools7.git
+    cd herdtools7
+    sed 's/^let rs = .*/let rs = [W \& (RLX | REL | ACQ_REL | ACQ | SC)]; (rf; myrmw)*/' \
+        herd/libdir/rc11.cat > herd/libdir/rc11_cxx20.cat
+    nix-shell -p ocaml dune_3 ocamlPackages.menhir ocamlPackages.menhirLib \
+        ocamlPackages.zarith ocamlPackages.logs ocamlPackages.findlib gnumake \
+        --run 'sh ./version-gen.sh $PWD/prefix && dune build herd/herd.exe'
+
+Herd's output takes hours to produce. Keep it, and the build, somewhere that
+is not cleaned up behind your back; a build directory is not such a place.
 
 1. `python3 tools/gen.py` writes the programs to `programs.txt` (one per
    line), an index to `index.txt`, and a C litmus file per program to `lit/`.
