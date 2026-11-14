@@ -68,9 +68,6 @@ RUSTFLAGS="--cfg loom" cargo test --test buggy_concurrent_inc --release
 ## Unsupported features
 Loom currently does not implement the full C11 memory model.
 Here is the (incomplete) list of unsupported features.
-* Read-modify-write operations are always ordered after the stores that have
-  been executed so far. An execution in which one comes before an earlier,
-  unrelated store is not explored.
 * Load buffering behavior:
   Loom does not explore some executions that are possible in the C11 memory
   model. That is, there can be a bug in the checked code even if Loom says
@@ -78,10 +75,11 @@ Here is the (incomplete) list of unsupported features.
   `tests/litmus.rs`.
 
 Loom's handling of atomics is checked against the RC11 memory model on a set
-of generated litmus tests, see `tests/litmus_rc11`. That covers `SeqCst`
-loads, stores and fences, which Loom orders as the model requires. On those
-tests Loom produces no outcome the model forbids, and the restriction on
-read-modify-write operations above accounts for the outcomes it does not find.
+of generated litmus tests, see `tests/litmus_rc11`. That covers loads, stores
+and read-modify-write operations with every ordering, and `SeqCst` fences. On
+all of those tests that Loom explores to completion, it produces exactly the
+outcomes the model allows. (RC11 itself rules out load buffering, so that
+restriction does not show up there.)
 
 ## License
 

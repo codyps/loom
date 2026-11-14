@@ -18,17 +18,18 @@ continues a release sequence.
 
 ## Known gaps
 
-Loom executes one operation at a time and only lets an operation observe what
-has already been executed. One consequence shows up as missing outcomes:
+None against this reference: for every program of the full generated set that
+loom explores to completion within the time budget (about 15,000 of the
+18,000), loom finds exactly the outcomes the model allows.
 
-- A read-modify-write always goes last in the modification order of the
-  stores executed so far. It cannot be placed before a store that was
-  executed earlier but that nothing orders before it.
+The reference format still has room for them. A third field on a line of
+`reference.txt` lists allowed outcomes loom is known not to find; the test
+then requires those to stay missing, so that both a regression and an
+improvement are noticed.
 
-This does not make loom report a failure that cannot happen. It does mean that
-loom can miss a bug that only shows up in such an execution. Every program in
-the full generated set for which loom misses an outcome contains a
-read-modify-write.
+RC11 forbids load buffering (a load observing a store that is executed later),
+which C++ and Rust allow in principle. Loom cannot produce it either, so the
+comparison says nothing about it.
 
 ## Regenerating
 

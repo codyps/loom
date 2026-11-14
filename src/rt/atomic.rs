@@ -128,12 +128,6 @@ pub(super) struct State {
     /// remembered.
     last_non_load_access: Option<Access>,
 
-    /// Last time the atomic was accessed using an RMW access that did not fail.
-    ///
-    /// This is used for applying the RMW atomicity constraint to other stores
-    /// (so they don't squeeze in between the read and write part of the RMW).
-    last_successful_rmw: VersionVec,
-
     /// Currently tracked stored values. This is the `MAX_ATOMIC_HISTORY` most
     /// recent stores to the atomic cell in loom execution order.
     stores: [Store; MAX_ATOMIC_HISTORY],
@@ -737,7 +731,6 @@ impl State {
             is_mutating: false,
             last_load_access: Default::default(),
             last_non_load_access: None,
-            last_successful_rmw: VersionVec::new(),
             stores: Default::default(),
             cnt: 0,
         };
@@ -834,9 +827,6 @@ impl State {
                 modification_order.join(&mo);
             }
         }
-
-        // RMW Atomicity.
-        modification_order.join(&self.last_successful_rmw);
 
         // The slot is about to be reused; forget what was known about the
         // store it held.
@@ -1128,6 +1118,97 @@ impl State {
         }
     }
 
+    /// The stores (as a bit set of slots) that are ordered after the one in
+    /// slot `index`.
+    fn later_stores(&self, index: usize) -> u8 {
+        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let before = self.mo_before();
+
+        (0..cnt)
+            .filter(|&slot| slot != index && before[slot] & (1 << index) != 0)
+            .fold(0, |later, slot| later | 1 << slot)
+    }
+
+    /// Returns `true` if the current thread reading the store in slot `index`
+    /// with a read-modify-write, and writing a new store directly after it,
+    /// is consistent with the order of `SeqCst` operations.
+    fn rmw_admissible(
+        &self,
+        threads: &thread::Set,
+        seq_cst: &SeqCst,
+        atomic: usize,
+        index: usize,
+        success: Ordering,
+        failure: Ordering,
+    ) -> bool {
+        if seq_cst.is_empty() {
+            return true;
+        }
+
+        // Whether the operation succeeds is not known yet. Assume that it
+        // does, and that it is a `SeqCst` operation if it can be: that is the
+        // case with the most to be consistent with.
+        let is_seq_cst = is_seq_cst(success) || is_seq_cst(failure);
+
+        let mut causality = threads.active().causality;
+
+        if matches!(
+            success,
+            Ordering::Acquire | Ordering::AcqRel | Ordering::SeqCst
+        ) {
+            causality.join(self.stores[index].sync.happens_before());
+        }
+
+        let thread = threads.active_id().as_usize();
+        let elsewhere = threads.active().elsewhere(atomic);
+        let candidate = Self::candidate(threads, atomic, &causality, &elsewhere);
+        let fences = seq_cst.fences_before(thread, &causality);
+
+        // The load ...
+        let mut nodes = self.store_nodes();
+
+        nodes[index].load_fences_before.union_with(&fences);
+
+        if is_seq_cst {
+            nodes[index].loads.insert(seq_cst.len());
+        }
+
+        let preds = self.coherence_preds(threads, index, &self.mo_before());
+        let before = self.mo_before_with(index, preds);
+
+        let mut edges = Self::seq_cst_edges(&before, &nodes);
+
+        // ... and the store, which goes directly after the store that is
+        // read. Its slot may be that of the oldest store, which is forgotten
+        // at that point.
+        let written = StoreNodes {
+            store: if is_seq_cst {
+                Some(seq_cst.len())
+            } else {
+                None
+            },
+            fences_before: fences,
+            ..StoreNodes::default()
+        };
+
+        let cnt = cmp::min(self.cnt as usize, MAX_ATOMIC_HISTORY);
+        let reused = if self.cnt as usize >= MAX_ATOMIC_HISTORY {
+            Some(self.cnt as usize % MAX_ATOMIC_HISTORY)
+        } else {
+            None
+        };
+
+        for slot in (0..cnt).filter(|&slot| Some(slot) != reused) {
+            if slot == index || before[index] & (1 << slot) != 0 {
+                StoreNodes::edges(&nodes[slot], &written, &mut edges);
+            } else if before[slot] & (1 << index) != 0 {
+                StoreNodes::edges(&written, &nodes[slot], &mut edges);
+            }
+        }
+
+        seq_cst.admits(if is_seq_cst { Some(&candidate) } else { None }, &edges)
+    }
+
     /// Returns `true` if the current thread loading the store in slot `index`
     /// is consistent with the order of `SeqCst` operations.
     fn load_admissible(
@@ -1216,6 +1297,10 @@ impl State {
 
         let prev = self.stores[index].value;
 
+        // The stores that are ordered after the one being read. The thread
+        // knows of none of them, or it could not read this one.
+        let later = self.later_stores(index);
+
         match f(prev) {
             Ok(next) => {
                 // Perform load synchronization using the `success` ordering.
@@ -1250,9 +1335,16 @@ impl State {
                     self.stores[written].rmw_of = Some(index as u8);
                 }
 
-                // RMW Atomicity. Future stores must happen after this, because we
-                // already observed a value.
-                self.last_successful_rmw.join(&threads.active().causality);
+                // RMW atomicity: the new store goes directly after the one
+                // that was read, and so before everything that was already
+                // ordered after that one. (Stores that get ordered after the
+                // one that was read later on are taken care of by
+                // `mo_before`.)
+                for slot in slots(later) {
+                    if slot != written {
+                        self.stores[slot].mo_preds |= 1 << written;
+                    }
+                }
 
                 self.commit(seq_cst);
 
@@ -1510,8 +1602,11 @@ impl State {
         let mut n = 0;
         let cnt = self.cnt as usize;
 
-        // Unlike `match_load_to_stores`, rmw operations only load "newest"
-        // stores, in terms of modification order.
+        // A read-modify-write writes directly after the store it reads. Like
+        // a load, it cannot read a store if the thread knows of a newer one:
+        // what it writes comes after everything the thread knows of. It can
+        // read a store that has newer stores the thread does not know of,
+        // which then come after what it writes.
         let before = self.mo_before();
 
         'outer: for (i, store_i) in self.stores.iter().take(cnt).enumerate() {
@@ -1525,17 +1620,27 @@ impl State {
 
                 assert_ne!(mo_i, mo_j);
 
-                if before[j] & (1 << i) != 0 {
-                    // There is a newer store.
+                if store_j.rmw_of == Some(i as u8) {
+                    // Another read-modify-write has read this store, and
+                    // wrote directly after it.
                     continue 'outer;
+                }
+
+                if before[j] & (1 << i) != 0 {
+                    if store_j.first_seen.is_seen_by_current(threads) {
+                        // Store `j` is newer, and known to the thread.
+                        continue 'outer;
+                    }
+
+                    if store_i.first_seen.is_seen_before_yield(threads) {
+                        // Saw this store before the previous yield. In order
+                        // to advance the model, don't return it again.
+                        continue 'outer;
+                    }
                 }
             }
 
-            // Whether the operation succeeds is not known yet; it is a
-            // `SeqCst` operation if it can be.
-            let is_seq_cst = is_seq_cst(success) || is_seq_cst(failure);
-
-            if !self.load_admissible(threads, seq_cst, atomic, i, success, is_seq_cst) {
+            if !self.rmw_admissible(threads, seq_cst, atomic, i, success, failure) {
                 continue 'outer;
             }
 

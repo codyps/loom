@@ -590,3 +590,119 @@ fn with_mut_on_all_atomic_types() {
         assert_eq!(unsafe { *ptr.load(Relaxed) }, 5);
     });
 }
+
+/// A read-modify-write writes directly after the store it reads, but that
+/// does not have to be the newest store loom has executed. The other thread's
+/// store can have been executed already, without the swapping thread knowing
+/// of it, and still come last.
+#[test]
+fn rmw_before_unrelated_earlier_store() {
+    let solutions = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let solutions1 = std::sync::Arc::clone(&solutions);
+
+    loom::model(move || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+
+        let th = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                x.store(1, Relaxed);
+                y.store(2, Relaxed);
+            })
+        };
+
+        // Seeing `y == 2` means the other thread's store to `x` has been
+        // executed. Nothing makes this thread aware of it, though.
+        let seen = y.load(Relaxed);
+        let swapped = x.swap(4, Relaxed);
+
+        th.join().unwrap();
+
+        solutions1
+            .lock()
+            .unwrap()
+            .insert((seen, swapped, x.load(Relaxed)));
+    });
+
+    let solutions = solutions.lock().unwrap();
+
+    // The swap replaced the initial value, and the store of 1 came after it.
+    assert!(solutions.contains(&(2, 0, 1)), "{:?}", solutions);
+
+    // Whatever the swap replaced, nothing got in between: if it replaced 0,
+    // then 1 is the final value, and if it replaced 1, then 4 is.
+    for &(_, swapped, last) in solutions.iter() {
+        match swapped {
+            0 => assert_eq!(last, 1),
+            1 => assert_eq!(last, 4),
+            other => panic!("swap replaced {}", other),
+        }
+    }
+}
+
+/// Two read-modify-writes never read the same store, so no update is lost,
+/// whatever else is going on.
+#[test]
+fn rmws_do_not_read_the_same_store() {
+    loom::model(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let ths: Vec<_> = (0..2)
+            .map(|_| {
+                let x = x.clone();
+                thread::spawn(move || x.fetch_add(1, Relaxed))
+            })
+            .collect();
+
+        // A plain store that may land anywhere.
+        x.store(10, Relaxed);
+
+        let mut read: Vec<_> = ths.into_iter().map(|th| th.join().unwrap()).collect();
+        read.sort_unstable();
+
+        let last = x.load(Relaxed);
+
+        match read[..] {
+            // Both before the store, both after it, or one on each side.
+            [0, 1] => assert!(last == 10 || last == 2),
+            [10, 11] => assert_eq!(last, 12),
+            [0, 10] => assert_eq!(last, 11),
+            _ => panic!("fetch_adds read {:?}", read),
+        }
+    });
+}
+
+/// A compare-exchange can fail on a value that is no longer the newest one,
+/// as long as the thread has not seen a newer one.
+#[test]
+fn compare_exchange_can_fail_on_stale_value() {
+    let solutions = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let solutions1 = std::sync::Arc::clone(&solutions);
+
+    loom::model(move || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+
+        let th = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                x.store(1, Relaxed);
+                y.store(1, Relaxed);
+            })
+        };
+
+        let seen = y.load(Relaxed);
+        let result = x.compare_exchange(1, 2, Relaxed, Relaxed);
+
+        th.join().unwrap();
+
+        solutions1.lock().unwrap().insert((seen, result));
+    });
+
+    let solutions = solutions.lock().unwrap();
+
+    // `x == 1` has been stored, yet the compare-exchange still finds 0.
+    assert!(solutions.contains(&(1, Err(0))), "{:?}", solutions);
+    assert!(solutions.contains(&(1, Ok(1))), "{:?}", solutions);
+}

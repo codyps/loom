@@ -179,10 +179,13 @@ generated litmus programs (`tests/litmus_rc11`):
    another store comes after it, and a store could end up between the two
    halves of a read-modify-write. It also hit an internal assertion on 4
    programs. With the fixes loom produces no forbidden outcome on the corpus.
- - Loom still misses allowed outcomes in 202 of the 15,423 programs it
-   explores fully, all of them containing a read-modify-write, which is
-   always placed last in the modification order. This is unchanged from
-   before, and documented in the README.
+ - A read-modify-write can read any store its thread could load, not only
+   the newest one loom has executed, and writes directly after it. Loom
+   used to miss the executions in which an unrelated, already executed store
+   comes after both. A compare-exchange can likewise fail on a value that is
+   no longer the newest.
+ - With all of the above, loom produces exactly the outcomes RC11 allows for
+   every program of the corpus that it explores to completion (about 15,000).
 
 Added:
 
