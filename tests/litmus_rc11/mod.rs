@@ -8,14 +8,18 @@
 //! - `W<var><value><order>`: store, e.g. `Wx1s`
 //! - `R<var><order>`: load, e.g. `Ryr`
 //! - `X<var><value><order>`: exchange (swap), e.g. `Xx2s`
+//! - `C<var><expected><value><order><order>`: compare-exchange (strong) with
+//!   the orders for success and for failure, e.g. `Cx01sr`
 //! - `F`: `SeqCst` fence
 //!
 //! Variables are `x`, `y` and `z`, values single digits, and the orders are
 //! `r` (relaxed), `a` (acquire for loads, release for stores, both for
-//! exchanges) and `s` (`SeqCst`).
+//! exchanges and for a compare-exchange that succeeds) and `s` (`SeqCst`).
 //!
 //! An outcome lists the values read by each thread, in program order, and
-//! the final value of each variable: `0:1,0|1:0|x=1,y=2,z=0`.
+//! the final value of each variable: `0:1,0|1:0|x=1,y=2,z=0`. A
+//! compare-exchange reads two values: 1 or 0 for whether it succeeded, and
+//! the value it found.
 
 use loom::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::atomic::{fence, AtomicUsize};
@@ -30,6 +34,7 @@ pub enum Op {
     Store(usize, usize, Ordering),
     Load(usize, Ordering),
     Exchange(usize, usize, Ordering),
+    CompareExchange(usize, usize, usize, Ordering, Ordering),
     Fence,
 }
 
@@ -70,6 +75,13 @@ pub fn parse(program: &str) -> Vec<Vec<Op>> {
                         b'W' => Op::Store(var(op[1]), value(op[2]), order(op[3], false, true)),
                         b'R' => Op::Load(var(op[1]), order(op[2], true, false)),
                         b'X' => Op::Exchange(var(op[1]), value(op[2]), order(op[3], true, true)),
+                        b'C' => Op::CompareExchange(
+                            var(op[1]),
+                            value(op[2]),
+                            value(op[3]),
+                            order(op[4], true, true),
+                            order(op[5], true, false),
+                        ),
                         b'F' => Op::Fence,
                         other => panic!("bad operation {:?}", other as char),
                     }
@@ -133,6 +145,14 @@ pub fn outcomes_within(
                                 Op::Load(var, order) => read.push(vars[var].load(order)),
                                 Op::Exchange(var, value, order) => {
                                     read.push(vars[var].swap(value, order))
+                                }
+                                Op::CompareExchange(var, expected, value, success, failure) => {
+                                    match vars[var]
+                                        .compare_exchange(expected, value, success, failure)
+                                    {
+                                        Ok(found) => read.extend([1, found]),
+                                        Err(found) => read.extend([0, found]),
+                                    }
                                 }
                                 Op::Fence => fence(SeqCst),
                             }

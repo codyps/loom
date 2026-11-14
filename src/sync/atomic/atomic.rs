@@ -44,7 +44,7 @@ where
     #[track_caller]
     pub(crate) fn rmw<F>(&self, f: F, order: Ordering) -> T
     where
-        F: FnOnce(T) -> T,
+        F: Fn(T) -> T,
     {
         self.try_rmw::<_, ()>(order, order, |v| Ok(f(v))).unwrap()
     }
@@ -52,7 +52,7 @@ where
     #[track_caller]
     fn try_rmw<F, E>(&self, success: Ordering, failure: Ordering, f: F) -> Result<T, E>
     where
-        F: FnOnce(T) -> Result<T, E>,
+        F: Fn(T) -> Result<T, E>,
     {
         self.state.rmw(location!(), success, failure, f, None)
     }

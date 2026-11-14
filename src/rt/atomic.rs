@@ -711,7 +711,7 @@ impl<T: Numeric> Atomic<T> {
         spurious: Option<fn(T) -> E>,
     ) -> Result<T, E>
     where
-        F: FnOnce(T) -> Result<T, E>,
+        F: Fn(T) -> Result<T, E>,
     {
         self.branch(Action::rmw(success, failure), location);
 
@@ -730,6 +730,7 @@ impl<T: Numeric> Atomic<T> {
                     &mut seed[..],
                     success,
                     failure,
+                    |num| f(T::from_u64(num)).is_ok(),
                 );
                 execution.path.push_load(&seed[..n]);
             }
@@ -1870,6 +1871,7 @@ impl State {
         dst: &mut [u8],
         success: Ordering,
         failure: Ordering,
+        writes: impl Fn(u64) -> bool,
     ) -> usize {
         let mut n = 0;
         let cnt = cmp::min(self.cnt as usize, self.history);
@@ -1882,6 +1884,10 @@ impl State {
         let before = self.mo_before();
 
         'outer: for (i, store_i) in self.stores.iter().take(cnt).enumerate() {
+            // An operation that does not write for the value it finds (a
+            // compare-exchange that fails) is a load, and nothing more.
+            let writes = writes(store_i.value);
+
             for (j, store_j) in self.stores.iter().take(cnt).enumerate() {
                 if i == j {
                     continue;
@@ -1892,7 +1898,7 @@ impl State {
 
                 assert_ne!(mo_i, mo_j);
 
-                if store_j.rmw_of == Some(i as u8) {
+                if writes && store_j.rmw_of == Some(i as u8) {
                     // Another read-modify-write has read this store, and
                     // wrote directly after it.
                     continue 'outer;
@@ -1912,7 +1918,21 @@ impl State {
                 }
             }
 
-            if !self.rmw_admissible(threads, seq_cst, atomic, i, &before, success, failure) {
+            let admissible = if writes {
+                self.rmw_admissible(threads, seq_cst, atomic, i, &before, success, failure)
+            } else {
+                self.load_admissible(
+                    threads,
+                    seq_cst,
+                    atomic,
+                    i,
+                    &before,
+                    failure,
+                    is_seq_cst(failure),
+                )
+            };
+
+            if !admissible {
                 continue 'outer;
             }
 

@@ -79,6 +79,12 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - `compare_exchange` that fails could not find a value that another
+   read-modify-write had already replaced. Nothing may come between the
+   store such an operation reads and the one it writes, so no second one
+   can read the same store; but a compare-exchange that fails writes
+   nothing, and may see a stale value like any load. Found by the litmus
+   programs with compare-exchange: 36 of 1,500 missed outcomes.
  - Atomics with more stores than loom keeps (7 by default) could produce
    outcomes that cannot happen. The store given up for a new one was the
    one made first, which can be anywhere in the order of the atomic's
