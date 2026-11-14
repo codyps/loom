@@ -49,10 +49,11 @@ comparison says nothing about it.
 
 Loom keeps a limited number of stores per atomic (`Builder::atomic_history`,
 7 by default). Two programs here make more stores than that to one variable.
-Run with `LOOM_ATOMIC_HISTORY=3`, where most programs do, loom misses
-allowed outcomes for 46 programs (the stores that would be read are gone),
-gives up on 16 with a message that says to keep more stores, and still
-finds outcomes that are not allowed for 2.
+Run with `LOOM_ATOMIC_HISTORY=3`, where many programs do, loom misses
+allowed outcomes for 45 programs (the stores that would be read are gone),
+gives up on 29 with a message that says to keep more stores, and still
+finds outcomes that are not allowed for 1. With 5 stores kept it agrees
+with the reference on all of them.
 
 ## Regenerating
 

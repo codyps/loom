@@ -96,8 +96,9 @@ and release, and on the lowest allowed direct dependency versions.
    only return a store that is gone fails with a message saying to raise
    `atomic_history`, instead of returning something else. Found by a
    litmus program with eight stores to one variable that herd needed 16
-   minutes for. With `LOOM_ATOMIC_HISTORY=3` on the whole corpus, 2,770
-   programs had outcomes that are not allowed; 2 still do.
+   minutes for. With `LOOM_ATOMIC_HISTORY=3` on the first corpus, 2,770
+   programs had outcomes that are not allowed; 1 still does, and none with
+   5 stores kept.
  - Yielding: a thread that yields runs again after the others have taken a
    step, so what it gets to do depends on where its yield falls between
    their steps, whatever those are. The search did not know: a thread that

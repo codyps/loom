@@ -147,6 +147,10 @@ pub(super) struct State {
     /// What is left of the stores that are not kept anymore.
     forgotten: Forgotten,
 
+    /// The slot of the store that a read-modify-write has read, while it
+    /// makes its own.
+    read_by_rmw: Option<usize>,
+
     /// What `mo_before` returned, if nothing that it is computed from has
     /// changed since. It is asked for several times per operation.
     mo_cache: MoCache,
@@ -347,6 +351,29 @@ impl StoreNodes {
         }
 
         nodes
+    }
+
+    /// Makes this stand for `earlier` as well, a store that this one comes
+    /// directly after.
+    fn absorb(&mut self, earlier: &StoreNodes) {
+        self.fences_before.union_with(&earlier.fences_before);
+        self.fences_after.union_with(&earlier.fences_after);
+        self.loads.union_with(&earlier.loads);
+        self.load_fences_before
+            .union_with(&earlier.load_fences_before);
+        self.load_fences_after
+            .union_with(&earlier.load_fences_after);
+        self.forgotten
+            .sources
+            .union_with(&earlier.forgotten.sources);
+        self.forgotten.fences.union_with(&earlier.forgotten.fences);
+
+        // The store itself, where it is the earlier of two stores and where
+        // it is the later one.
+        if let Some(store) = earlier.store {
+            self.loads.insert(store);
+            self.fences_after.insert(store);
+        }
     }
 
     /// The edges of the `SeqCst` order that follow from `earlier` being
@@ -867,6 +894,7 @@ impl State {
             history,
             last: 0,
             forgotten: Forgotten::default(),
+            read_by_rmw: None,
             created_location: location,
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
@@ -1443,10 +1471,6 @@ impl State {
 
     /// Forgets the store in `slot`, which is the first of the stores that
     /// are kept (see `next_slot`), or not a store at all.
-    ///
-    /// The store is taken to come before every other one from here on. What
-    /// that means for the order of `SeqCst` operations is settled now for
-    /// the stores that are kept, and remembered for the ones to come.
     fn forget_slot(&mut self, seq_cst: &mut SeqCst, slot: usize, in_use: bool) {
         let mask: StoreSet = !(1 << slot);
 
@@ -1463,7 +1487,27 @@ impl State {
 
         self.mo_cache.clear();
 
-        if in_use && !seq_cst.is_empty() {
+        // A store written by a read-modify-write that read this one comes
+        // directly after it: whatever is before this store is before that
+        // one, and whatever is, or turns out to be, after that one is after
+        // this one. That store stands for both from here on: it takes this
+        // one's place in the order, counts as seen by the threads that have
+        // seen this one, and as this one in the order of `SeqCst`
+        // operations.
+        let follower = (0..self.history)
+            .find(|&other| other != slot && self.stores[other].rmw_of == Some(slot as u8));
+
+        if let Some(follower) = follower {
+            let position = self.stores[slot].position();
+            self.stores[follower].take_position(position);
+        } else if self.read_by_rmw == Some(slot) {
+            // The store that is being made is the one that follows it, see
+            // `rmw`.
+        } else if in_use && !seq_cst.is_empty() {
+            // Nothing stands for the store anymore. It is taken to come
+            // before every other one from here on. What that means for the
+            // order of `SeqCst` operations is settled now for the stores
+            // that are kept, and remembered for the ones to come.
             let mut edges = Vec::new();
 
             for other in (0..self.history).filter(|&other| other != slot) {
@@ -1479,19 +1523,6 @@ impl State {
             let forgotten = self.stores[slot].sc.clone();
             self.forgotten.add(&forgotten);
             self.forgotten.prune(seq_cst);
-        }
-
-        // A store written by a read-modify-write that read this one comes
-        // directly after it: whatever is, or turns out to be, after this
-        // store is after that one as well. That store takes this one's
-        // place in the order, and counts as seen by the threads that have
-        // seen this one.
-        let follower = (0..self.history)
-            .find(|&other| other != slot && self.stores[other].rmw_of == Some(slot as u8));
-
-        if let Some(follower) = follower {
-            let position = self.stores[slot].position();
-            self.stores[follower].take_position(position);
         }
 
         for store in &mut self.stores[..self.history] {
@@ -1576,7 +1607,10 @@ impl State {
                 // sequence.
                 let sync = self.stores[index].sync;
                 let position = self.stores[index].position();
+
+                self.read_by_rmw = Some(index);
                 self.store(threads, seq_cst, atomic, sync, next, success, node);
+                self.read_by_rmw = None;
 
                 // Remember which store this one replaced. If its slot was
                 // just reused for the new store, the new one takes its
@@ -1588,6 +1622,18 @@ impl State {
                 if written != index {
                     self.stores[written].rmw_of = Some(index as u8);
                 } else {
+                    // The store that was read is gone before the two were
+                    // ever kept together: what follows from the new one
+                    // coming after it has to be added here.
+                    let mut edges = Vec::new();
+                    StoreNodes::edges(&position.2, &self.stores[written].sc, &mut edges);
+
+                    for (from, to) in edges {
+                        let added = seq_cst.add_edge(from, to);
+
+                        debug_assert!(added, "[loom internal bug] SeqCst order is cyclic");
+                    }
+
                     self.stores[written].take_position(position);
                 }
 
@@ -2045,16 +2091,25 @@ impl Default for Store {
 
 impl Store {
     /// Where the store is in the modification order as far as its version
-    /// goes, and the threads that have seen it.
-    fn position(&self) -> (VersionVec, FirstSeen) {
-        (self.modification_order, self.first_seen.clone())
+    /// goes, the threads that have seen it, and what counts as the store in
+    /// the order of `SeqCst` operations.
+    fn position(&self) -> (VersionVec, FirstSeen, StoreNodes) {
+        (
+            self.modification_order,
+            self.first_seen.clone(),
+            self.sc.clone(),
+        )
     }
 
     /// Takes the place of a store that this one directly follows, and that
     /// is being forgotten.
-    fn take_position(&mut self, (modification_order, first_seen): (VersionVec, FirstSeen)) {
+    fn take_position(
+        &mut self,
+        (modification_order, first_seen, sc): (VersionVec, FirstSeen, StoreNodes),
+    ) {
         self.modification_order = modification_order;
         self.first_seen.merge(&first_seen);
+        self.sc.absorb(&sc);
     }
 }
 
