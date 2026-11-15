@@ -1,7 +1,12 @@
 # Litmus tests against a reference memory model
 
+There are two references: `reference.txt`, computed by the [herd7] simulator
+from a formal model, and `reference_genmc.txt`, computed by the [GenMC] model
+checker, which is fast and knows locks. Most of this file is about the first;
+see "GenMC" at the end for the second.
+
 `reference.txt` holds small concurrent programs and, for each, the outcomes the
-RC11 memory model allows, as computed by the [herd7] simulator. The test in
+RC11 memory model allows, as computed by herd. The test in
 `tests/litmus_reference.rs` runs every program under loom and checks that loom
 finds no outcome that is not allowed, and all the allowed ones except those
 recorded as known gaps. `mod.rs` documents the program notation and contains
@@ -18,7 +23,7 @@ continues a release sequence.
 
 ## What is covered
 
-`reference.txt` has 20,743 programs:
+`reference.txt` has 20,747 programs:
 
 - every program of two threads with two operations each over two variables,
   using relaxed and `SeqCst` loads, stores and exchanges and `SeqCst` fences;
@@ -29,7 +34,8 @@ continues a release sequence.
 - 599 programs of two threads with up to five operations;
 - 600 programs of five and six threads;
 - 97 programs with seven to nine stores to a single variable, which is more
-  than loom keeps by default.
+  than loom keeps by default;
+- 4 larger programs on which loom and GenMC disagreed, see below.
 
 An optimized build of the test checks all of them in about ten seconds; an
 unoptimized one checks one in eight.
@@ -106,4 +112,53 @@ forbidden outcome to `lout/extra.txt` and those for which it missed one to
 `lout/missing.txt`. `LOOM_LITMUS_PREEMPTIONS` sets a preemption bound and
 `LOOM_LITMUS_EXHAUSTIVE` makes the search exhaustive, for comparing the two.
 
+## GenMC
+
+GenMC explores the executions of a C program under RC11, one execution per
+equivalence class, and runs each to its end. `tools/genmc.py` turns a litmus
+program into a C program that prints what it read, runs GenMC on it, and
+collects what was printed. All 20,948 programs of the herd corpus take it a
+minute and a half, where herd takes hours and does not finish 205.
+
+On the 20,747 programs that have a herd result, GenMC finds the same outcomes
+for all but 4. For 3 of those it finds outcomes that herd does not allow,
+and for 1 it misses outcomes that herd allows.
+Loom agrees with herd on all 4. So GenMC is a second opinion and not a
+ground truth, and a disagreement with it is settled by herd where herd can
+be asked.
+
+`reference_genmc.txt` holds 2,968 programs that herd cannot be given, or
+does not finish, and that loom explores in under a third of a second each:
+
+- 1,496 programs with locks (`La`, `Ua`, `Lb`, `Ub`: two mutexes, never taken
+  in an order that can deadlock) around the same operations as before;
+- 708 larger programs: three and four threads of up to four operations, two
+  threads of up to six;
+- 375 with compare-exchange and 272 with many stores to one variable, of
+  those larger shapes;
+- 117 of the programs that herd did not finish.
+
+Loom finds exactly what GenMC finds for all of them. Of the 3,905 programs
+GenMC was given in all, loom finishes 3,895 within 45 seconds each. It
+agrees with GenMC on 3,889 of those. The others are 3 of the 4 programs
+above, which herd decides in loom's favor (they are in `reference.txt`,
+with herd's result, along with a fourth that showed a bug in loom), and 3
+that loom gives up on, saying that more stores have to be kept.
+
+To build GenMC (v0.20.0 needs LLVM 19 to 22; it looks for `clang` next to
+the LLVM tools only, where nix does not put it, hence the `sed`):
+
+    git clone --depth 1 https://github.com/MPI-SWS/genmc.git
+    cd genmc
+    sed -i 's/ NO_CACHE NO_DEFAULT_PATH REQUIRED)/ NO_CACHE REQUIRED)/' CMakeLists.txt
+    nix-shell -p cmake gnumake llvmPackages_19.llvm llvmPackages_19.llvm.dev \
+        llvmPackages_19.clang libffi zlib libedit ncurses libxml2 \
+        --run 'cmake -DCMAKE_BUILD_TYPE=Release -B build -S . && cmake --build build -j'
+
+To run it: `python3 tools/genmc.py genmc/build/bin/genmc < programs.txt >
+results.txt` writes lines in the format of the reference files. `gen.py`
+writes the programs for GenMC after the ones for herd; `gen.py 20948` writes
+only those.
+
 [herd7]: https://github.com/herd/herdtools7
+[GenMC]: https://github.com/MPI-SWS/genmc

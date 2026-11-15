@@ -25,7 +25,12 @@ mod litmus_rc11;
 
 use std::collections::BTreeSet;
 
+/// What herd allows.
 const REFERENCE: &str = include_str!("litmus_rc11/reference.txt");
+
+/// What GenMC finds, for programs that herd cannot be given: ones with
+/// locks, and ones it would take hours for.
+const REFERENCE_GENMC: &str = include_str!("litmus_rc11/reference_genmc.txt");
 
 /// The programs are split over a few tests to run in parallel.
 const PARTS: usize = 8;
@@ -34,7 +39,7 @@ const PARTS: usize = 8;
 /// one in this many. An optimized one checks every program.
 const DEBUG_SAMPLE: usize = 8;
 
-fn check(part: usize) {
+fn check(reference: &str, part: usize) {
     let mut failures = Vec::new();
 
     let sample = if cfg!(debug_assertions) {
@@ -43,7 +48,7 @@ fn check(part: usize) {
         1
     };
 
-    for line in REFERENCE.lines().skip(part).step_by(PARTS).step_by(sample) {
+    for line in reference.lines().skip(part).step_by(PARTS).step_by(sample) {
         let mut fields = line.split(" | ");
 
         let program = fields.next().unwrap();
@@ -85,23 +90,31 @@ fn check(part: usize) {
 }
 
 macro_rules! parts {
-    ($($name:ident: $part:expr,)*) => {
+    ($($name:ident: $reference:expr, $part:expr,)*) => {
         $(
             #[test]
             fn $name() {
-                check($part);
+                check($reference, $part);
             }
         )*
     };
 }
 
 parts! {
-    reference_part_0: 0,
-    reference_part_1: 1,
-    reference_part_2: 2,
-    reference_part_3: 3,
-    reference_part_4: 4,
-    reference_part_5: 5,
-    reference_part_6: 6,
-    reference_part_7: 7,
+    reference_part_0: REFERENCE, 0,
+    reference_part_1: REFERENCE, 1,
+    reference_part_2: REFERENCE, 2,
+    reference_part_3: REFERENCE, 3,
+    reference_part_4: REFERENCE, 4,
+    reference_part_5: REFERENCE, 5,
+    reference_part_6: REFERENCE, 6,
+    reference_part_7: REFERENCE, 7,
+    genmc_part_0: REFERENCE_GENMC, 0,
+    genmc_part_1: REFERENCE_GENMC, 1,
+    genmc_part_2: REFERENCE_GENMC, 2,
+    genmc_part_3: REFERENCE_GENMC, 3,
+    genmc_part_4: REFERENCE_GENMC, 4,
+    genmc_part_5: REFERENCE_GENMC, 5,
+    genmc_part_6: REFERENCE_GENMC, 6,
+    genmc_part_7: REFERENCE_GENMC, 7,
 }

@@ -11,6 +11,7 @@
 //! - `C<var><expected><value><order><order>`: compare-exchange (strong) with
 //!   the orders for success and for failure, e.g. `Cx01sr`
 //! - `F`: `SeqCst` fence
+//! - `L<mutex>` and `U<mutex>`: lock and unlock a mutex, `a` or `b`
 //!
 //! Variables are `x`, `y` and `z`, values single digits, and the orders are
 //! `r` (relaxed), `a` (acquire for loads, release for stores, both for
@@ -24,6 +25,7 @@
 use loom::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
 use loom::sync::atomic::{fence, AtomicUsize};
 use loom::sync::Arc;
+use loom::sync::Mutex as LoomMutex;
 use loom::thread;
 
 use std::collections::BTreeSet;
@@ -36,6 +38,8 @@ pub enum Op {
     Exchange(usize, usize, Ordering),
     CompareExchange(usize, usize, usize, Ordering, Ordering),
     Fence,
+    Lock(usize),
+    Unlock(usize),
 }
 
 pub const VARS: usize = 3;
@@ -83,6 +87,8 @@ pub fn parse(program: &str) -> Vec<Vec<Op>> {
                             order(op[5], true, false),
                         ),
                         b'F' => Op::Fence,
+                        b'L' => Op::Lock((op[1] - b'a') as usize),
+                        b'U' => Op::Unlock((op[1] - b'a') as usize),
                         other => panic!("bad operation {:?}", other as char),
                     }
                 })
@@ -131,13 +137,17 @@ pub fn outcomes_within(
                 AtomicUsize::new(0),
             ]);
 
+            let locks: Arc<[LoomMutex<()>; 2]> = Arc::new([LoomMutex::new(()), LoomMutex::new(())]);
+
             let handles: Vec<_> = threads
                 .iter()
                 .cloned()
                 .map(|ops| {
                     let vars = vars.clone();
+                    let locks = locks.clone();
                     thread::spawn(move || {
                         let mut read = Vec::new();
+                        let mut held = [None, None];
 
                         for op in ops {
                             match op {
@@ -155,6 +165,8 @@ pub fn outcomes_within(
                                     }
                                 }
                                 Op::Fence => fence(SeqCst),
+                                Op::Lock(lock) => held[lock] = Some(locks[lock].lock().unwrap()),
+                                Op::Unlock(lock) => held[lock] = None,
                             }
                         }
 

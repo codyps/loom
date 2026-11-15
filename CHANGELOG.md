@@ -35,9 +35,18 @@ and release, and on the lowest allowed direct dependency versions.
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
  - The whole RC11 reference corpus is checked in and checked by the test
    suite, all of it in an optimized build. It used to be a subset of 2,067
-   programs and is now 20,743: the 17,947 of the first corpus, and 2,796
-   more with compare-exchange, longer threads, five and six threads, and
-   more stores to one variable than loom keeps by default.
+   programs and is now 20,747: the 17,947 of the first corpus, 2,796 more
+   with compare-exchange, longer threads, five and six threads, and more
+   stores to one variable than loom keeps by default, and 4 that settle
+   disagreements with GenMC.
+ - A second reference for the litmus tests: GenMC, built from source. It is
+   fast enough to check what herd cannot (herd did not finish 205 programs
+   of its own corpus; GenMC does all 20,948 in a minute and a half), and it
+   knows locks. `tests/litmus_rc11/reference_genmc.txt` has 2,968 programs
+   checked against it, half of them with mutexes, the rest larger than
+   what herd gets through. GenMC and herd agree on all but 4 of the 20,747
+   programs both have a result for; loom agrees with herd on those. Two of
+   the bugs under "Fixed" were found this way.
  - `tests/exhaustive.rs`: 22 small models of everything loom provides
    (mutex, condition variable, channel, `RwLock`, `Notify`, park, `Arc`,
    atomics, yielding, `block_on`, scoped threads), each explored the usual
@@ -81,6 +90,22 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - Sleep sets lost outcomes, for a while. A thread was not tried from an
+   earlier point for the sake of its next step if it was asleep there, on
+   the grounds that the executions in which that step comes first had been
+   explored. They had, but the search gets to what follows from reordering
+   two operations by going through the reordering at that point, and other
+   parts of the search had been left out in turn because this part was
+   expected to cover them. Found by GenMC on a program of three threads
+   (`Rxs,Wy1r;Ryr,F;Wx2r`), which had three outcomes instead of four. The
+   rule is gone, and with it what it saved: the channel model above went
+   from 38 executions back to 90.
+ - A lock, or anything else a thread does between two `SeqCst` operations,
+   did not count as something done elsewhere, which is what decides whether
+   happens-before orders `SeqCst` operations of different threads. Only
+   accesses to other atomics did. An outcome that is not allowed was
+   possible in a program where one thread takes a lock between a `SeqCst`
+   store and a `SeqCst` load of the same atomic. Found by GenMC.
  - `compare_exchange` that fails could not find a value that another
    read-modify-write had already replaced. Nothing may come between the
    store such an operation reads and the one it writes, so no second one
@@ -244,13 +269,9 @@ Counts below are without a preemption bound.
    disconnects the channel. Each remaining sender gets to be the last, as
    with the handles of an `Arc`. `RwLock`: two threads taking the lock for
    reading are not explored in both orders once one of them has been.
- - A thread is not tried from an earlier point for the sake of its next
-   step if it is asleep there: that it is asleep says that this has been
-   explored. Such requests used to start executions that were found to be
-   repeats only further down. Three threads sending one message each to a
-   receiver that drains the channel: 835 executions before these two
-   changes, 38 now (228 instead of 2,112 with a preemption bound of 3). Two
-   writers and two readers of two atomics: 1,630 to 999.
+   Three threads sending one message each to a receiver that drains the
+   channel: 835 executions before, 90 now (426 instead of 2,112 with a
+   preemption bound of 3).
  - Several workers (`LOOM_WORKERS`, `model::Builder::workers`; one by
    default). Each explores a part of the tree of executions with a path of
    its own. A worker that runs out is handed an alternative that another

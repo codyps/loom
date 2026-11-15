@@ -24,17 +24,18 @@ def render(threads):
                 # compare-exchange: expects the initial value or what some
                 # operation of the program writes
                 val+=1; toks.append(f"C{op[1]}{op[2] % (writes+1)}{val}{op[3]}{op[4]}")
+            elif op[0] in 'LU': toks.append(op[0]+op[1])
             else: toks.append("F")
         out.append(",".join(toks))
     return ";".join(out), val
 
 def swapvars(threads, m):
-    return tuple(tuple((op[0], m[op[1]])+tuple(op[2:]) if len(op)>1 else op for op in t) for t in threads)
+    return tuple(tuple((op[0], m[op[1]])+tuple(op[2:]) if len(op)>1 and op[1] in m else op for op in t) for t in threads)
 
 def key(threads):
     # canonical under thread permutation and variable renaming
     best=None
-    vars_=sorted({op[1] for t in threads for op in t if len(op)>1})
+    vars_=sorted({op[1] for t in threads for op in t if len(op)>1 and op[1] in 'xyz'})
     for perm in itertools.permutations(vars_):
         m=dict(zip(vars_, perm))
         # rename to x,y,z by first-appearance is implied by trying all perms onto same set
@@ -97,6 +98,45 @@ sample(300, E, [(3,3,3),(3,3,2),(4,4),(5,4)], "stores")
 # more threads
 sample(600, A, [(1,1,1,1,1),(1,1,1,1,2),(1,1,1,2,2),(1,1,1,1,1,1)], "5thr")
 
+# Everything above can be given to herd, in principle. What follows is for
+# GenMC only (see genmc.py): herd would take far too long, or has no locks.
+first_genmc=len(progs)
+
+# larger programs
+sample(1200, A, [(4,4,3),(4,3,3),(3,3,3,2),(6,5),(6,6),(3,3,2,2)], "large")
+sample(600, E, [(3,3,3),(4,4),(5,4),(3,2,2,2),(4,3,2)], "stores2")
+sample(400, D, [(3,3,3),(4,4),(3,3,2,2)], "cas2")
+
+# Locks: `La` and `Lb` take a mutex, `Ua` and `Ub` give it up. A thread holds
+# `a` for some stretch of its operations, and may hold `b` inside that
+# stretch or on its own: never `a` inside `b`, so nothing deadlocks.
+def with_locks(ops):
+    ops=list(ops)
+    i=random.randrange(len(ops)); j=random.randrange(i+1,len(ops)+1)
+    inner=ops[i:j]
+    if random.random()<0.4 and inner:
+        k=random.randrange(len(inner)); l=random.randrange(k+1,len(inner)+1)
+        inner=inner[:k]+[('L','b')]+inner[k:l]+[('U','b')]+inner[l:]
+    out=ops[:i]+[('L','a')]+inner+[('U','a')]+ops[j:]
+    return tuple(out)
+
+def lone_b(ops):
+    ops=list(ops)
+    i=random.randrange(len(ops)); j=random.randrange(i+1,len(ops)+1)
+    return tuple(ops[:i]+[('L','b')]+ops[i:j]+[('U','b')]+ops[j:])
+
+def sample_locks(n, alpha, shapes, tag):
+    tries=0; start=len(progs)
+    while len(progs)-start<n and tries<n*50:
+        tries+=1
+        threads=[]
+        for t in rnd(alpha, random.choice(shapes)):
+            r=random.random()
+            threads.append(with_locks(t) if r<0.7 else lone_b(t) if r<0.85 else t)
+        add(tuple(threads), tag)
+
+sample_locks(1500, A, [(2,2),(3,2),(3,3),(2,2,2),(3,2,2),(2,2,2,2)], "locks")
+
 ord_c={'r':'memory_order_relaxed','s':'memory_order_seq_cst'}
 def c_order(o, kind):
     if o=='a': return {'W':'memory_order_release','R':'memory_order_acquire','X':'memory_order_acq_rel'}[kind]
@@ -111,6 +151,7 @@ with open("programs.txt","w") as pf, open("index.txt","w") as idx:
         name=f"t{n:05d}"
         if n<first: continue
         pf.write(s+"\n"); idx.write(f"{name} {tag} {s}\n")
+        if n>=first_genmc: continue
         locs=[]; body=[]; expected=[]
         for ti,t in enumerate(s.split(";")):
             lines=[]; r=0
