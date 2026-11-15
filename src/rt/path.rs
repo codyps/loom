@@ -515,6 +515,31 @@ impl Path {
         self.sleep_sets && !self.exhaustive && self.input.is_none() && !self.skipping
     }
 
+    /// Returns `true` if one of `threads` has been explored from the
+    /// scheduling decision at `point`, is being explored, or is waiting to
+    /// be.
+    pub(super) fn is_scheduled(&self, point: usize, threads: ThreadSet) -> bool {
+        if point >= self.branches.len() {
+            return false;
+        }
+
+        let schedule = match object::Ref::from_usize(point, self.branches.id())
+            .downcast::<Schedule>(&self.branches)
+        {
+            Some(schedule) => schedule.get(&self.branches),
+            None => return false,
+        };
+
+        schedule.exploring
+            && schedule.threads.iter().enumerate().any(|(i, th)| {
+                threads & (1 << i) != 0
+                    && matches!(
+                        th,
+                        Thread::Active | Thread::Pending | Thread::Visited | Thread::Taken
+                    )
+            })
+    }
+
     /// Returns `true` if the search is limited to a number of preemptions.
     pub(super) fn is_bounded(&self) -> bool {
         self.preemption_bound.is_some()

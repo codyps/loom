@@ -1,6 +1,6 @@
 use crate::rt::alloc::Allocation;
 use crate::rt::seq_cst::SeqCst;
-use crate::rt::{lazy_static, object, thread, Path, ThreadSet};
+use crate::rt::{lazy_static, object, thread, Path, ThreadSet, VersionVec, MAX_THREADS};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,6 +35,9 @@ pub(crate) struct Execution {
     /// thread is running from.
     scheduled_at: Option<usize>,
 
+    /// The steps of this execution so far, in order.
+    steps: Vec<Step>,
+
     /// Maps raw allocations to LeakTrack objects
     pub(super) raw_allocations: HashMap<usize, Allocation>,
 
@@ -55,6 +58,18 @@ pub(crate) struct Execution {
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
 pub(crate) struct Id(usize);
+
+/// A step of an execution: a thread, chosen at a scheduling decision, runs
+/// its operation.
+struct Step {
+    /// The position in the path of the scheduling decision.
+    path_id: usize,
+
+    thread: usize,
+
+    /// What the step is ordered after, itself included.
+    dpor_vv: VersionVec,
+}
 
 impl Execution {
     /// Create a new execution.
@@ -82,6 +97,7 @@ impl Execution {
             seq_cst: SeqCst::default(),
             sleeping: 0,
             scheduled_at: None,
+            steps: Vec::new(),
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
             max_threads,
@@ -122,6 +138,7 @@ impl Execution {
         let mut lazy_statics = self.lazy_statics;
         let mut raw_allocations = self.raw_allocations;
         let mut arc_objs = self.arc_objs;
+        let mut steps = self.steps;
 
         let mut threads = self.threads;
 
@@ -134,6 +151,7 @@ impl Execution {
         lazy_statics.reset();
         raw_allocations.clear();
         arc_objs.clear();
+        steps.clear();
 
         threads.clear(id);
 
@@ -145,6 +163,7 @@ impl Execution {
             seq_cst,
             sleeping: 0,
             scheduled_at: None,
+            steps,
             lazy_statics,
             raw_allocations,
             arc_objs,
@@ -184,6 +203,7 @@ impl Execution {
             // recent one, see `races_with_all`.
             let all = self.objects.races_with_all(operation);
             let mut latest = None;
+            let mut points = Vec::new();
             let path = &mut self.path;
 
             // Taking a lock cannot be moved before the release it waits
@@ -204,16 +224,33 @@ impl Execution {
                     }
 
                     if all {
-                        // Track backtracking point
-                        path.backtrack(access.path_id(), th_id);
+                        points.push(access.path_id());
                     } else {
                         latest = latest.max(Some(access.path_id()));
                     }
                 });
 
-            if let Some(point) = latest {
+            points.extend(latest);
+
+            if points.is_empty() {
+                continue;
+            }
+
+            // What the operation is ordered after.
+            let mut dpor_vv = th.dpor_vv;
+
+            self.objects
+                .for_each_dependent_access(operation, false, false, |access| {
+                    dpor_vv.join(access.version());
+                });
+
+            for point in points {
+                if !bounded && covered(&self.steps, path, point, th_id.as_usize(), &dpor_vv) {
+                    continue;
+                }
+
                 // Track backtracking point
-                self.path.backtrack(point, th_id);
+                path.backtrack(point, th_id);
             }
         }
 
@@ -401,6 +438,17 @@ impl Execution {
 
             dpor_vv[th_id] += 1;
             threads.active_mut().dpor_vv = dpor_vv;
+        }
+
+        self.steps.push(Step {
+            path_id,
+            thread: self.threads.active_id().as_usize(),
+            dpor_vv: self.threads.active().dpor_vv,
+        });
+
+        if let Some(operation) = self.threads.active().operation {
+            let th_id = self.threads.active_id();
+            let dpor_vv = self.threads.active().dpor_vv;
 
             self.objects
                 .set_last_access(operation, th_id.as_usize(), path_id, &dpor_vv);
@@ -503,6 +551,64 @@ impl Execution {
     pub(crate) fn check_for_leaks(&self) {
         self.objects.check_for_leaks();
     }
+}
+
+/// Returns `true` if nothing has to be added to the scheduling decision at
+/// `point` for `thread`'s next operation, which is ordered after `dpor_vv`,
+/// to be tried before the operation that was executed from there.
+///
+/// The executions wanted are the ones that go on, from that point, with
+/// the steps that have been taken since and are not ordered after that
+/// operation, and then with `thread`'s operation. Any thread whose first
+/// step among those is not ordered after another of them can be the one to
+/// start with. If one of those threads has been explored from the point, is
+/// being explored, or is going to be, these executions are taken care of.
+/// (These are the "source sets" of Abdulla, Aronis, Jonsson and Sagonas,
+/// "Optimal dynamic partial order reduction", POPL 2014.)
+fn covered(steps: &[Step], path: &Path, point: usize, thread: usize, dpor_vv: &VersionVec) -> bool {
+    let index = match steps.binary_search_by_key(&point, |step| step.path_id) {
+        Ok(index) => index,
+        Err(_) => return false,
+    };
+
+    let earlier = &steps[index];
+    let clock = earlier.dpor_vv.get(earlier.thread);
+
+    // Each thread's first step that is not ordered after the operation.
+    let mut first = [None; MAX_THREADS];
+
+    for (i, step) in steps.iter().enumerate().skip(index + 1) {
+        if step.dpor_vv.get(earlier.thread) < clock && first[step.thread].is_none() {
+            first[step.thread] = Some(i);
+        }
+    }
+
+    // Whether a step at position `at`, ordered after `vv`, comes after none
+    // of the other threads' steps.
+    let leads = |thread: usize, vv: &VersionVec, at: usize| {
+        first.iter().enumerate().all(|(other, first)| match first {
+            Some(first) if other != thread && *first < at => {
+                vv.get(other) < steps[*first].dpor_vv.get(other)
+            }
+            _ => true,
+        })
+    };
+
+    let mut initials: ThreadSet = 0;
+
+    for (other, first) in first.iter().enumerate() {
+        if let Some(first) = first {
+            if leads(other, &steps[*first].dpor_vv, *first) {
+                initials |= 1 << other;
+            }
+        }
+    }
+
+    if first[thread].is_none() && leads(thread, dpor_vv, usize::MAX) {
+        initials |= 1 << thread;
+    }
+
+    path.is_scheduled(point, initials)
 }
 
 impl fmt::Debug for Execution {

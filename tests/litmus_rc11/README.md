@@ -139,11 +139,12 @@ does not finish, and that loom explores in under a third of a second each:
 - 117 of the programs that herd did not finish.
 
 Loom finds exactly what GenMC finds for all of them. Of the 3,905 programs
-GenMC was given in all, loom finishes 3,895 within 45 seconds each. It
-agrees with GenMC on 3,889 of those. The others are 3 of the 4 programs
-above, which herd decides in loom's favor (they are in `reference.txt`,
-with herd's result, along with a fourth that showed a bug in loom), and 3
-that loom gives up on, saying that more stores have to be kept.
+GenMC was given in all, loom finishes 3,895 within 45 seconds each, and
+the other 10 within a few minutes on eight workers. It agrees with GenMC
+on all but 6. Those are 3 of the 4 programs above, which herd decides in
+loom's favor (they are in `reference.txt`, with herd's result, along with
+a fourth that showed a bug in loom), and 3 that loom gives up on, saying
+that more stores have to be kept.
 
 To build GenMC (v0.20.0 needs LLVM 19 to 22; it looks for `clang` next to
 the LLVM tools only, where nix does not put it, hence the `sed`):

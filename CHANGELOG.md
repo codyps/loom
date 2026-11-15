@@ -283,6 +283,16 @@ Counts below are without a preemption bound.
    Three threads sending one message each to a receiver that drains the
    channel: 835 executions before, 90 now (426 instead of 2,112 with a
    preemption bound of 3).
+ - Source sets. When an operation is to be tried before an earlier one, a
+   thread is added to the scheduling decision of the earlier one. Not if
+   there is one already that the wanted executions can start with: a
+   thread whose first step since then comes after none of the other
+   steps that are to stay where they are. Unlike the rule that was taken
+   back (see "Fixed"), this never leaves something out because a thread is
+   asleep. Two writers and two readers of two atomics: 1,630 executions to
+   1,562; three threads doing three `fetch_add` each: 1,699 to 1,680,
+   which is the number of orders there are. Not used with a preemption
+   bound.
  - Several workers (`LOOM_WORKERS`, `model::Builder::workers`; one by
    default). Each explores a part of the tree of executions with a path of
    its own. A worker that runs out is handed an alternative that another
