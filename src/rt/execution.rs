@@ -196,7 +196,7 @@ impl Execution {
 
                     if all {
                         // Track backtracking point
-                        path.backtrack(access.path_id(), th_id, th.last_step);
+                        path.backtrack(access.path_id(), th_id);
                     } else {
                         latest = latest.max(Some(access.path_id()));
                     }
@@ -204,7 +204,7 @@ impl Execution {
 
             if let Some(point) = latest {
                 // Track backtracking point
-                self.path.backtrack(point, th_id, th.last_step);
+                self.path.backtrack(point, th_id);
             }
         }
 
@@ -415,7 +415,7 @@ impl Execution {
         }
 
         let yielding = self.threads.active();
-        let (last_step, dpor_vv) = (yielding.last_step, yielding.dpor_vv);
+        let dpor_vv = yielding.dpor_vv;
 
         // The threads it waits for are not asleep anymore: their next step
         // lets this thread run again, which it did not when it was explored.
@@ -436,7 +436,7 @@ impl Execution {
                 continue;
             }
 
-            self.path.backtrack(point, active, last_step);
+            self.path.backtrack(point, active);
         }
     }
 

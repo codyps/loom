@@ -349,5 +349,5 @@ fn channel_with_three_senders() {
     });
 
     // 835 with every pair of channel operations taken to be dependent.
-    assert!((6..=48).contains(&count), "{}", count);
+    assert!((6..=100).contains(&count), "{}", count);
 }

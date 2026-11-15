@@ -520,3 +520,48 @@ fn rwlock_readers_between_writes() {
     // Each reader sees one of the six non-decreasing pairs of 0, 1 and 2.
     assert_eq!(seen.len(), 36, "{:?}", seen);
 }
+
+/// The first thread reads `x` after the third has stored to it, and the
+/// second reads `y` after the first has stored to that. To get there the
+/// search has to move the first thread's load ahead of the second thread's
+/// fence, which it had already done in another part of the search, where
+/// the first thread ran before the others. It has to do it here as well:
+/// what comes next is the second thread's load after the first thread's
+/// store, and that is only seen from here.
+#[test]
+fn reordering_that_another_part_of_the_search_covers() {
+    use loom::sync::atomic::fence;
+
+    let seen = same_outcomes(|| {
+        let x = Arc::new(AtomicUsize::new(0));
+        let y = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                let read = x.load(SeqCst);
+                y.store(1, Relaxed);
+                read
+            })
+        };
+        let second = {
+            let y = y.clone();
+            thread::spawn(move || {
+                let read = y.load(Relaxed);
+                fence(SeqCst);
+                read
+            })
+        };
+        let third = {
+            let x = x.clone();
+            thread::spawn(move || x.store(2, Relaxed))
+        };
+
+        let read = (first.join().unwrap(), second.join().unwrap());
+        third.join().unwrap();
+
+        read
+    });
+
+    assert_eq!(seen, BTreeSet::from([(0, 0), (0, 1), (2, 0), (2, 1)]));
+}
