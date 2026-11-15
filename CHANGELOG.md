@@ -90,6 +90,17 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - Preemption bound with locks: outcomes within the bound were missed. A
+   thread that is stopped while it holds a lock lets another one run up to
+   where it wants the lock, and that one then stops by itself, which is no
+   preemption. The search never tried stopping a thread there: taking a
+   lock and releasing it were not operations to reorder, as the one that
+   waits cannot go first. With a bound they are now. And a thread that is
+   about to take or release a lock, or to do anything else that decides
+   which threads can run, is not put to sleep in a bounded search: moving
+   such a step changes what a preemption is. Found by comparing with the
+   exhaustive search on the GenMC programs with locks: 22 of 2,968 missed
+   outcomes with a bound of 1, 2 with a bound of 2; none do now.
  - Sleep sets lost outcomes, for a while. A thread was not tried from an
    earlier point for the sake of its next step if it was asleep there, on
    the grounds that the executions in which that step comes first had been

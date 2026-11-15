@@ -309,6 +309,10 @@ impl Store {
     /// Calls `f` with every previous access that `operation` is dependent
     /// with and that could still be unordered with respect to it.
     ///
+    /// With `bounded` set as well, the search has a preemption bound, and a
+    /// thread that waits for a lock is reordered with the release of it: see
+    /// `Execution::schedule`.
+    ///
     /// With `racing` set, accesses that `operation` depends on but can never
     /// be reordered with are left out. Those matter for tracking what the
     /// operation is ordered after, but are not places to backtrack to.
@@ -316,6 +320,7 @@ impl Store {
         &self,
         operation: Operation,
         racing: bool,
+        bounded: bool,
         mut f: impl FnMut(&Access),
     ) {
         let last = match &self.entries[operation.obj.index] {
@@ -342,13 +347,13 @@ impl Store {
             }
             Entry::Mutex(entry) => {
                 entry
-                    .dependent_accesses(operation.action, racing)
+                    .dependent_accesses(operation.action, racing && !bounded)
                     .for_each(f);
                 return;
             }
             Entry::RwLock(entry) => {
                 entry
-                    .dependent_accesses(operation.action, racing)
+                    .dependent_accesses(operation.action, racing && !bounded)
                     .for_each(f);
                 return;
             }
@@ -410,6 +415,20 @@ impl Store {
             Entry::RwLock(entry) => entry.dependent(a.action, b.action),
             _ => true,
         }
+    }
+
+    /// Returns `true` if `operation` can make a thread wait, or let one that
+    /// waits carry on: an operation on a lock, a channel, or something else
+    /// to wait for.
+    pub(super) fn affects_waiting(&self, operation: Operation) -> bool {
+        matches!(
+            self.entries[operation.obj.index],
+            Entry::Mutex(_)
+                | Entry::RwLock(_)
+                | Entry::Condvar(_)
+                | Entry::Notify(_)
+                | Entry::Channel(_)
+        )
     }
 
     /// Returns `true` if `operation` has to be tried before each of the

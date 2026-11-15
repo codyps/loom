@@ -723,3 +723,79 @@ fn yield_then_act() {
         (before, yielder.join().unwrap(), other.join().unwrap())
     });
 }
+
+/// With one preemption, the second thread can run between the first
+/// thread's two exchanges, if the first is stopped while it holds the lock:
+/// the second then stops at the lock by itself, which costs nothing.
+#[test]
+fn preempted_inside_a_critical_section() {
+    let seen = check(ALL, || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let lock = Arc::new(Mutex::new(()));
+
+        let other = {
+            let (x, lock) = (x.clone(), lock.clone());
+            thread::spawn(move || {
+                let first = x.swap(3, Relaxed);
+                let guard = lock.lock().unwrap();
+                let second = x.swap(4, SeqCst);
+                drop(guard);
+
+                (first, second)
+            })
+        };
+
+        let guard = lock.lock().unwrap();
+        let first = x.swap(1, SeqCst);
+        drop(guard);
+        let second = x.swap(2, SeqCst);
+
+        (first, second, other.join().unwrap(), x.load(SeqCst))
+    });
+
+    assert!(seen.contains(&(0, 3, (1, 2), 4)), "{:?}", seen);
+}
+
+/// The same with a third thread, which is where putting threads to sleep
+/// comes in: a thread about to take or release a lock decides which
+/// threads can run, and with a bound that is not something to skip over.
+#[test]
+fn preempted_inside_a_critical_section_three_threads() {
+    check(BOUNDED, || {
+        let x = Arc::new(AtomicUsize::new(0));
+        let lock = Arc::new(Mutex::new(()));
+
+        let first = {
+            let (x, lock) = (x.clone(), lock.clone());
+            thread::spawn(move || {
+                let guard = lock.lock().unwrap();
+                let first = x.swap(1, Relaxed);
+                drop(guard);
+
+                (first, x.swap(2, Relaxed))
+            })
+        };
+        let second = {
+            let (x, lock) = (x.clone(), lock.clone());
+            thread::spawn(move || {
+                let first = x.swap(3, Relaxed);
+                let guard = lock.lock().unwrap();
+                let second = x.swap(4, SeqCst);
+                drop(guard);
+
+                (first, second)
+            })
+        };
+        let third = {
+            let x = x.clone();
+            thread::spawn(move || x.swap(5, SeqCst))
+        };
+
+        (
+            first.join().unwrap(),
+            second.join().unwrap(),
+            third.join().unwrap(),
+            x.load(SeqCst),
+        )
+    });
+}

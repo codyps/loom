@@ -515,6 +515,11 @@ impl Path {
         self.sleep_sets && !self.exhaustive && self.input.is_none() && !self.skipping
     }
 
+    /// Returns `true` if the search is limited to a number of preemptions.
+    pub(super) fn is_bounded(&self) -> bool {
+        self.preemption_bound.is_some()
+    }
+
     pub(crate) fn set_sleep_sets(&mut self, sleep_sets: bool) {
         self.sleep_sets = sleep_sets;
     }

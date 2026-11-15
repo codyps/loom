@@ -186,8 +186,17 @@ impl Execution {
             let mut latest = None;
             let path = &mut self.path;
 
+            // Taking a lock cannot be moved before the release it waits
+            // for, and without a bound nothing is gained by trying. With a
+            // bound it is: the thread can be run up to where it starts to
+            // wait, at a point where the other one still holds the lock,
+            // and switching away from a thread that waits is no
+            // preemption. An execution that is within the bound that way
+            // may have no other within it that is equivalent.
+            let bounded = path.is_bounded();
+
             self.objects
-                .for_each_dependent_access(operation, true, |access| {
+                .for_each_dependent_access(operation, true, bounded, |access| {
                     if access.happens_before(&th.dpor_vv) {
                         // The previous access happened before this access,
                         // thus there is no race.
@@ -339,10 +348,22 @@ impl Execution {
                         _ => true,
                     };
 
+                    // With a preemption bound, moving a thread's step to an
+                    // earlier point must not cost a preemption more (see
+                    // `Path::explored_at`). That is only known for a step
+                    // that leaves alone which threads can run: with a lock
+                    // taken earlier, a thread that waits for it stops for
+                    // free where it would have had to be preempted, and the
+                    // other way around.
+                    let bounded_out = self.path.is_bounded()
+                        && th
+                            .operation
+                            .map_or(false, |pending| self.objects.affects_waiting(pending));
+
                     // A thread that has yielded can run again because of
                     // what other threads did since, so it does not have
                     // nothing to do with them.
-                    if independent && th.is_runnable() && !th.yielded {
+                    if independent && th.is_runnable() && !th.yielded && !bounded_out {
                         sleeping |= bit;
                     }
                 }
@@ -374,7 +395,7 @@ impl Execution {
             let mut dpor_vv = threads.active().dpor_vv;
 
             self.objects
-                .for_each_dependent_access(operation, false, |access| {
+                .for_each_dependent_access(operation, false, false, |access| {
                     dpor_vv.join(access.version());
                 });
 
