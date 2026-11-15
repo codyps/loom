@@ -539,6 +539,7 @@ pub(crate) fn fence(ordering: Ordering, location: Location) {
         let clock = execution.threads.active().causality.get(thread);
 
         // A fence is an operation on no location in particular.
+        execution.threads.active_mut().settle_other();
         execution.seq_cst.observe(thread, NO_LOCATION, clock);
 
         match ordering {
@@ -851,6 +852,7 @@ impl<T: Numeric> Atomic<T> {
         let thread = execution.threads.active_id().as_usize();
         let clock = execution.threads.active().causality.get(thread);
 
+        execution.threads.active_mut().settle_other();
         execution.seq_cst.observe(thread, atomic, clock);
 
         atomic

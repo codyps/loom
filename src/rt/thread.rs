@@ -54,6 +54,10 @@ pub(crate) struct Thread {
     /// Number of times the thread yielded
     pub yield_count: usize,
 
+    /// True if the thread has done something other than an atomic operation
+    /// since its last atomic operation.
+    other_pending: bool,
+
     /// True from when the thread yields until it runs again. When it can do
     /// that depends on what the other threads do, whatever that is.
     pub(super) yielded: bool,
@@ -142,6 +146,7 @@ impl Thread {
             last_yield: None,
             yield_count: 0,
             yield_waits: 0,
+            other_pending: false,
             yielded: false,
             last_step: None,
             locals: HashMap::new(),
@@ -158,6 +163,22 @@ impl Thread {
             }
             Some(_) => self.last_view,
             None => VersionVec::new(),
+        }
+    }
+
+    /// Records that the thread is about to do something that is not an
+    /// atomic operation, such as taking a lock.
+    pub(crate) fn note_other(&mut self) {
+        self.other_pending = true;
+    }
+
+    /// Called when the thread gets to an atomic operation: whatever else it
+    /// has done since the last one is over, and counts as an operation on a
+    /// location of its own.
+    pub(crate) fn settle_other(&mut self) {
+        if self.other_pending {
+            self.other_pending = false;
+            self.note_access(seq_cst::OTHER_LOCATION);
         }
     }
 

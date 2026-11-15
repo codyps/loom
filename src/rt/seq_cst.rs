@@ -129,6 +129,9 @@ impl NodeSet {
 /// Location of a fence, which is not an access to any atomic.
 pub(crate) const NO_LOCATION: usize = usize::MAX;
 
+/// Stands for whatever a thread does that is not an atomic operation.
+pub(crate) const OTHER_LOCATION: usize = usize::MAX - 1;
+
 #[derive(Debug, Clone)]
 struct Node {
     thread: usize,

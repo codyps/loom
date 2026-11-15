@@ -672,6 +672,25 @@ impl<T: Object<Entry = Entry>> Ref<T> {
             action,
             location,
         });
+
+        // For the order of `SeqCst` operations it matters whether a thread
+        // has done something else between two of them (see `rt::seq_cst`).
+        // Taking a lock or sending a message is something else as much as
+        // an access to another atomic is.
+        let is_atomic = matches!(
+            execution.objects.entries[self.index],
+            Entry::Atomic(_) | Entry::SeqCstFences(_)
+        );
+
+        if !is_atomic {
+            execution.threads.active_causality_inc();
+
+            let thread = execution.threads.active_id().as_usize();
+            let clock = execution.threads.active().causality.get(thread);
+
+            execution.seq_cst.observe(thread, self.index, clock);
+            execution.threads.active_mut().note_other();
+        }
     }
 }
 
