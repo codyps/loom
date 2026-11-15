@@ -80,11 +80,17 @@ fn invalid_unsync_load_relaxed() {
     });
 }
 
+/// Each exchange can read the initial value although the other thread has
+/// stored to that atomic, or the other thread's store: all four
+/// combinations. Whichever it reads, the store ends up last, as a
+/// read-modify-write that reads the initial value has to come directly
+/// after it, so both atomics are always 1 at the end.
 #[test]
-#[ignore]
-#[should_panic]
 fn compare_and_swap_reads_old_values() {
-    loom::model(|| {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let seen2 = seen.clone();
+
+    loom::model(move || {
         let a = Arc::new(AtomicUsize::new(0));
         let b = Arc::new(AtomicUsize::new(0));
 
@@ -93,21 +99,23 @@ fn compare_and_swap_reads_old_values() {
 
         let th = thread::spawn(move || {
             a2.store(1, Release);
-            b2.compare_and_swap(0, 2, AcqRel);
+            b2.compare_and_swap(0, 2, AcqRel)
         });
 
         b.store(1, Release);
-        a.compare_and_swap(0, 2, AcqRel);
+        let read_a = a.compare_and_swap(0, 2, AcqRel);
 
-        th.join().unwrap();
+        let read_b = th.join().unwrap();
 
-        let a_val = a.load(Acquire);
-        let b_val = b.load(Acquire);
+        assert_eq!(a.load(Acquire), 1);
+        assert_eq!(b.load(Acquire), 1);
 
-        if a_val == 2 && b_val == 2 {
-            panic!();
-        }
+        seen2.lock().unwrap().insert((read_a, read_b));
     });
+
+    let seen = seen.lock().unwrap();
+    let all: HashSet<_> = [(0, 0), (0, 1), (1, 0), (1, 1)].into_iter().collect();
+    assert_eq!(*seen, all);
 }
 
 #[test]
