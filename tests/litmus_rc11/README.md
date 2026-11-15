@@ -68,13 +68,13 @@ Loom keeps a limited number of stores per atomic (`Builder::atomic_history`,
 one variable, and loom agrees with the reference on them. For the 203 that
 herd did not finish, loom with the default gives what it gives with every
 store kept, except for one program that it gives up on with a message that
-says to keep more stores. Run with `LOOM_ATOMIC_HISTORY=3` on the first
-17,947 programs, many of which then make more stores than are kept, loom
-misses
-allowed outcomes for 45 programs (the stores that would be read are gone),
-gives up on 29 with a message that says to keep more stores, and still
-finds outcomes that are not allowed for 1. With 5 stores kept it agrees
-with the reference on all of them.
+says to keep more stores. Run with `LOOM_ATOMIC_HISTORY=3` on all 20,747
+programs, many of which then make more stores than are kept, loom misses
+allowed outcomes for 52 programs (the stores that would be read are gone),
+gives up on 43 with a message that says to keep more stores, and finds no
+outcome that is not allowed. With 5 stores kept it gives up on 2 and agrees
+with the reference on the rest; with 2 kept, one program is left for which
+it finds outcomes that are not allowed.
 
 ## Regenerating
 
