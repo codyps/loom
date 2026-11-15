@@ -138,6 +138,24 @@ pub struct Builder {
     /// to `0` turns it off.
     pub sleep_sets: bool,
 
+    /// Explore each way of ordering the operations of a model that have to
+    /// do with each other exactly once, and nothing else.
+    ///
+    /// Without this, loom tries a thread from an earlier point when two
+    /// operations could have been the other way around, and sees where that
+    /// leads. Often it leads, many steps later, to an execution that has
+    /// been explored. With it, loom keeps track of the steps that get the
+    /// two operations the other way around, and follows them (the "wakeup
+    /// trees" of optimal dynamic partial order reduction).
+    ///
+    /// This builds on [`sleep_sets`](Builder::sleep_sets), and is not used
+    /// with a preemption bound or with more than one
+    /// [worker](Builder::workers).
+    ///
+    /// Defaults to `true`. Setting the `LOOM_WAKEUP_TREES` environment
+    /// variable to `0` turns it off.
+    pub wakeup_trees: bool,
+
     /// Try every thread at every point where the preemption bound allows
     /// it, instead of only the ones that loom can tell make a difference.
     ///
@@ -195,6 +213,8 @@ impl Builder {
             .map(|v| v.parse().expect("invalid value for `LOOM_ATOMIC_HISTORY`"))
             .unwrap_or(7);
 
+        let wakeup_trees = env::var("LOOM_WAKEUP_TREES").map_or(true, |v| v != "0");
+
         let workers = env::var("LOOM_WORKERS")
             .map(|v| v.parse().expect("invalid value for `LOOM_WORKERS`"))
             .unwrap_or(1);
@@ -239,6 +259,7 @@ impl Builder {
             location,
             log,
             sleep_sets,
+            wakeup_trees,
             exhaustive: false,
             workers,
         }
@@ -363,6 +384,7 @@ impl Builder {
                     execution.path.set_max_branches(self.max_branches);
                     execution.path.set_sleep_sets(self.sleep_sets);
                     execution.path.set_exhaustive(self.exhaustive);
+                    execution.path.set_wakeup_trees(self.wakeup_trees);
                 }
             }
         }
@@ -538,6 +560,7 @@ impl Builder {
         execution.max_history = self.atomic_history;
         execution.path.set_sleep_sets(self.sleep_sets);
         execution.path.set_exhaustive(self.exhaustive);
+        execution.path.set_wakeup_trees(self.wakeup_trees);
 
         execution
     }

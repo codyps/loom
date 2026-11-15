@@ -359,7 +359,8 @@
 //! ```
 //!
 //! Loom skips executions that can only repeat ones it has already explored (see
-//! [`Builder::sleep_sets`](model::Builder::sleep_sets)). A bounded search can do much less of
+//! [`Builder::sleep_sets`](model::Builder::sleep_sets) and
+//! [`Builder::wakeup_trees`](model::Builder::wakeup_trees)). A bounded search can do much less of
 //! that, so for a small model the exhaustive check may well be the faster one: try it first.
 //!
 //! ## Using several cores

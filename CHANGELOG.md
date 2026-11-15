@@ -293,6 +293,32 @@ Counts below are without a preemption bound.
    1,562; three threads doing three `fetch_add` each: 1,699 to 1,680,
    which is the number of orders there are. Not used with a preemption
    bound.
+ - Wakeup trees (`model::Builder::wakeup_trees`, on by default;
+   `LOOM_WAKEUP_TREES=0` turns it off). When two operations of an execution
+   could have been the other way around, the search no longer adds a thread
+   to an earlier scheduling decision and sees where that leads. It adds the
+   sequence of steps that gets them the other way around, and follows it:
+   the steps taken in between that have nothing to do with the earlier
+   operation, and then the later one. The sequences that are to be run
+   from a decision are kept as a tree. This is optimal dynamic partial
+   order reduction (Abdulla, Aronis, Jonsson and Sagonas, POPL 2014), and
+   it is what makes it sound to leave out what a sleeping thread covers,
+   which the rule that was taken back did without it.
+
+   Executions that are started and turn out to be repeats were what was
+   left to save. Three threads sending to a channel that is drained: 89
+   executions to 43; three threads with a handle to a shared value: 59 to
+   42; four threads doing three operations each on one atomic, or on one
+   lock: 370,430 to 369,600, which is the number of orders there are, and
+   a third less time per execution for the lock, as the search no longer
+   looks at every thread's next operation at every step. Where an
+   operation's relation to another depends on what came before (the last
+   handle to be dropped), some repeats remain.
+
+   Used when there is no preemption bound and one worker. With a bound the
+   search is a different one, and with several workers a tree would have
+   to be shared between the worker that explores it and the ones that add
+   to it; both keep to the way described above.
  - Several workers (`LOOM_WORKERS`, `model::Builder::workers`; one by
    default). Each explores a part of the tree of executions with a path of
    its own. A worker that runs out is handed an alternative that another

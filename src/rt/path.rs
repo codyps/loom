@@ -51,10 +51,80 @@ pub(crate) struct Path {
     #[cfg_attr(feature = "checkpoint", serde(default))]
     exhaustive: bool,
 
+    /// If true, wakeup trees are used where they can be, see `optimal`.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    wakeup_trees: bool,
+
+    /// The sequences that the execution is to follow from the next branch
+    /// that is created.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    guide: Wut,
+
     /// What this path has in common with the paths of the other workers of
     /// a search that is run by several, see `Shared`.
     #[cfg_attr(feature = "checkpoint", serde(skip))]
     shared: Option<Arc<Shared>>,
+}
+
+/// A wakeup tree: the sequences of threads that are still to be run from a
+/// scheduling decision, as a tree in which the children of a node are in the
+/// order in which they were added. A sequence ends where the search is free
+/// to go on as it likes.
+///
+/// This is what makes the search explore each way of ordering the dependent
+/// operations of a model once, and no execution in vain ("Optimal dynamic
+/// partial order reduction", Abdulla, Aronis, Jonsson and Sagonas, POPL
+/// 2014). When two operations of an execution could have been the other way
+/// around, what gets it that way is not one thread to be run earlier but a
+/// sequence: the steps that were taken in between and have nothing to do
+/// with the first operation, and then the second one. Without the sequence,
+/// the search starts the thread and may end up, many steps later, where it
+/// has been.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
+pub(crate) struct Wut {
+    children: Vec<(u8, Wut)>,
+}
+
+/// A step in a sequence that is to be added to a wakeup tree.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Wakeup {
+    pub(super) thread: usize,
+
+    /// Identifies the step to the caller, see `Path::insert_wakeup`.
+    pub(super) step: usize,
+}
+
+impl Wut {
+    fn is_empty(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    /// The tree below the child for `thread`.
+    fn subtree(&self, thread: usize) -> Wut {
+        self.children
+            .iter()
+            .find(|(child, _)| *child as usize == thread)
+            .map(|(_, subtree)| subtree.clone())
+            .unwrap_or_default()
+    }
+
+    fn remove(&mut self, thread: usize) {
+        self.children.retain(|(child, _)| *child as usize != thread);
+    }
+
+    /// A tree that is the single sequence `steps`.
+    fn sequence(steps: &[Wakeup]) -> Wut {
+        let mut tree = Wut::default();
+
+        for step in steps.iter().rev() {
+            tree = Wut {
+                children: vec![(step.thread as u8, tree)],
+            };
+        }
+
+        tree
+    }
 }
 
 /// Identifies a branch, and whether other workers have a copy of it.
@@ -118,6 +188,10 @@ pub(crate) struct Schedule {
     #[cfg_attr(feature = "checkpoint", serde(default))]
     sleeping: ThreadSet,
 
+    /// The sequences that are still to be run from here.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    wut: Wut,
+
     /// The threads (as a bit set) that, when run from this point, could
     /// carry on after their step: switching away from them at the next
     /// point was a preemption. A step can include choices of its own (which
@@ -145,6 +219,11 @@ pub(crate) struct Load {
     /// Number of values in list
     len: u8,
 
+    /// What the execution is to follow after this branch, whichever value
+    /// is read.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    guide: Wut,
+
     exploring: bool,
 }
 
@@ -155,6 +234,11 @@ pub(crate) struct Spurious {
     node: Node,
 
     spur: bool,
+
+    /// What the execution is to follow after this branch, either way.
+    #[cfg_attr(feature = "checkpoint", serde(default))]
+    guide: Wut,
+
     exploring: bool,
 }
 
@@ -379,6 +463,8 @@ impl Path {
             exploring_on_start: exploring,
             sleep_sets: false,
             exhaustive: false,
+            wakeup_trees: false,
+            guide: Wut::default(),
             shared: None,
         }
     }
@@ -443,6 +529,7 @@ impl Path {
             values: [0; MAX_ATOMIC_HISTORY],
             pos,
             len: 0,
+            guide: self.guide.clone(),
             exploring: self.exploring,
         });
 
@@ -491,6 +578,7 @@ impl Path {
             self.branches.insert(Spurious {
                 node: Node::new(),
                 spur,
+                guide: self.guide.clone(),
                 exploring: self.exploring,
             });
         }
@@ -551,6 +639,25 @@ impl Path {
 
     pub(crate) fn set_exhaustive(&mut self, exhaustive: bool) {
         self.exhaustive = exhaustive;
+    }
+
+    pub(crate) fn set_wakeup_trees(&mut self, wakeup_trees: bool) {
+        self.wakeup_trees = wakeup_trees;
+    }
+
+    /// Returns `true` if the search uses wakeup trees. They take the place
+    /// of adding single threads to scheduling decisions, and build on
+    /// threads being put to sleep. With a preemption bound the search is
+    /// something else, and with several workers a tree would have to be
+    /// shared between the one that explores it and the ones that add to
+    /// it: both keep to the older way.
+    pub(super) fn optimal(&self) -> bool {
+        self.wakeup_trees
+            && self.sleep_sets
+            && !self.exhaustive
+            && self.preemption_bound.is_none()
+            && self.input.is_none()
+            && self.shared.is_none()
     }
 
     /// Records that `thread`, run from the schedule branch at `pos`, could
@@ -649,6 +756,7 @@ impl Path {
                 threads: [Thread::Disabled; MAX_THREADS],
                 prev,
                 sleeping,
+                wut: Wut::default(),
                 carried_on: 0,
                 exploring: self.exploring,
             });
@@ -733,6 +841,8 @@ impl Path {
             if self.input.is_some() && self.exploring {
                 self.select_thread_from_input(schedule_ref);
             }
+
+            self.follow_guide(schedule_ref, sleeping);
         }
 
         let schedule = object::Ref::from_usize(self.pos, self.branches.id())
@@ -850,6 +960,10 @@ impl Path {
         self.exploring = self.exploring_on_start;
         self.skipping = false;
 
+        // The next execution goes its own way, unless the branch it starts
+        // from says otherwise.
+        self.guide = Wut::default();
+
         // Set the final branch to try the next option. If all options have been
         // traversed, pop the final branch and try again w/ the one under it.
         //
@@ -868,9 +982,10 @@ impl Path {
 
                     // Transition the active thread to visited, and with it
                     // the ones that other workers took in the meantime.
-                    for thread in schedule.threads.iter_mut() {
+                    for (i, thread) in schedule.threads.iter_mut().enumerate() {
                         if thread.is_active() || *thread == Thread::Taken {
                             *thread = Thread::Visited;
+                            schedule.wut.remove(i);
                         }
                     }
 
@@ -878,7 +993,18 @@ impl Path {
                     // that another worker got to first counts as visited:
                     // that worker explores it.
                     loop {
-                        let pending = match schedule.threads.iter().position(|th| th.is_pending()) {
+                        // The sequences of the wakeup tree go first, in the
+                        // order in which they were added.
+                        let in_tree = schedule
+                            .wut
+                            .children
+                            .iter()
+                            .map(|(thread, _)| *thread as usize)
+                            .find(|&thread| schedule.threads[thread].is_pending());
+
+                        let pending = match in_tree
+                            .or_else(|| schedule.threads.iter().position(|th| th.is_pending()))
+                        {
                             Some(pending) => pending,
                             None => break false,
                         };
@@ -901,6 +1027,7 @@ impl Path {
 
                         if claimed {
                             schedule.threads[pending] = Thread::Active;
+                            self.guide = schedule.wut.subtree(pending);
                             break true;
                         }
                     }
@@ -918,6 +1045,7 @@ impl Path {
                         }
 
                         if load.node.claim(&self.shared, load.pos).is_ok() {
+                            self.guide = load.guide.clone();
                             break true;
                         }
                     }
@@ -928,6 +1056,7 @@ impl Path {
                     }
 
                     spurious.spur = true;
+                    self.guide = spurious.guide.clone();
                     spurious.node.claim(&self.shared, 1).is_ok()
                 }
             };
@@ -939,6 +1068,219 @@ impl Path {
         }
 
         false
+    }
+
+    /// Makes the scheduling decision that has just been created go the way
+    /// the wakeup tree it was created under says, if there is one.
+    fn follow_guide(&mut self, schedule_ref: object::Ref<Schedule>, sleeping: ThreadSet) {
+        if self.guide.is_empty() {
+            return;
+        }
+
+        let guide = std::mem::take(&mut self.guide);
+
+        if !self.optimal() {
+            return;
+        }
+
+        let schedule = schedule_ref.get_mut(&mut self.branches);
+
+        if !schedule.exploring {
+            return;
+        }
+
+        let mut guide = guide;
+
+        let waits = guide.children.iter().any(|(thread, _)| {
+            !matches!(
+                schedule.threads[*thread as usize],
+                Thread::Active | Thread::Skip
+            )
+        });
+
+        if waits {
+            // The execution is not where a sequence was meant for: its
+            // thread waits for something. Whatever the sequence was after
+            // has to be found some other way, so every thread gets its turn
+            // from here.
+            for (i, thread) in schedule.threads.iter_mut().enumerate() {
+                if sleeping & (1 << i) == 0 {
+                    thread.explore();
+                }
+            }
+
+            return;
+        }
+
+        // Where a sequence leads whose thread is asleep has been explored.
+        // (That happens when what an operation has to do with another one
+        // depends on what came before, and came out differently this time.)
+        guide
+            .children
+            .retain(|(thread, _)| sleeping & (1 << *thread) == 0);
+
+        if guide.is_empty() {
+            // There is nothing to explore down this way.
+            schedule.exploring = false;
+            self.skip_branch();
+
+            return;
+        }
+
+        for thread in schedule.threads.iter_mut() {
+            if thread.is_active() {
+                *thread = Thread::Skip;
+            }
+        }
+
+        // Every sequence of the tree starts from here, the first one first.
+        for (thread, _) in &guide.children {
+            schedule.threads[*thread as usize] = Thread::Pending;
+        }
+
+        let first = guide.children[0].0 as usize;
+
+        schedule.threads[first] = Thread::Active;
+        self.guide = guide.subtree(first);
+        schedule.wut = guide;
+    }
+
+    /// Adds the sequence `steps` to the wakeup tree of the scheduling
+    /// decision at `point`, unless the executions that go on from there with
+    /// those steps are taken care of: by a thread that has been explored
+    /// from there, or by a sequence that is in the tree.
+    ///
+    /// `before(a, b)` says whether the step identified by `a` has to come
+    /// before the one identified by `b`, for two steps of the sequence.
+    ///
+    /// Returns `false` if there is no such decision to add anything to.
+    pub(super) fn insert_wakeup(
+        &mut self,
+        point: usize,
+        steps: &[Wakeup],
+        before: impl Fn(usize, usize) -> bool,
+    ) -> bool {
+        if point >= self.branches.len() || steps.is_empty() {
+            return false;
+        }
+
+        let schedule = match object::Ref::from_usize(point, self.branches.id())
+            .downcast::<Schedule>(&self.branches)
+        {
+            Some(schedule) => schedule.get_mut(&mut self.branches),
+            None => return false,
+        };
+
+        if !schedule.exploring {
+            return false;
+        }
+
+        // The positions of the steps that can be the first of the sequence:
+        // each thread's first step, if no step of another thread has to
+        // come before it.
+        let initials = |steps: &[Wakeup]| {
+            let mut seen: ThreadSet = 0;
+            let mut initials = Vec::new();
+
+            for (i, step) in steps.iter().enumerate() {
+                if seen & (1 << step.thread) != 0 {
+                    continue;
+                }
+
+                seen |= 1 << step.thread;
+
+                let leads = steps[..i].iter().all(|earlier| {
+                    earlier.thread == step.thread || !before(earlier.step, step.step)
+                });
+
+                if leads {
+                    initials.push(i);
+                }
+            }
+
+            initials
+        };
+
+        let asleep = schedule
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, th)| **th == Thread::Visited)
+            .fold(schedule.sleeping, |asleep, (i, _)| asleep | 1 << i);
+
+        let mut steps = steps.to_vec();
+
+        // Running a thread that is asleep here first leads to nothing new,
+        // and the sequence can be made to start with it.
+        if initials(&steps)
+            .iter()
+            .any(|&i| asleep & (1 << steps[i].thread) != 0)
+        {
+            return true;
+        }
+
+        let Schedule { threads, wut, .. } = schedule;
+
+        let mut tree = wut;
+        let mut root = true;
+
+        loop {
+            let first = initials(&steps);
+
+            // A sequence of the tree that this one can be made to start
+            // with: the oldest one.
+            let child = tree.children.iter().position(|(thread, _)| {
+                !(root && threads[*thread as usize].is_active())
+                    && first.iter().any(|&i| steps[i].thread == *thread as usize)
+            });
+
+            let child = match child {
+                Some(child) => child,
+                None => break,
+            };
+
+            let thread = tree.children[child].0 as usize;
+            let position = first
+                .iter()
+                .copied()
+                .find(|&i| steps[i].thread == thread)
+                .unwrap();
+
+            steps.remove(position);
+
+            if steps.is_empty() || tree.children[child].1.is_empty() {
+                // The tree has the sequence, or one that ends earlier and
+                // leaves the search free to go on like this one.
+                return true;
+            }
+
+            tree = &mut tree.children[child].1;
+            root = false;
+        }
+
+        if root {
+            let first = steps[0].thread;
+
+            match threads[first] {
+                Thread::Skip | Thread::Pending => threads[first] = Thread::Pending,
+                Thread::Active | Thread::Visited | Thread::Taken => return true,
+                Thread::Disabled | Thread::Yield => {
+                    // The thread cannot run here. As when a single thread
+                    // is asked for that cannot: every thread gets its turn.
+                    for (i, thread) in threads.iter_mut().enumerate() {
+                        if asleep & (1 << i) == 0 {
+                            thread.explore();
+                        }
+                    }
+
+                    return true;
+                }
+            }
+        }
+
+        tree.children.extend(Wut::sequence(&steps).children);
+
+        true
     }
 
     /// Takes part in a search that several workers run together.
@@ -1060,6 +1402,8 @@ impl Path {
                     exploring_on_start: self.exploring_on_start,
                     sleep_sets: self.sleep_sets,
                     exhaustive: self.exhaustive,
+                    wakeup_trees: self.wakeup_trees,
+                    guide: Wut::default(),
                     shared: Some(shared.clone()),
                 });
             }

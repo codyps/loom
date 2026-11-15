@@ -2,7 +2,8 @@
 
 //! Skipping executions that repeat explored ones must not change what loom
 //! finds. Each model here is run with and without it, and has to produce the
-//! same outcomes, in no more executions. That goes for a search with a
+//! same outcomes, in no more executions. So does following wakeup trees,
+//! which goes one step further. That goes for a search with a
 //! preemption bound as well, which finds less to begin with: it must not
 //! find less still.
 
@@ -15,8 +16,16 @@ use loom::thread;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicUsize as StdAtomicUsize;
 
+/// How much of what loom does to explore less is turned on.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Plain,
+    SleepSets,
+    WakeupTrees,
+}
+
 /// Runs `f` under loom and returns the outcomes and the number of executions.
-fn explore<T, F>(sleep_sets: bool, bound: Option<usize>, f: F) -> (BTreeSet<T>, usize)
+fn explore<T, F>(mode: Mode, bound: Option<usize>, f: F) -> (BTreeSet<T>, usize)
 where
     T: Ord + Send + 'static,
     F: Fn() -> T + Sync + Send + 'static,
@@ -30,7 +39,13 @@ where
 
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = bound;
-        builder.sleep_sets = sleep_sets;
+        builder.sleep_sets = mode != Mode::Plain;
+        builder.wakeup_trees = mode == Mode::WakeupTrees;
+
+        // Wakeup trees are not used with several workers (`LOOM_WORKERS`).
+        if mode == Mode::WakeupTrees {
+            builder.workers = 1;
+        }
 
         builder.check(move || {
             count.fetch_add(1, SeqCst);
@@ -54,20 +69,32 @@ where
     // other threads there, which now and then costs more than the sleeping
     // saves.
     for bound in [Some(0), Some(1), Some(2), Some(3)] {
-        let (with, _) = explore(true, bound, f);
-        let (without, _) = explore(false, bound, f);
+        let (with, _) = explore(Mode::SleepSets, bound, f);
+        let (without, _) = explore(Mode::Plain, bound, f);
 
         assert_eq!(with, without, "preemption bound {:?}", bound);
     }
 
-    let (with, with_count) = explore(true, None, f);
-    let (without, without_count) = explore(false, None, f);
+    let (with, with_count) = explore(Mode::SleepSets, None, f);
+    let (without, without_count) = explore(Mode::Plain, None, f);
 
     assert_eq!(with, without);
     assert!(
         with_count <= without_count,
         "{} executions with, {} without",
         with_count,
+        without_count
+    );
+
+    // Wakeup trees are not compared by the number of executions with sleep
+    // sets alone: nearly always fewer, now and then one or two more.
+    let (trees, trees_count) = explore(Mode::WakeupTrees, None, f);
+
+    assert_eq!(trees, without, "wakeup trees");
+    assert!(
+        trees_count <= without_count,
+        "{} executions with wakeup trees, {} without",
+        trees_count,
         without_count
     );
 

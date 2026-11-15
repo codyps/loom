@@ -351,3 +351,53 @@ fn channel_with_three_senders() {
     // 835 with every pair of channel operations taken to be dependent.
     assert!((6..=100).contains(&count), "{}", count);
 }
+
+/// Three threads that each drop a handle to a shared value and store to an
+/// atomic: six orders of the stores, and any of the handles can be the last
+/// to go. Following wakeup trees, the search does not start executions
+/// that turn out to be repeats of others, or not many.
+#[test]
+fn wakeup_trees() {
+    fn count(wakeup_trees: bool) -> usize {
+        use loom::sync::Arc;
+
+        let count = std::sync::Arc::new(StdAtomicUsize::new(0));
+
+        {
+            let count = count.clone();
+
+            let mut builder = loom::model::Builder::new();
+            builder.preemption_bound = None;
+            builder.sleep_sets = true;
+            builder.wakeup_trees = wakeup_trees;
+            // Wakeup trees are not used with several workers.
+            builder.workers = 1;
+
+            builder.check(move || {
+                count.fetch_add(1, SeqCst);
+
+                let x = Arc::new(AtomicUsize::new(0));
+
+                let handles: Vec<_> = (0..3)
+                    .map(|i| {
+                        let x = x.clone();
+                        thread::spawn(move || x.store(i, SeqCst))
+                    })
+                    .collect();
+
+                drop(x);
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            });
+        }
+
+        count.load(SeqCst)
+    }
+
+    let (with, without) = (count(true), count(false));
+
+    // 42 and 59.
+    assert!(with <= 48 && with < without, "{} and {}", with, without);
+}

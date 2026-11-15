@@ -38,6 +38,12 @@ pub(crate) struct Execution {
     /// The steps of this execution so far, in order.
     steps: Vec<Step>,
 
+    /// The pairs of operations of this execution that could have been the
+    /// other way around: the position in the path of the scheduling
+    /// decision that the earlier one was executed from, and the step of the
+    /// later one.
+    races: Vec<(usize, usize)>,
+
     /// Maps raw allocations to LeakTrack objects
     pub(super) raw_allocations: HashMap<usize, Allocation>,
 
@@ -69,6 +75,10 @@ struct Step {
 
     /// What the step is ordered after, itself included.
     dpor_vv: VersionVec,
+
+    /// Whether the step was an operation on something, and not just a
+    /// thread getting to its first one.
+    operation: bool,
 }
 
 impl Execution {
@@ -98,6 +108,7 @@ impl Execution {
             sleeping: 0,
             scheduled_at: None,
             steps: Vec::new(),
+            races: Vec::new(),
             raw_allocations: HashMap::new(),
             arc_objs: HashMap::new(),
             max_threads,
@@ -139,8 +150,15 @@ impl Execution {
         let mut raw_allocations = self.raw_allocations;
         let mut arc_objs = self.arc_objs;
         let mut steps = self.steps;
+        let mut races = self.races;
 
         let mut threads = self.threads;
+
+        if path.optimal() {
+            wake_up(&mut path, &steps, &races, self.id);
+        }
+
+        races.clear();
 
         if !path.step() {
             return None;
@@ -164,6 +182,7 @@ impl Execution {
             sleeping: 0,
             scheduled_at: None,
             steps,
+            races,
             lazy_statics,
             raw_allocations,
             arc_objs,
@@ -191,7 +210,16 @@ impl Execution {
             }
         }
 
+        // With wakeup trees, what could have been the other way around is
+        // looked at when an operation is executed, further down, and acted
+        // on when the execution has come to its end.
+        let optimal = self.path.optimal();
+
         for (th_id, th) in self.threads.iter() {
+            if optimal {
+                break;
+            }
+
             let operation = match th.operation {
                 Some(operation) => operation,
                 None => continue,
@@ -431,6 +459,32 @@ impl Execution {
 
             let mut dpor_vv = threads.active().dpor_vv;
 
+            if optimal {
+                // The accesses that the operation is dependent with and not
+                // ordered after.
+                let mut racing: Vec<(usize, VersionVec)> = Vec::new();
+
+                self.objects
+                    .for_each_dependent_access(operation, true, false, |access| {
+                        if !access.happens_before(&dpor_vv) {
+                            racing.push((access.path_id(), *access.version()));
+                        }
+                    });
+
+                // Only the ones with nothing in between could have been the
+                // other way around as they are.
+                for (i, (path_id, version)) in racing.iter().enumerate() {
+                    let direct = racing
+                        .iter()
+                        .enumerate()
+                        .all(|(j, (_, later))| i == j || !(version <= later));
+
+                    if direct {
+                        self.races.push((*path_id, self.steps.len()));
+                    }
+                }
+            }
+
             self.objects
                 .for_each_dependent_access(operation, false, false, |access| {
                     dpor_vv.join(access.version());
@@ -444,6 +498,7 @@ impl Execution {
             path_id,
             thread: self.threads.active_id().as_usize(),
             dpor_vv: self.threads.active().dpor_vv,
+            operation: self.threads.active().operation.is_some(),
         });
 
         if let Some(operation) = self.threads.active().operation {
@@ -550,6 +605,50 @@ impl Execution {
     /// Panics if any leaks were detected
     pub(crate) fn check_for_leaks(&self) {
         self.objects.check_for_leaks();
+    }
+}
+
+/// Goes through the operations of an execution that has come to its end
+/// which could have been the other way around, and adds to the wakeup trees
+/// what gets them that way.
+///
+/// For an operation and a later one that it races with, that is: from the
+/// decision that the earlier one was executed from, the steps that were
+/// taken after it and are not ordered after it, in the order in which they
+/// were taken, and then the later operation.
+fn wake_up(path: &mut Path, steps: &[Step], races: &[(usize, usize)], execution: Id) {
+    use crate::rt::path::Wakeup;
+
+    // Whether step `a` has to come before step `b`, which was taken later.
+    let before = |a: usize, b: usize| {
+        let (a, b) = (&steps[a], &steps[b]);
+
+        a.thread == b.thread || (a.operation && b.dpor_vv.get(a.thread) >= a.dpor_vv.get(a.thread))
+    };
+
+    for &(point, later) in races {
+        let earlier = match steps.binary_search_by_key(&point, |step| step.path_id) {
+            Ok(earlier) => earlier,
+            Err(_) => continue,
+        };
+
+        let mut sequence: Vec<Wakeup> = (earlier + 1..steps.len())
+            .filter(|&step| step != later && !before(earlier, step))
+            .map(|step| Wakeup {
+                thread: steps[step].thread,
+                step,
+            })
+            .collect();
+
+        sequence.push(Wakeup {
+            thread: steps[later].thread,
+            step: later,
+        });
+
+        if !path.insert_wakeup(point, &sequence, before) {
+            // No decision to add a sequence to: a single thread it is.
+            path.backtrack(point, thread::Id::new(execution, steps[later].thread));
+        }
     }
 }
 
