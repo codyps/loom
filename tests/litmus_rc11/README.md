@@ -146,6 +146,9 @@ loom's favor (they are in `reference.txt`, with herd's result, along with
 a fourth that showed a bug in loom), and 3 that loom gives up on, saying
 that more stores have to be kept.
 
+The same holds for the search with wakeup trees, which is the default; set
+`LOOM_WAKEUP_TREES=0` to compare with the search without them.
+
 To build GenMC (v0.20.0 needs LLVM 19 to 22; it looks for `clang` next to
 the LLVM tools only, where nix does not put it, hence the `sed`):
 

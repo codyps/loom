@@ -57,13 +57,14 @@ and release, and on the lowest allowed direct dependency versions.
    three bugs listed under "Fixed" for yielding and for sleep sets with a
    preemption bound.
  - A model can have 16 threads, counting the main one, instead of 5
-   (`MAX_THREADS`), and that is the default for `model::Builder::max_threads`
-   as well. The limit is what the bookkeeping per thread is sized for; with
-   the comparison of version vectors rewritten to go with it, an execution
-   takes about 2% longer than with 5. What decides whether a model with
-   many threads can be checked is how much the threads have to do with each
-   other: fifteen threads that keep to themselves are one execution, eight
-   that take the same lock once are 40,320.
+   (`MAX_THREADS`, upstream issue 157), and that is the default for
+   `model::Builder::max_threads` as well. The limit is what the bookkeeping
+   per thread is sized for; with the comparison of version vectors rewritten
+   to go with it, an execution takes about 2% longer than with 5. What
+   decides whether a model with many threads can be checked is how much the
+   threads have to do with each other: fifteen threads that keep to
+   themselves are one execution, eight that take the same lock once are
+   40,320.
  - `model::Builder::atomic_history` and `LOOM_ATOMIC_HISTORY`: the number of
    stores loom keeps per atomic, 7 by default as before and now up to 16. A
    load may return a store made long ago if nothing tells the loading
@@ -487,9 +488,9 @@ Not addressed:
    `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
  - Design questions and feature requests left alone: catching thread panics
    (417, documented instead), spurious condvar wakeups (1), `MaybeUninit`
-   (299), raising `MAX_THREADS` (157), random exploration (11), dropping the
-   `generator` dependency (388), and the reports that depend on external code
-   that could not be run here (301, 362, 398).
+   (299), random exploration (11), dropping the `generator` dependency
+   (388), and the reports that depend on external code that could not be run
+   here (301, 362, 398).
 
 ### Not merged
 
@@ -512,9 +513,12 @@ Not addressed:
  - The `block_on` waker test documents the `will_wake` contract but cannot
    fail on the old code in practice: the old vtable was only duplicated under
    particular inlining.
- - The ignored tests are still ignored and still fail: `load_buffering`,
-   `relaxed`, `test_seq_cst` and `compare_and_swap_reads_old_values`. The
-   atomics fix above does not address them.
+ - The ignored tests `load_buffering` and `relaxed` are still ignored and
+   still fail: both need load buffering, which is not modeled. Of the others
+   that were ignored, `test_seq_cst` passes with the `SeqCst` fix, and
+   `compare_and_swap_reads_old_values` expected an outcome that no execution
+   has (a read-modify-write that reads the initial value cannot come after
+   the store it raced with); it now checks the outcomes there are.
  - `Box`: zero-sized values are not leak tracked, and unsized boxes can only
    be made with `Box::from_raw`.
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
