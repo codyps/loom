@@ -22,7 +22,8 @@ and release, and on the lowest allowed direct dependency versions.
    flags in `std` atomics that loom cannot see, so races between `notified()`
    and the notify methods were not explored; here all state is behind a
    modeled lock. `notify()` is now `notify_one()`, and the blocking `wait()`
-   shares the same permit and waiters.
+   shares the same permit and waiters. Any number of threads may be blocked
+   in `wait()` at once; it used to panic for a second one.
  - `lock_api` feature: mock `RawMutex` / `RawRwLock` and the `Mutex`,
    `RwLock` and guard aliases built on them, for code using `lock_api` or
    `parking_lot` (upstream PR 161, ported; uses `std::sync::OnceLock` rather
@@ -562,7 +563,6 @@ Not addressed:
    `Box<[T]>`, `Box<T>` to `Box<dyn Trait>`); that needs compiler support.
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
    across executions.
- - `Notify::wait` is still limited to one blocked thread at a time.
  - With only 2 stores kept per atomic (`atomic_history`), loom gives
    outcomes that RC11 forbids for 3 of the 23,715 litmus programs, such as
    `Rxr,Rys,Xy1r;Wx2s,Wy3s,Wy4s;Wy5r,F,Xx6s`: a store is given up while the

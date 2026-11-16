@@ -3,8 +3,6 @@ use crate::rt;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::SeqCst;
 use std::task::{Context, Poll, Waker};
 
 /// Notifies a waiter to wake up.
@@ -17,8 +15,9 @@ use std::task::{Context, Poll, Waker};
 /// never stores a permit.
 ///
 /// In addition a thread can block on the same notifications with [`wait`],
-/// which implements the park / unpark pattern. Only one thread may be blocked
-/// in `wait` at a time; any number of [`notified`] futures may be pending.
+/// which implements the park / unpark pattern. Any number of threads may be
+/// blocked in `wait`, and any number of [`notified`] futures be pending,
+/// together.
 ///
 /// Every operation is a point at which loom may switch threads, and
 /// notification establishes an acquire / release synchronization point
@@ -33,11 +32,9 @@ use std::task::{Context, Poll, Waker};
 /// [`wait`]: Notify::wait
 #[derive(Debug)]
 pub struct Notify {
-    /// Wakes the thread blocked in `wait`.
-    object: rt::Notify,
-
-    /// Enforces the single blocked thread invariant
-    waiting: AtomicBool,
+    /// What wakes a thread blocked in `wait`, one per thread that has
+    /// waited, by thread.
+    threads: std::sync::Mutex<[Option<rt::Notify>; crate::MAX_THREADS]>,
 
     /// Modeled lock around `state`. Taking it is what makes each operation
     /// visible to loom, both as a branch point and for causality.
@@ -75,8 +72,8 @@ struct Waiter {
 /// How to tell a waiter that it has been notified.
 #[derive(Debug)]
 enum Wake {
-    /// The thread blocked in `Notify::wait`.
-    Thread,
+    /// A thread blocked in `Notify::wait`, through its object.
+    Thread(rt::Notify),
 
     /// A `Notified` future; it may not have a waker yet if it was only
     /// enabled.
@@ -119,8 +116,7 @@ impl Notify {
     /// Create a new `Notify`.
     pub fn new() -> Notify {
         Notify {
-            object: rt::Notify::new(false, true),
-            waiting: AtomicBool::new(false),
+            threads: std::sync::Mutex::new([None; crate::MAX_THREADS]),
             lock: rt::Mutex::new(true),
             state: std::sync::Mutex::new(State {
                 permit: false,
@@ -219,29 +215,25 @@ impl Notify {
     /// Block the current thread until it is notified.
     ///
     /// Consumes a stored permit, returning immediately, if there is one. The
-    /// wait may also end spuriously, as with `std::thread::park`.
-    ///
-    /// # Panics
-    /// Panics if multiple threads try to wait on the same `Notify` simultaneously.
+    /// wait may also end spuriously, as with `std::thread::park`: at most
+    /// once per thread and `Notify` in an execution, so that a loop around
+    /// it ends.
     #[track_caller]
     pub fn wait(&self) {
         let location = location!();
-
-        self.waiting
-            .compare_exchange(false, true, SeqCst, SeqCst)
-            .expect("only a single thread may wait on `Notify`");
+        let object = self.thread_object();
 
         let waiter = self.with_state(location, |state| {
             if state.permit {
                 state.permit = false;
                 None
             } else {
-                Some(state.register(Wake::Thread))
+                Some(state.register(Wake::Thread(object)))
             }
         });
 
         if let Some(id) = waiter {
-            self.object.wait(location);
+            object.wait(location);
 
             // If the wait ended without a notification, stop waiting.
             self.with_state(location, |state| {
@@ -250,8 +242,14 @@ impl Notify {
                 }
             });
         }
+    }
 
-        self.waiting.store(false, SeqCst);
+    /// What wakes the current thread when it waits.
+    fn thread_object(&self) -> rt::Notify {
+        let thread = rt::execution(|execution| execution.threads.active_id().as_usize());
+        let mut threads = self.threads.lock().unwrap();
+
+        *threads[thread].get_or_insert_with(|| rt::Notify::new(false, true))
     }
 
     fn with_state<R>(&self, location: rt::Location, f: impl FnOnce(&mut State) -> R) -> R {
@@ -266,7 +264,7 @@ impl Notify {
     /// is itself a modeled operation.
     fn wake(&self, wake: Option<Wake>, location: rt::Location) {
         match wake {
-            Some(Wake::Thread) => self.object.notify(location),
+            Some(Wake::Thread(object)) => object.notify(location),
             Some(Wake::Task(Some(waker))) => waker.wake(),
             Some(Wake::Task(None)) | None => {}
         }

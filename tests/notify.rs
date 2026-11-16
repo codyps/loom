@@ -300,3 +300,38 @@ fn notified_without_notification_deadlocks() {
         loom::future::block_on(notify.notified());
     });
 }
+
+/// Several threads can be blocked in `wait` at once: `notify_one` wakes one
+/// of two, and the other keeps waiting until it is notified as well.
+#[test]
+fn notify_one_wakes_one_of_several() {
+    use loom::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::{Acquire, Release};
+
+    loom::model(|| {
+        let notify = Arc::new(Notify::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let (notify, woken) = (notify.clone(), woken.clone());
+                thread::spawn(move || {
+                    notify.wait();
+                    woken.fetch_add(1, Release);
+                })
+            })
+            .collect();
+
+        // One permit is stored at most: each `notify_one` is only given
+        // once the one before has been taken.
+        notify.notify_one();
+        while woken.load(Acquire) < 1 {
+            thread::yield_now();
+        }
+        notify.notify_one();
+
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+    });
+}
