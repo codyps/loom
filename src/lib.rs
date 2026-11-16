@@ -310,8 +310,10 @@
 //! by a stand-in for the test that is built from loom types and synchronizes the same way.
 //!
 //! Time is a special case of this. Loom has no notion of it: [`std::thread::sleep`] does not make
-//! any ordering more or less likely, and timeouts never fire (`Condvar::wait_timeout` waits for a
-//! notification like `wait`). A test must not rely on something happening "soon enough".
+//! any ordering more or less likely, and a timeout can fire at any point at which what it waits
+//! for has not happened yet, however long it is (`Condvar::wait_timeout` times out whether the
+//! notification is a moment away or never comes). A test must not rely on something happening
+//! "soon enough".
 //!
 //! ## Panics in Threads
 //!

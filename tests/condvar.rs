@@ -214,3 +214,177 @@ fn waiter_with_unpark_token() {
         thread::park();
     });
 }
+
+/// A flag behind a mutex, and a condition variable to wait for it with.
+struct Flag {
+    set: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Flag {
+    fn new() -> Arc<Flag> {
+        Arc::new(Flag {
+            set: Mutex::new(false),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn set(&self) {
+        *self.set.lock().unwrap() = true;
+        self.changed.notify_one();
+    }
+}
+
+/// Waits once, without checking again that the flag is set.
+fn wait_once(flag: &Flag) -> bool {
+    let set = flag.set.lock().unwrap();
+
+    if *set {
+        return true;
+    }
+
+    *flag.changed.wait(set).unwrap()
+}
+
+/// A wait may end without a notification, as with `std`. Code that does not
+/// check again, in a loop, is caught.
+#[test]
+#[should_panic(expected = "woke up without the flag")]
+fn spurious_wakeup_is_explored() {
+    let mut builder = loom::model::Builder::new();
+    builder.spurious_wakeups = true;
+
+    builder.check(|| {
+        let flag = Flag::new();
+
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.set())
+        };
+
+        assert!(wait_once(&flag), "woke up without the flag");
+
+        setter.join().unwrap();
+    });
+}
+
+/// With spurious wakeups turned off, a wait only ends with a notification.
+#[test]
+fn spurious_wakeups_can_be_turned_off() {
+    let mut builder = loom::model::Builder::new();
+    builder.spurious_wakeups = false;
+
+    builder.check(|| {
+        let flag = Flag::new();
+
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.set())
+        };
+
+        assert!(wait_once(&flag));
+
+        setter.join().unwrap();
+    });
+}
+
+/// What a timed wait for the flag sees: whether it timed out, and whether
+/// the flag was set.
+fn timed_waits(wait: fn(&Flag) -> (bool, bool)) -> std::collections::BTreeSet<(bool, bool)> {
+    let seen = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let recorded = seen.clone();
+
+    loom::model(move || {
+        let flag = Flag::new();
+
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.set())
+        };
+
+        recorded.lock().unwrap().insert(wait(&flag));
+
+        setter.join().unwrap();
+    });
+
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+/// A timed wait can time out, whatever the duration, and can be notified.
+/// A wait that is notified does not time out.
+#[test]
+fn wait_timeout_times_out() {
+    let seen = timed_waits(|flag| {
+        let set = flag.set.lock().unwrap();
+
+        if *set {
+            return (false, true);
+        }
+
+        let (set, result) = flag
+            .changed
+            .wait_timeout(set, std::time::Duration::from_secs(1))
+            .unwrap();
+
+        (result.timed_out(), *set)
+    });
+
+    // Timed out before the flag was set, or after; notified, with the flag
+    // set; and the flag already set before the wait.
+    assert_eq!(seen, [(true, false), (true, true), (false, true)].into(),);
+}
+
+/// `wait_timeout_while` reports a timeout only with the condition still
+/// true, and otherwise returns once it is false.
+#[test]
+fn wait_timeout_while_times_out() {
+    let seen = timed_waits(|flag| {
+        let (set, result) = flag
+            .changed
+            .wait_timeout_while(
+                flag.set.lock().unwrap(),
+                std::time::Duration::from_secs(1),
+                |set| !*set,
+            )
+            .unwrap();
+
+        (result.timed_out(), *set)
+    });
+
+    assert_eq!(seen, [(true, false), (false, true)].into());
+}
+
+/// A loop that waits again after a timeout ends: a thread times out at most
+/// once per condition variable in an execution.
+#[test]
+fn wait_timeout_in_a_loop() {
+    loom::model(|| {
+        let flag = Flag::new();
+
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.set())
+        };
+
+        let mut set = flag.set.lock().unwrap();
+        let mut timeouts = 0;
+
+        while !*set {
+            let (next, result) = flag
+                .changed
+                .wait_timeout(set, std::time::Duration::from_millis(10))
+                .unwrap();
+            set = next;
+
+            if result.timed_out() {
+                timeouts += 1;
+            }
+        }
+
+        assert!(timeouts <= 1);
+        drop(set);
+
+        setter.join().unwrap();
+    });
+}

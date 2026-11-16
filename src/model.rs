@@ -156,6 +156,19 @@ pub struct Builder {
     /// variable to `0` turns it off.
     pub wakeup_trees: bool,
 
+    /// Let a [`Condvar::wait`](crate::sync::Condvar::wait) end without a
+    /// notification, which `std` allows: a spurious wakeup. Code that waits
+    /// has to check, after the wait, that what it waited for has happened,
+    /// in a loop, as [`Condvar::wait_while`](crate::sync::Condvar::wait_while)
+    /// does. Each thread wakes up spuriously at most once per condition
+    /// variable in an execution, so that such loops end.
+    ///
+    /// A timed wait can always time out, whatever this says.
+    ///
+    /// Defaults to `true`. Setting the `LOOM_SPURIOUS_WAKEUPS` environment
+    /// variable to `0` turns it off.
+    pub spurious_wakeups: bool,
+
     /// Try every thread at every point where the preemption bound allows
     /// it, instead of only the ones that loom can tell make a difference.
     ///
@@ -215,6 +228,8 @@ impl Builder {
 
         let wakeup_trees = env::var("LOOM_WAKEUP_TREES").map_or(true, |v| v != "0");
 
+        let spurious_wakeups = env::var("LOOM_SPURIOUS_WAKEUPS").map_or(true, |v| v != "0");
+
         let workers = env::var("LOOM_WORKERS")
             .map(|v| v.parse().expect("invalid value for `LOOM_WORKERS`"))
             .unwrap_or(1);
@@ -260,6 +275,7 @@ impl Builder {
             log,
             sleep_sets,
             wakeup_trees,
+            spurious_wakeups,
             exhaustive: false,
             workers,
         }
@@ -562,6 +578,7 @@ impl Builder {
         execution.log = self.log;
         execution.location = self.location;
         execution.max_history = self.atomic_history;
+        execution.spurious_wakeups = self.spurious_wakeups;
         execution.path.set_sleep_sets(self.sleep_sets);
         execution.path.set_exhaustive(self.exhaustive);
         execution.path.set_wakeup_trees(self.wakeup_trees);

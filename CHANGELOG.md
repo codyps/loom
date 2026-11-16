@@ -95,7 +95,17 @@ and release, and on the lowest allowed direct dependency versions.
    for `RefCell` (upstream PR 430, extended to `std::cell::Cell` and
    `RefCell`; the proposal only covered `loom::cell::Cell`).
  - `Arc::into_inner` (upstream PR 354).
- - `Condvar::wait_while` (upstream PR 167).
+ - `Condvar::wait_while` (upstream PR 167), and `Condvar::wait_timeout_while`.
+ - `Condvar::wait_timeout` times out, and `Condvar::wait` can end without a
+   notification, as with `std` (upstream issue 1). Both used to wait for a
+   notification, so code that handles a timeout was never run, and code
+   that waits once without checking again was never caught. A thread that
+   is waiting stops at some point at which it has not been notified yet:
+   other threads may run first, and notify it, in which case it returns
+   as notified. Each thread does this at most once per condition variable
+   in an execution, so a loop around a wait ends. Spurious wakeups of
+   `wait` can be turned off with `model::Builder::spurious_wakeups` or
+   `LOOM_SPURIOUS_WAKEUPS=0`; a timed wait can always time out.
  - `UnsafeCell::as_mut`, a safe tracked `&mut` access (upstream PR 379).
  - `AtomicPtr::fetch_ptr_add`, `fetch_ptr_sub`, `fetch_byte_add`,
    `fetch_byte_sub`, `fetch_and`, `fetch_or`, `fetch_xor` (upstream PR 405,
@@ -516,10 +526,9 @@ Not addressed:
    `repr(transparent)` atomics and cells (51, 317), `const fn new` (170),
    `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
  - Design questions and feature requests left alone: catching thread panics
-   (417, documented instead), spurious condvar wakeups (1), `MaybeUninit`
-   (299), random exploration (11), dropping the `generator` dependency
-   (388), and the reports that depend on external code that could not be run
-   here (301, 362, 398).
+   (417, documented instead), `MaybeUninit` (299), random exploration (11),
+   dropping the `generator` dependency (388), and the reports that depend
+   on external code that could not be run here (301, 362, 398).
 
 ### Not merged
 
@@ -538,7 +547,8 @@ Not addressed:
  - Behavior changes that can make an existing model fail where it passed:
    `try_lock` can now fail under contention (it could not before, which was
    wrong); an unpark token is no longer lost when the target blocks on
-   something else first; `UnsafeCell` drop and cross-execution reuse checks.
+   something else first; `UnsafeCell` drop and cross-execution reuse checks;
+   `Condvar` waits that time out or wake up spuriously.
  - The `block_on` waker test documents the `will_wake` contract but cannot
    fail on the old code in practice: the old vtable was only duplicated under
    particular inlining.
@@ -553,7 +563,9 @@ Not addressed:
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
    across executions.
  - `Notify::wait` is still limited to one blocked thread at a time.
- - `Condvar` waits never end spuriously, and `wait_timeout` never times out.
+ - `Condvar`: a thread times out, or wakes up spuriously, at most once per
+   condition variable in an execution. A model that counts timeouts, or
+   only gives up after several, does not get past the first.
  - Scoped threads: as elsewhere in loom, a panicking thread fails the model
    rather than being reported through `join`.
 

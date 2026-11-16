@@ -60,6 +60,9 @@ pub(crate) struct Execution {
 
     /// Log execution output to STDOUT
     pub(crate) log: bool,
+
+    /// Whether a condition variable wait may end without a notification.
+    pub(crate) spurious_wakeups: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
@@ -115,6 +118,7 @@ impl Execution {
             max_history: 7,
             location: false,
             log: false,
+            spurious_wakeups: true,
         }
     }
 
@@ -143,6 +147,7 @@ impl Execution {
         let max_history = self.max_history;
         let location = self.location;
         let log = self.log;
+        let spurious_wakeups = self.spurious_wakeups;
         let mut path = self.path;
         let mut objects = self.objects;
         let mut seq_cst = self.seq_cst;
@@ -190,6 +195,7 @@ impl Execution {
             max_history,
             location,
             log,
+            spurious_wakeups,
         })
     }
 
