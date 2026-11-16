@@ -36,6 +36,12 @@ pub struct Builder {
     /// executions, and makes every operation on an atomic that has been
     /// stored to that often take longer.
     ///
+    /// Keeping very few stores can also make loom report an outcome that no
+    /// execution has: a store that is given up while what it is ordered with
+    /// is still undecided takes part of that order with it. On the litmus
+    /// corpus this happens with 2, for 3 of its 23,715 programs, and not with
+    /// 1, nor with 3 or more.
+    ///
     /// Defaults to the `LOOM_ATOMIC_HISTORY` environment variable, or 7.
     /// At most 16.
     pub atomic_history: usize,

@@ -563,6 +563,13 @@ Not addressed:
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
    across executions.
  - `Notify::wait` is still limited to one blocked thread at a time.
+ - With only 2 stores kept per atomic (`atomic_history`), loom gives
+   outcomes that RC11 forbids for 3 of the 23,715 litmus programs, such as
+   `Rxr,Rys,Xy1r;Wx2s,Wy3s,Wy4s;Wy5r,F,Xx6s`: a store is given up while the
+   order of `SeqCst` operations around it is still being settled, and an
+   edge that closes a cycle is lost with it. Not with 1, nor with 3 or
+   more, the default 7 included, and not with versions of those programs
+   that give stores up at the default.
  - `Condvar`: a thread times out, or wakes up spuriously, at most once per
    condition variable in an execution. A model that counts timeouts, or
    only gives up after several, does not get past the first.
