@@ -233,8 +233,16 @@ struct Store {
     /// Manages causality transfers between threads
     sync: Synchronize,
 
-    /// Tracks when each thread first saw value
+    /// Tracks when each thread first saw value, or one of the stores this
+    /// one stands for (see `State::forget_slot`).
     first_seen: FirstSeen,
+
+    /// When each thread first saw this store itself.
+    own_seen: FirstSeen,
+
+    /// The stores this one stands for, oldest first: who saw each of them,
+    /// and the fences that a fence after a load of it has to come after.
+    stood_for_loads: Vec<StoodForLoads>,
 
     /// Stores (as a bit set of slots in `State::stores`) that are ordered
     /// before this one in the modification order, in addition to what
@@ -292,6 +300,26 @@ struct StoreNodes {
     /// What counts as the stores that this one stands for when they are
     /// the later of two stores: the stores, and fences after them.
     stood_for: NodeSet,
+
+    /// Fences that a load of a store this one stands for happens before.
+    /// They count as fences after a load of this store where it is the
+    /// later of two stores, and not where it is compared with what it
+    /// stands for: two loads of one store are not ordered, and a fence
+    /// before this store is not ordered before a load of an earlier one.
+    stood_for_load_fences_after: NodeSet,
+}
+
+/// A store that another one stands for, as far as fences after loads of it
+/// go.
+#[derive(Debug, Clone)]
+struct StoodForLoads {
+    /// The threads that saw it.
+    seen: FirstSeen,
+
+    /// The fences ordered before a load of it: fences before it, before the
+    /// stores it stood for in turn and before loads of those, and the fences
+    /// of the stores forgotten before it.
+    fences: NodeSet,
 }
 
 /// The nodes of the `SeqCst` order that are related to stores that are not
@@ -378,8 +406,10 @@ impl StoreNodes {
         self.loads.union_with(&earlier.loads);
         self.load_fences_before
             .union_with(&earlier.load_fences_before);
-        self.load_fences_after
+        self.stood_for_load_fences_after
             .union_with(&earlier.load_fences_after);
+        self.stood_for_load_fences_after
+            .union_with(&earlier.stood_for_load_fences_after);
         self.forgotten
             .sources
             .union_with(&earlier.forgotten.sources);
@@ -406,6 +436,7 @@ impl StoreNodes {
         fences.union_with(&earlier.load_fences_before);
 
         product(&fences, &later.load_fences_after, edges);
+        product(&fences, &later.stood_for_load_fences_after, edges);
     }
 }
 
@@ -621,7 +652,7 @@ fn fence_seqcst(execution: &mut Execution) {
     });
 
     for state in execution.objects.iter_mut::<State>() {
-        state.note_fence(&execution.threads, node);
+        state.note_fence(&execution.threads, &mut execution.seq_cst, node);
         state.commit(&mut execution.seq_cst);
     }
 }
@@ -982,6 +1013,7 @@ impl State {
         let store = &mut self.stores[index];
 
         store.first_seen.touch(threads);
+        store.own_seen.touch(threads);
         store.sync.sync_load(threads, ordering);
 
         let value = store.value;
@@ -1050,7 +1082,9 @@ impl State {
             happens_before,
             modification_order,
             sync,
+            own_seen: first_seen.clone(),
             first_seen,
+            stood_for_loads: Vec::new(),
             mo_preds: 0,
             sc: StoreNodes {
                 forgotten: self.forgotten.clone(),
@@ -1286,7 +1320,7 @@ impl State {
     }
 
     /// The current thread has executed a `SeqCst` fence.
-    fn note_fence(&mut self, threads: &thread::Set, node: usize) {
+    fn note_fence(&mut self, threads: &thread::Set, seq_cst: &mut SeqCst, node: usize) {
         let cnt = cmp::min(self.cnt as usize, self.history);
 
         for store in &mut self.stores[..cnt] {
@@ -1300,8 +1334,27 @@ impl State {
                 store.sc.stood_for.insert(node);
             }
 
-            if store.first_seen.is_seen_by_current(threads) {
+            if store.own_seen.is_seen_by_current(threads) {
                 store.sc.load_fences_after.insert(node);
+            } else if let Some(stood_for) = store
+                .stood_for_loads
+                .iter()
+                .rev()
+                .find(|stood_for| stood_for.seen.is_seen_by_current(threads))
+            {
+                // The fence comes after a load of a store that this one
+                // stands for, the latest of those the thread saw. What has
+                // to come before the fence for that is known now, and the
+                // fence is the newest node, so this cannot close a cycle.
+                for from in stood_for.fences.iter() {
+                    if from != node {
+                        let added = seq_cst.add_edge(from, node);
+
+                        debug_assert!(added, "[loom internal bug] SeqCst order is cyclic");
+                    }
+                }
+
+                store.sc.stood_for_load_fences_after.insert(node);
             }
         }
     }
@@ -1608,6 +1661,7 @@ impl State {
         self.apply_load_coherence(threads, index);
 
         self.stores[index].first_seen.touch(threads);
+        self.stores[index].own_seen.touch(threads);
 
         let prev = self.stores[index].value;
 
@@ -2152,6 +2206,8 @@ impl Default for Store {
             modification_order: VersionVec::new(),
             sync: Synchronize::new(),
             first_seen: FirstSeen::new(),
+            own_seen: FirstSeen::new(),
+            stood_for_loads: Vec::new(),
             mo_preds: 0,
             sc: StoreNodes::default(),
             rmw_of: None,
@@ -2169,11 +2225,21 @@ impl Store {
         let mut stands_for = self.stands_for.clone();
         stands_for.push(self.happens_before);
 
+        let mut fences = self.sc.fences_before.clone();
+        fences.union_with(&self.sc.forgotten.fences);
+
+        let mut stood_for_loads = self.stood_for_loads.clone();
+        stood_for_loads.push(StoodForLoads {
+            seen: self.own_seen.clone(),
+            fences,
+        });
+
         Position {
             modification_order: self.modification_order,
             first_seen: self.first_seen.clone(),
             sc: self.sc.clone(),
             stands_for,
+            stood_for_loads,
         }
     }
 
@@ -2184,6 +2250,12 @@ impl Store {
         self.first_seen.merge(&position.first_seen);
         self.sc.absorb(&position.sc);
         self.stands_for.extend(position.stands_for);
+
+        // The stores taken over are older than any this one already stood
+        // for: it is made later than they are, and directly follows them.
+        let mut stood_for_loads = position.stood_for_loads;
+        stood_for_loads.append(&mut self.stood_for_loads);
+        self.stood_for_loads = stood_for_loads;
     }
 }
 
@@ -2196,6 +2268,10 @@ struct Position {
     /// What the threads that made the store, and the ones it stood for
     /// itself, knew of at the time.
     stands_for: Vec<VersionVec>,
+
+    /// The store and the ones it stood for, as far as fences after loads
+    /// of them go, oldest first.
+    stood_for_loads: Vec<StoodForLoads>,
 }
 
 // ===== impl FirstSeen =====

@@ -91,6 +91,18 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - `SeqCst` fences and stores that are not kept anymore: an internal error
+   ("SeqCst order is cyclic") in a debug build, as soon as an atomic had
+   one store more than loom keeps and `SeqCst` fences were involved: a
+   thread with a fence and seven stores, and another with a fence and a
+   swap, was enough. The store that stands for a forgotten one took over
+   the fences after loads of it as fences after loads of its own, and so
+   ordered a fence before one load of the forgotten store before a fence
+   after another, which nothing requires. Those fences are now kept apart,
+   with what has to come before each. In an optimized build the edges were
+   dropped instead, and the outcomes were right; with 1, 2 or 3 stores
+   kept, 444, 244 and 107 programs of the litmus corpora hit the error, and
+   every other program gives the same outcomes as before.
  - Preemption bound with locks: outcomes within the bound were missed. A
    thread that is stopped while it holds a lock lets another one run up to
    where it wants the lock, and that one then stops by itself, which is no

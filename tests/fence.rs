@@ -279,3 +279,87 @@ fn fence_seqcst_after_flag() {
         writer.join().unwrap();
     });
 }
+
+/// What a thread's `swap` returns in each execution of `f`.
+fn swap_results(history: usize, f: fn() -> usize) -> std::collections::BTreeSet<usize> {
+    let found = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+
+    let mut builder = loom::model::Builder::new();
+    builder.atomic_history = history;
+
+    let found2 = found.clone();
+    builder.check(move || {
+        let result = f();
+        found2.lock().unwrap().insert(result);
+    });
+
+    let found = found.lock().unwrap().clone();
+    found
+}
+
+/// A store that has to be forgotten to make room for the one a `swap`
+/// writes, with `SeqCst` fences in both threads. The new store stands for
+/// the forgotten one from then on; a fence before the swap is not ordered
+/// before one after a load of the forgotten store, and neither are two
+/// fences after loads of it. Loom used to order them, which closed a cycle.
+#[test]
+fn fences_around_a_forgotten_store() {
+    use loom::sync::atomic::AtomicUsize;
+
+    fn model() -> usize {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let fences = thread::spawn(|| {
+            fence(SeqCst);
+            fence(SeqCst);
+        });
+
+        let swapper = {
+            let x = x.clone();
+            thread::spawn(move || {
+                fence(SeqCst);
+                x.swap(1, Relaxed)
+            })
+        };
+
+        fences.join().unwrap();
+        swapper.join().unwrap()
+    }
+
+    assert_eq!(swap_results(1, model), [0].into());
+}
+
+/// The same with more stores than loom keeps by default: one more than
+/// that is enough. Each of the stores, and the initial value, can be what
+/// the swap reads.
+#[test]
+fn fences_around_forgotten_stores() {
+    use loom::sync::atomic::AtomicUsize;
+
+    fn model() -> usize {
+        let x = Arc::new(AtomicUsize::new(0));
+
+        let writer = {
+            let x = x.clone();
+            thread::spawn(move || {
+                fence(SeqCst);
+                for i in 1..=7 {
+                    x.store(i, Relaxed);
+                }
+            })
+        };
+
+        let swapper = {
+            let x = x.clone();
+            thread::spawn(move || {
+                fence(SeqCst);
+                x.swap(8, Relaxed)
+            })
+        };
+
+        writer.join().unwrap();
+        swapper.join().unwrap()
+    }
+
+    assert_eq!(swap_results(7, model), (0..=7).collect());
+}
