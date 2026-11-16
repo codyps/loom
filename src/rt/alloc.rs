@@ -48,6 +48,11 @@ pub(crate) fn alloc(ptr: *mut u8, location: Location) {
     drop(prev);
 }
 
+/// Returns `true` if `ptr` was allocated with `loom::alloc`, freed or not.
+pub(crate) fn is_tracked(ptr: *mut u8) -> bool {
+    rt::execution(|execution| execution.raw_allocations.contains_key(&(ptr as usize)))
+}
+
 /// Track a raw deallocation
 pub(crate) fn dealloc(ptr: *mut u8, location: Location) {
     rt::execution(|execution| {

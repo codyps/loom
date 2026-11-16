@@ -133,8 +133,8 @@ fn same_size_as_std_box() {
     same_size_and_alignment!([u32; 1024]);
 }
 
-/// Zero-sized values must not go through the allocator (a zero-sized
-/// allocation is undefined behavior), and everything else still works.
+/// Boxes of zero-sized values work like any other: they get a byte of
+/// their own (a zero-sized allocation is undefined behavior).
 #[test]
 fn zero_sized() {
     struct Zst;
@@ -234,5 +234,133 @@ fn traits() {
 
         let pinned = Box::pin(5usize);
         assert_eq!(*pinned, 5);
+    });
+}
+
+/// A box of a zero-sized value is tracked for leaks: leaking it means that
+/// the value's destructor never runs.
+#[test]
+#[should_panic(expected = "Allocation leaked")]
+fn zero_sized_leak() {
+    struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {}
+    }
+
+    loom::model(|| {
+        let _ = Box::into_raw(Box::new(Guard));
+    });
+}
+
+/// A zero-sized value may be given to `from_raw` at any well-aligned
+/// address, with nothing allocated for it, as in `std`.
+#[test]
+fn zero_sized_from_dangling_pointer() {
+    loom::model(|| {
+        let (detect_drop, drop_count) = DetectDrop::new();
+
+        struct Zst;
+
+        let boxed = unsafe { Box::from_raw(std::ptr::NonNull::<Zst>::dangling().as_ptr()) };
+        drop(boxed);
+
+        let empty: Box<[DetectDrop]> = unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                std::ptr::NonNull::<DetectDrop>::dangling().as_ptr(),
+                0,
+            ))
+        };
+        drop(empty);
+
+        drop(detect_drop);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// Freeing a box of a zero-sized value twice is a double free, like for any
+/// other value.
+#[test]
+#[should_panic(expected = "Double free")]
+fn zero_sized_double_free() {
+    loom::model(|| {
+        let raw = Box::into_raw(Box::new(()));
+        drop(unsafe { Box::from_raw(raw) });
+        drop(unsafe { Box::from_raw(raw) });
+    });
+}
+
+/// Boxed slices and strings, made the ways `std` has for them.
+#[test]
+fn slices_and_strings() {
+    loom::model(|| {
+        let (detect_drop, drop_count) = DetectDrop::new();
+
+        let from_vec: Box<[DetectDrop]> = Box::from(vec![detect_drop.clone(), detect_drop.clone()]);
+        assert_eq!(from_vec.len(), 2);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        let cloned = from_vec.clone();
+        drop(from_vec);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+        drop(cloned);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 4);
+
+        let from_array: Box<[DetectDrop]> = Box::from([detect_drop.clone(), detect_drop.clone()]);
+        let from_iter: Box<[u32]> = (1..=3).collect();
+        let from_slice: Box<[u32]> = Box::from(&[1, 2, 3][..]);
+        assert_eq!(from_iter, from_slice);
+        assert_eq!(&*from_slice, &[1, 2, 3]);
+        drop(from_array);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 6);
+
+        let empty: Box<[u64]> = Box::default();
+        assert!(empty.is_empty());
+        let zero_sized: Box<[()]> = Box::from(vec![(); 5]);
+        assert_eq!(zero_sized.len(), 5);
+
+        let string: Box<str> = Box::from("loom");
+        let owned: Box<str> = Box::from(String::from("loom"));
+        assert_eq!(string, owned);
+        assert_eq!(&*string.clone(), "loom");
+        assert_eq!(&*Box::<str>::default(), "");
+
+        drop(detect_drop);
+    });
+}
+
+/// A boxed slice that is leaked is reported like any other box.
+#[test]
+#[should_panic(expected = "Allocation leaked")]
+fn slice_leak() {
+    loom::model(|| {
+        let boxed: Box<[u32]> = Box::from(vec![1, 2, 3]);
+        let _ = Box::into_raw(boxed);
+    });
+}
+
+/// A trait object, by casting the raw pointer.
+#[test]
+fn trait_object() {
+    loom::model(|| {
+        let (detect_drop, drop_count) = DetectDrop::new();
+
+        trait Named {
+            fn name(&self) -> &'static str;
+        }
+
+        impl Named for DetectDrop {
+            fn name(&self) -> &'static str {
+                "detect drop"
+            }
+        }
+
+        let boxed = Box::new(detect_drop);
+        let dynamic: Box<dyn Named> =
+            unsafe { Box::from_raw(Box::into_raw(boxed) as *mut dyn Named) };
+        assert_eq!(dynamic.name(), "detect drop");
+
+        drop(dynamic);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     });
 }

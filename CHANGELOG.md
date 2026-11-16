@@ -30,6 +30,14 @@ and release, and on the lowest allowed direct dependency versions.
  - `loom::boxed::Box`, a leak-tracked `Box` (upstream PR 141, ported). Fixes
    the gaps its author listed: zero-sized values, drop-check marker, `Send` /
    `Sync` / `Unpin` for unsized contents. `Box::into_inner` replaces `*boxed`.
+   A box of a zero-sized value allocates a byte, which `std`'s does not, so
+   that leaking it is reported: its destructor never runs. (A zero-sized
+   value given to `from_raw` at an address nothing was allocated at is
+   still fine, and not tracked.) Boxed slices and strings can be made from
+   a `Vec`, a slice, an array, an iterator, a `&str` or a `String`, and
+   cloned, as in `std`; coercing a box to an unsized one cannot be done
+   outside `std`, and the documentation shows the raw pointer cast that
+   does it for a trait object.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
@@ -536,8 +544,8 @@ Not addressed:
    `compare_and_swap_reads_old_values` expected an outcome that no execution
    has (a read-modify-write that reads the initial value cannot come after
    the store it raced with); it now checks the outcomes there are.
- - `Box`: zero-sized values are not leak tracked, and unsized boxes can only
-   be made with `Box::from_raw`.
+ - `Box`: a box cannot be coerced to an unsized one (`Box<[T; N]>` to
+   `Box<[T]>`, `Box<T>` to `Box<dyn Trait>`); that needs compiler support.
  - `lock_api` locks, like every loom object, cannot be kept in a `static`
    across executions.
  - `Notify::wait` is still limited to one blocked thread at a time.
