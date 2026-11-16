@@ -1097,6 +1097,22 @@ impl State {
             }
 
             for i in 0..cnt {
+                // No two stores have the same version. A store's version
+                // starts from its thread's causality right after the
+                // thread's own clock was advanced for it (`rt::synchronize`),
+                // so it holds a clock value that no version made before the
+                // store holds. Two stores that had the same version would
+                // each have been made after the other. A store that takes
+                // the place of a forgotten one (`take_position`) takes its
+                // version over, so the version is still one store's. The
+                // first store, made with the atomic, does not advance the
+                // clock, but no other store can come before it.
+                debug_assert!(
+                    i == j
+                        || self.stores[i].modification_order != self.stores[j].modification_order,
+                    "[loom internal bug] two stores with the same version"
+                );
+
                 if i != j && self.stores[i].modification_order < self.stores[j].modification_order {
                     before[j] |= 1 << i;
                 }
@@ -1889,12 +1905,6 @@ impl State {
                     continue;
                 }
 
-                let mo_i = store_i.modification_order;
-                let mo_j = store_j.modification_order;
-
-                // TODO: this sometimes fails
-                assert_ne!(mo_i, mo_j);
-
                 if before[j] & (1 << i) != 0 {
                     if store_j.first_seen.is_seen_by_current(threads) {
                         // Store `j` is newer, so don't store the current one.
@@ -1973,11 +1983,6 @@ impl State {
                 if i == j {
                     continue;
                 }
-
-                let mo_i = store_i.modification_order;
-                let mo_j = store_j.modification_order;
-
-                assert_ne!(mo_i, mo_j);
 
                 if writes && store_j.rmw_of == Some(i as u8) {
                     // Another read-modify-write has read this store, and

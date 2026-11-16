@@ -168,3 +168,44 @@ fn atomic_history_out_of_range() {
         let _ = AtomicUsize::new(0);
     });
 }
+
+/// No two stores to an atomic have the same version, which loom checks in a
+/// debug build, also where stores are forgotten and the store that
+/// read-modify-writes one takes its place. Threads mix stores and
+/// read-modify-writes on one atomic, so that with few stores kept slots are
+/// reused all the time, and an atomic is created by a thread right after a
+/// store, without its clock moving in between.
+#[test]
+fn store_versions_are_distinct() {
+    for history in [1, 2, 3] {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.atomic_history = history;
+
+        builder.check(|| {
+            let x = Arc::new(AtomicUsize::new(0));
+
+            let threads: Vec<_> = (0..2)
+                .map(|t| {
+                    let x = x.clone();
+                    thread::spawn(move || {
+                        x.store(10 + t, Relaxed);
+                        x.fetch_add(1, SeqCst);
+                        let _ = x.compare_exchange(11, 20 + t, SeqCst, Relaxed);
+                        let y = AtomicUsize::new(x.load(Relaxed));
+                        y.fetch_add(1, Relaxed);
+                        y.store(0, SeqCst);
+                        let _ = y.load(Relaxed);
+                    })
+                })
+                .collect();
+
+            x.swap(5, SeqCst);
+            let _ = x.load(Relaxed);
+
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        });
+    }
+}
