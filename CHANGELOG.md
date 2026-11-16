@@ -33,6 +33,11 @@ and release, and on the lowest allowed direct dependency versions.
  - `model::Builder::check_with_input`: run one execution whose scheduling,
    atomic read and spurious wakeup choices come from a byte string, for
    driving loom from a fuzzer or replaying an execution (upstream PR 427).
+   When the input runs out, the first outcome of each choice is taken. No
+   input starves a thread that waits by yielding, as a thread that yields
+   is not chosen again before the others have had a turn; the proposal
+   listed starvation as a limitation, which that rule (see "Fixed") has
+   since removed.
  - The whole RC11 reference corpus is checked in and checked by the test
    suite, all of it in an optimized build. It used to be a subset of 2,067
    programs and is now 20,747: the 17,947 of the first corpus, 2,796 more
@@ -539,9 +544,6 @@ Not addressed:
  - `Condvar` waits never end spuriously, and `wait_timeout` never times out.
  - Scoped threads: as elsewhere in loom, a panicking thread fails the model
    rather than being reported through `join`.
- - `check_with_input`: when the input runs out the first outcome is chosen,
-   which can starve a thread and hit `max_branches` on a correct model. The
-   author asked upstream whether a different fallback is wanted; unanswered.
 
 # 0.7.3 (November 7, 2026)
 

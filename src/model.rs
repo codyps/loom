@@ -293,9 +293,13 @@ impl Builder {
     /// # Panics
     ///
     /// Model failures and exceeded execution limits panic as in [`Builder::check`].
-    /// An input-selected execution, including the fallback after input exhaustion,
-    /// can starve a thread and exceed `max_branches` even for a correct model.
-    /// Reaching this limit does not establish a concurrency bug.
+    ///
+    /// No input can starve a thread that waits by yielding (`thread::yield_now`
+    /// or `hint::spin_loop`): a thread that yields is not chosen again before
+    /// every other thread that can run has taken a step, whatever the input
+    /// says, and the same holds for the first outcomes chosen once the input
+    /// runs out. A waiting loop that does not yield can run forever and exceed
+    /// `max_branches` here, as it can with [`Builder::check`].
     ///
     /// ```
     /// let input = [5, 2];

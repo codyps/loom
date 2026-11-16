@@ -191,3 +191,82 @@ fn detects_leaks() {
         std::mem::forget(Arc::new(AtomicUsize::new(0)));
     });
 }
+
+/// Threads that wait for each other by yielding: three on a spin lock, and
+/// a thread waiting for one that waits for a third. No input starves one of
+/// them, as a thread that yields is not chosen again before the others have
+/// had a turn, and neither do the first outcomes taken once the input runs
+/// out.
+#[test]
+fn input_does_not_starve_yielding_threads() {
+    fn spin_lock(input: &[u8]) {
+        Builder::new().check_with_input(input, || {
+            let lock = Arc::new(loom::sync::Mutex::new(0));
+            let threads: Vec<_> = (0..3)
+                .map(|_| {
+                    let lock = lock.clone();
+                    thread::spawn(move || loop {
+                        if let Ok(mut count) = lock.try_lock() {
+                            *count += 1;
+                            break;
+                        }
+                        thread::yield_now();
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(*lock.lock().unwrap(), 3);
+        });
+    }
+
+    fn chain(input: &[u8]) {
+        Builder::new().check_with_input(input, || {
+            let first = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+            let second = Arc::new(loom::sync::atomic::AtomicBool::new(false));
+            let middle = {
+                let (first, second) = (first.clone(), second.clone());
+                thread::spawn(move || {
+                    while !second.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    first.store(true, Ordering::Release);
+                })
+            };
+            let last = {
+                let second = second.clone();
+                thread::spawn(move || second.store(true, Ordering::Release))
+            };
+            while !first.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            middle.join().unwrap();
+            last.join().unwrap();
+        });
+    }
+
+    // Every repeated byte, and a few hundred mixed inputs.
+    let mut inputs: Vec<Vec<u8>> = vec![Vec::new()];
+    inputs.extend((0..=255).map(|byte| vec![byte; 16]));
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    for _ in 0..300 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let len = (seed % 65) as usize;
+        inputs.push(
+            seed.to_le_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(len)
+                .collect(),
+        );
+    }
+
+    for input in &inputs {
+        spin_lock(input);
+        chain(input);
+    }
+}
