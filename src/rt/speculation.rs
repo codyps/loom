@@ -31,7 +31,7 @@
 //! and nothing it forbids.
 
 use crate::rt::seq_cst::NodeSet;
-use crate::rt::{Execution, Scheduler, VersionVec};
+use crate::rt::{Execution, Scheduler, ThreadSet, VersionVec};
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -50,13 +50,17 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 /// run. `resume_unwind` does not run the panic hook, so nothing is printed.
 pub(crate) struct Discard;
 
-/// Drops the current execution, starting with the current thread.
-pub(crate) fn discard(execution: &mut Execution) -> ! {
+/// Drops the current execution, starting with the current thread, unless it
+/// is unwinding already: a second panic would abort the process. It carries
+/// on then, and the execution is dropped all the same.
+pub(crate) fn discard(execution: &mut Execution) {
     if let Some(load_buffering) = &mut execution.load_buffering {
         load_buffering.discarding = true;
     }
 
-    resume_unwind(Box::new(Discard))
+    if !std::thread::panicking() {
+        resume_unwind(Box::new(Discard));
+    }
 }
 
 /// Returns `true` if the execution is being dropped.
@@ -169,8 +173,9 @@ pub(crate) struct LoadBuffering {
     pub(crate) pass: Pass,
 
     /// The values stored to each atomic, by its object index, in the
-    /// executions of the first pass, in ascending order.
-    pub(crate) values: BTreeMap<usize, Vec<u64>>,
+    /// executions of the first pass, in ascending order, with the threads
+    /// (as a bit set) that stored them.
+    pub(crate) values: BTreeMap<usize, Vec<(u64, ThreadSet)>>,
 
     /// The guesses of the current execution that are not settled yet.
     pub(crate) pending: Vec<Guess>,
@@ -274,13 +279,14 @@ impl LoadBuffering {
         }
     }
 
-    /// Notes a store of `value` to `atomic`, in the first pass.
-    pub(crate) fn note_value(&mut self, atomic: usize, value: u64) {
+    /// Notes a store of `value` to `atomic` by `thread`, in the first pass.
+    pub(crate) fn note_value(&mut self, atomic: usize, value: u64, thread: usize) {
         if self.pass == Pass::Collect {
             let values = self.values.entry(atomic).or_default();
 
-            if let Err(pos) = values.binary_search(&value) {
-                values.insert(pos, value);
+            match values.binary_search_by_key(&value, |&(value, _)| value) {
+                Ok(pos) => values[pos].1 |= 1 << thread,
+                Err(pos) => values.insert(pos, (value, 1 << thread)),
             }
         }
     }

@@ -59,6 +59,7 @@ use crate::rt::location::{self, Location, LocationSet};
 use crate::rt::object;
 use crate::rt::seq_cst::{Candidate, NodeSet, SeqCst, NO_LOCATION};
 use crate::rt::speculation::{self, Guess, LoadBuffering, Pass, Settled};
+use crate::rt::ThreadSet;
 use crate::rt::{
     self, thread, Access, Numeric, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
 };
@@ -761,10 +762,14 @@ fn guesses(
     };
 
     let state = state_ref.get(&execution.objects);
+    let others: ThreadSet = !(1 << active.as_usize());
 
     values
         .iter()
-        .copied()
+        // A value that only this thread stored can only come from its own
+        // later store, which its load cannot read.
+        .filter(|&&(_, stored_by)| stored_by & others != 0)
+        .map(|&(value, _)| value)
         .filter(|value| {
             !seed
                 .iter()
@@ -789,7 +794,7 @@ fn stored(execution: &mut Execution, state_ref: object::Ref<State>, atomic: usiz
     let slot = state.last;
     let value = state.stores[slot].value;
 
-    load_buffering.note_value(atomic, value);
+    load_buffering.note_value(atomic, value, execution.threads.active_id().as_usize());
 
     let thread = execution.threads.active_id().as_usize();
     let causality = execution.threads.active().causality;
@@ -867,7 +872,8 @@ impl<T: Numeric> Atomic<T> {
             let state = execution.objects.insert(state);
 
             if let Some(load_buffering) = &mut execution.load_buffering {
-                load_buffering.note_value(state.index(), value.into_u64());
+                let thread = execution.threads.active_id().as_usize();
+                load_buffering.note_value(state.index(), value.into_u64(), thread);
             }
 
             trace!(?state, %location, "Atomic::new");
