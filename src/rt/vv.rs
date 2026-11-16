@@ -12,6 +12,7 @@ pub(crate) struct VersionVec {
 }
 
 impl VersionVec {
+    #[inline]
     pub(crate) fn new() -> VersionVec {
         VersionVec {
             versions: [0; MAX_THREADS],
@@ -29,14 +30,17 @@ impl VersionVec {
     }
 
     /// The version of the thread with index `thread`.
+    #[inline]
     pub(crate) fn get(&self, thread: usize) -> u16 {
         self.versions[thread]
     }
 
+    #[inline]
     pub(crate) fn inc(&mut self, id: thread::Id) {
         self.versions[id.as_usize()] += 1;
     }
 
+    #[inline]
     pub(crate) fn join(&mut self, other: &VersionVec) {
         for (i, &version) in other.versions.iter().enumerate() {
             self.versions[i] = cmp::max(self.versions[i], version);
@@ -56,6 +60,7 @@ impl VersionVec {
 }
 
 impl cmp::PartialOrd for VersionVec {
+    #[inline]
     fn partial_cmp(&self, other: &VersionVec) -> Option<cmp::Ordering> {
         use cmp::Ordering::*;
 
@@ -81,12 +86,14 @@ impl cmp::PartialOrd for VersionVec {
 impl ops::Index<thread::Id> for VersionVec {
     type Output = u16;
 
+    #[inline]
     fn index(&self, index: thread::Id) -> &u16 {
         self.versions.index(index.as_usize())
     }
 }
 
 impl ops::IndexMut<thread::Id> for VersionVec {
+    #[inline]
     fn index_mut(&mut self, index: thread::Id) -> &mut u16 {
         self.versions.index_mut(index.as_usize())
     }

@@ -164,5 +164,35 @@ results.txt` writes lines in the format of the reference files. `gen.py`
 writes the programs for GenMC after the ones for herd; `gen.py 20948` writes
 only those.
 
+## Load buffering
+
+`reference_lb.txt` is for `Builder::load_buffering`, which lets a `Relaxed`
+load read a store that comes after it. RC11 rules that out with one axiom,
+`acyclic (sb | rf) as no-thin-air`; without that line, `rc11_cxx20.cat` is
+what the C++ standard allows for programs like these, in which every store
+writes a constant and nothing can come out of thin air. The file holds
+herd's result with that model for the 1,953 programs of `reference.txt` in
+which load buffering can be seen at all (two threads that load and then
+store, one of the loads plain `Relaxed`), from 1,957; herd did not finish 4.
+
+    grep -v "as no-thin-air" herd/libdir/rc11_cxx20.cat > rc11_cxx20_lb.cat
+
+and then `runherd.sh` with `-model rc11_cxx20_lb.cat`, for those programs.
+
+Loom finds every outcome RC11 allows and none that the model forbids. Of the
+1,118 outcomes that only load buffering allows, it finds 873; the others are
+listed as known gaps. They are out of reach by design: only plain `Relaxed`
+loads guess a later store, and an execution is dropped if the loading thread
+touches the atomic again, or executes an acquire or `SeqCst` fence, before
+the store is made.
+
+Run on the whole corpus, the mode gives exactly RC11's outcomes for every
+program outside this set except 86 larger ones of `reference_genmc.txt`,
+where it adds some. herd finishes 46 of those 71 that have no locks, and
+forbids none of what loom adds. GenMC's IMM model is no stand-in: it allows
+less than this model on 93 programs of the set (it keeps a load before a
+later release store), and disagreed with loom on 18 of the 46, on all of
+which herd sides with loom.
+
 [herd7]: https://github.com/herd/herdtools7
 [GenMC]: https://github.com/MPI-SWS/genmc

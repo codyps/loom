@@ -1,5 +1,6 @@
 use crate::rt::alloc::Allocation;
 use crate::rt::seq_cst::SeqCst;
+use crate::rt::speculation::{self, LoadBuffering};
 use crate::rt::{lazy_static, object, thread, Path, ThreadSet, VersionVec, MAX_THREADS};
 
 use std::collections::HashMap;
@@ -63,6 +64,10 @@ pub(crate) struct Execution {
 
     /// Whether a condition variable wait may end without a notification.
     pub(crate) spurious_wakeups: bool,
+
+    /// Guesses for loads that read stores yet to be made, when load
+    /// buffering is explored (see `rt::speculation`).
+    pub(crate) load_buffering: Option<Box<LoadBuffering>>,
 }
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
@@ -119,6 +124,7 @@ impl Execution {
             location: false,
             log: false,
             spurious_wakeups: true,
+            load_buffering: None,
         }
     }
 
@@ -148,6 +154,7 @@ impl Execution {
         let location = self.location;
         let log = self.log;
         let spurious_wakeups = self.spurious_wakeups;
+        let mut load_buffering = self.load_buffering;
         let mut path = self.path;
         let mut objects = self.objects;
         let mut seq_cst = self.seq_cst;
@@ -178,6 +185,10 @@ impl Execution {
 
         threads.clear(id);
 
+        if let Some(load_buffering) = &mut load_buffering {
+            load_buffering.reset();
+        }
+
         Some(Execution {
             id,
             path,
@@ -196,7 +207,40 @@ impl Execution {
             location,
             log,
             spurious_wakeups,
+            load_buffering,
         })
+    }
+
+    /// Scheduling while the execution is being dropped (see
+    /// `speculation::Discard`): the current thread unwinds, unless it is
+    /// unwinding already, and when it is done, the next thread that has not
+    /// finished runs to unwind in turn, blocked or not. Nothing is recorded
+    /// in the path.
+    fn schedule_discarding(&mut self) -> bool {
+        let current = self.threads.active_id();
+
+        if !self.threads.active().is_terminated() {
+            if speculation::should_unwind(self) {
+                std::panic::resume_unwind(Box::new(speculation::Discard));
+            }
+
+            // Unwinding already, or starting or finishing: carry on.
+            return false;
+        }
+
+        let next = self
+            .threads
+            .iter()
+            .map(|(id, _)| id)
+            .find(|&id| !self.threads[id].is_terminated());
+
+        if let Some(next) = next {
+            self.threads[next].set_runnable();
+        }
+
+        self.threads.set_active(next);
+
+        next.is_some() && next != Some(current)
     }
 
     /// Returns `true` if a switch is required
@@ -204,6 +248,10 @@ impl Execution {
         use crate::rt::path::Thread;
 
         // Implementation of the DPOR algorithm.
+
+        if speculation::is_discarding(self) {
+            return self.schedule_discarding();
+        }
 
         let curr_thread = self.threads.active_id();
 
@@ -365,6 +413,21 @@ impl Execution {
         if next.is_none() && !self.threads.iter().all(|(_, th)| th.is_terminated()) {
             // No thread can run, and not because they are all done: the test
             // has deadlocked.
+            //
+            // With a guess unsettled, nothing can settle it anymore: the
+            // execution does not exist. With a failure held back while there
+            // was one, the failure is what this comes from.
+            if let Some(load_buffering) = &mut self.load_buffering {
+                if !load_buffering.pending.is_empty() {
+                    load_buffering.discarding = true;
+                    return self.schedule_discarding();
+                }
+
+                if let Some(failure) = load_buffering.failure.take() {
+                    std::panic::resume_unwind(failure);
+                }
+            }
+
             //
             // The current thread is left active. The panic below unwinds it,
             // and the destructors that run on the way (a loom `Arc` being

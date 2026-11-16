@@ -98,6 +98,9 @@ impl Scheduler {
         let mut cx = Context::from_waker(&waker);
 
         assert!(switch.poll(&mut cx).is_ready());
+
+        // The thread has been resumed.
+        crate::rt::speculation::unwind_if_discarding();
     }
 
     pub(crate) fn spawn(stack_size: Option<usize>, f: Box<dyn FnOnce()>) {
@@ -199,7 +202,14 @@ impl Scheduler {
             struct DropGuard<'a, 'b>(std::cell::RefMut<'a, State<'b>>, VecDeque<QueuedSpawn>);
             impl<'a, 'b> Drop for DropGuard<'a, 'b> {
                 fn drop(&mut self) {
-                    if std::thread::panicking() {
+                    // Unless the execution carries on after the panic: a
+                    // panic held back while a load's guess is open, or an
+                    // execution that is being dropped one thread at a time
+                    // (see `rt::speculation`). The threads queued to be
+                    // spawned are part of it then.
+                    if std::thread::panicking()
+                        && !crate::rt::speculation::carries_on(self.0.execution)
+                    {
                         self.1 = std::mem::take(self.0.queued_spawn);
                     }
                 }

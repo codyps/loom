@@ -49,6 +49,8 @@ pub(crate) use self::scheduler::Scheduler;
 
 mod seq_cst;
 
+pub(crate) mod speculation;
+
 mod synchronize;
 pub(crate) use self::synchronize::Synchronize;
 
@@ -99,7 +101,7 @@ where
             let panic_guard = PanicGuard;
 
             // execute the closure, note that `f()` may panic!
-            f();
+            speculation::run_thread(f);
 
             // if `f()` didn't panic, then we terminate the
             // spawned thread by dropping the guard ourselves.

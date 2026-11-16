@@ -7,13 +7,17 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
-// Loom currently does not support load buffering.
+/// The main thread's load can read the 1 that the other thread copies from
+/// the main thread's later store. RC11, which loom follows by default, rules
+/// that out; the C++ standard allows it, and `Builder::load_buffering`
+/// explores it.
 #[test]
-#[ignore]
 fn load_buffering() {
     let values = Arc::new(Mutex::new(HashSet::new()));
     let values_ = values.clone();
-    loom::model(move || {
+    let mut builder = loom::model::Builder::new();
+    builder.load_buffering = true;
+    builder.check(move || {
         let x = Arc::new(AtomicUsize::new(0));
         let y = Arc::new(AtomicUsize::new(0));
 
@@ -28,7 +32,11 @@ fn load_buffering() {
         y.store(1, Relaxed);
 
         th.join().unwrap();
-        values.lock().unwrap().insert(a);
+
+        // Not for an execution in which the load's guess did not come true.
+        if loom::model::is_settled() {
+            values.lock().unwrap().insert(a);
+        }
     });
     assert!(values_.lock().unwrap().contains(&1));
 }

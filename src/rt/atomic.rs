@@ -58,6 +58,7 @@ use crate::rt::execution::Execution;
 use crate::rt::location::{self, Location, LocationSet};
 use crate::rt::object;
 use crate::rt::seq_cst::{Candidate, NodeSet, SeqCst, NO_LOCATION};
+use crate::rt::speculation::{self, Guess, LoadBuffering, Pass, Settled};
 use crate::rt::{
     self, thread, Access, Numeric, Synchronize, VersionVec, MAX_ATOMIC_HISTORY, MAX_THREADS,
 };
@@ -608,6 +609,18 @@ pub(crate) fn fence(ordering: Ordering, location: Location) {
         let thread = execution.threads.active_id().as_usize();
         let clock = execution.threads.active().causality.get(thread);
 
+        // An acquire fence after a load synchronizes with the store that was
+        // read, if it was a release; a `SeqCst` fence is ordered with it. A
+        // store that has not been made yet cannot take part in either.
+        if ordering != Ordering::Release
+            && execution
+                .load_buffering
+                .as_ref()
+                .is_some_and(|load_buffering| load_buffering.thread_guessing(thread))
+        {
+            speculation::discard(execution);
+        }
+
         // A fence is an operation on no location in particular.
         execution.threads.active_mut().settle_other();
         execution.seq_cst.observe(thread, NO_LOCATION, clock);
@@ -676,6 +689,169 @@ fn fence_seqcst(execution: &mut Execution) {
     }
 }
 
+/// Drops the execution if the current thread has a guess about `atomic`
+/// that is not settled yet: the access would depend on which store was read.
+fn unsettled_access(execution: &mut Execution, atomic: usize) {
+    if let Some(load_buffering) = &execution.load_buffering {
+        let thread = execution.threads.active_id().as_usize();
+
+        if load_buffering.guessing(thread, atomic) {
+            speculation::discard(execution);
+        }
+    }
+}
+
+/// The current thread reads the store numbered `seq` of `atomic`. Where it
+/// knows of a load that guessed a value of the atomic, the store that load
+/// reads has to come before this one.
+fn read_store(
+    load_buffering: &mut Option<Box<LoadBuffering>>,
+    threads: &thread::Set,
+    atomic: usize,
+    seq: u16,
+) {
+    if let Some(load_buffering) = load_buffering {
+        let thread = threads.active_id().as_usize();
+        let causality = &threads.active().causality;
+
+        for guess in &mut load_buffering.pending {
+            if guess.atomic == atomic
+                && guess.thread != thread
+                && causality.get(guess.thread) >= guess.clock
+            {
+                guess.read_after.push(seq);
+            }
+        }
+    }
+}
+
+/// The values a `Relaxed` load of `atomic` may guess, when load buffering is
+/// explored: values the atomic was given in the first pass that none of the
+/// stores in `seed`, which the load can read, has.
+fn guesses(
+    execution: &Execution,
+    state_ref: object::Ref<State>,
+    atomic: usize,
+    seed: &[u8],
+    ordering: Ordering,
+) -> Vec<u64> {
+    let load_buffering = match &execution.load_buffering {
+        Some(load_buffering) if load_buffering.pass == Pass::Guess => load_buffering,
+        _ => return Vec::new(),
+    };
+
+    if ordering != Ordering::Relaxed || !execution.path.is_exploring() {
+        return Vec::new();
+    }
+
+    // Only another thread that can still run can make the store.
+    let active = execution.threads.active_id();
+    let others = execution
+        .threads
+        .iter()
+        .any(|(id, thread)| id != active && !thread.is_terminated());
+
+    if !others {
+        return Vec::new();
+    }
+
+    let values = match load_buffering.values.get(&atomic) {
+        Some(values) => values,
+        None => return Vec::new(),
+    };
+
+    let state = state_ref.get(&execution.objects);
+
+    values
+        .iter()
+        .copied()
+        .filter(|value| {
+            !seed
+                .iter()
+                .any(|&slot| state.stores[slot as usize].value == *value)
+        })
+        // One choice is not guessing; a load branch holds up to
+        // `MAX_ATOMIC_HISTORY` choices.
+        .take(MAX_ATOMIC_HISTORY - 1)
+        .collect()
+}
+
+/// A store has been made to `atomic`, by the current thread, as the last of
+/// its stores: in the first pass, its value is noted; in the second, it may
+/// settle a guess.
+fn stored(execution: &mut Execution, state_ref: object::Ref<State>, atomic: usize) {
+    let load_buffering = match &mut execution.load_buffering {
+        Some(load_buffering) => load_buffering,
+        None => return,
+    };
+
+    let state = state_ref.get_mut(&mut execution.objects);
+    let slot = state.last;
+    let value = state.stores[slot].value;
+
+    load_buffering.note_value(atomic, value);
+
+    let thread = execution.threads.active_id().as_usize();
+    let causality = execution.threads.active().causality;
+
+    let mut i = 0;
+
+    while i < load_buffering.pending.len() {
+        let guess = &load_buffering.pending[i];
+
+        // The loading thread's own later store cannot be read by its earlier
+        // load, and neither can a store that happens after the load.
+        let candidate = guess.atomic == atomic
+            && guess.value == value
+            && guess.thread != thread
+            && causality.get(guess.thread) < guess.clock;
+
+        if !candidate {
+            i += 1;
+            continue;
+        }
+
+        // Loads of the atomic that guessed and that the loading thread knew
+        // of read stores that come before this one, where they are settled.
+        let mut after: StoreSet = 0;
+
+        for settled in &load_buffering.settled {
+            if settled.atomic == atomic && guess.knows(settled.thread, settled.clock) {
+                if let Some(slot) = state.slot_of(settled.seq) {
+                    after |= 1 << slot;
+                }
+            }
+        }
+
+        if !state.settle(&mut execution.seq_cst, slot, guess, after) {
+            i += 1;
+            continue;
+        }
+
+        trace!(?guess, slot, "settled");
+
+        let guess = load_buffering.pending.swap_remove(i);
+        let seq = state.stores[slot].seq;
+
+        // ... and the ones that are not settled yet read stores that come
+        // before this one, which this load read after knowing of them.
+        for other in &mut load_buffering.pending {
+            if other.atomic == atomic && guess.knows(other.thread, other.clock) {
+                other.read_after.push(seq);
+            }
+        }
+
+        load_buffering.settled.push(Settled {
+            thread: guess.thread,
+            clock: guess.clock,
+            atomic,
+            seq,
+        });
+
+        // The loop goes on at the same index, which now holds another guess.
+    }
+}
+
 impl<T: Numeric> Atomic<T> {
     /// Create a new, atomic cell initialized with the provided value
     pub(crate) fn new(value: T, location: Location) -> Atomic<T> {
@@ -689,6 +865,10 @@ impl<T: Numeric> Atomic<T> {
                 location,
             );
             let state = execution.objects.insert(state);
+
+            if let Some(load_buffering) = &mut execution.load_buffering {
+                load_buffering.note_value(state.index(), value.into_u64());
+            }
 
             trace!(?state, %location, "Atomic::new");
 
@@ -707,23 +887,94 @@ impl<T: Numeric> Atomic<T> {
             let atomic = self.begin(execution);
             let state = self.state.get_mut(&mut execution.objects);
 
-            // If necessary, generate the list of stores to permute through
-            if execution.path.is_traversed() {
-                let mut seed = [0; MAX_ATOMIC_HISTORY];
+            // The load may return a store yet to be made, see
+            // `rt::speculation`. Whether it does is chosen first: the stores
+            // it could read otherwise do not matter then. Which stores those
+            // are is only needed for a new branch otherwise.
+            let guessing = execution
+                .load_buffering
+                .as_ref()
+                .is_some_and(|load_buffering| load_buffering.pass == Pass::Guess);
 
-                let n = state.match_load_to_stores(
+            let mut seed = [0; MAX_ATOMIC_HISTORY];
+            let mut n = 0;
+
+            if guessing || execution.path.is_traversed() {
+                n = state.match_load_to_stores(
                     &execution.threads,
                     &execution.seq_cst,
                     atomic,
                     &mut seed[..],
                     ordering,
                 );
+            }
 
+            let guesses = if guessing {
+                guesses(execution, self.state, atomic, &seed[..n], ordering)
+            } else {
+                Vec::new()
+            };
+
+            if !guesses.is_empty() {
+                if execution.path.is_traversed() {
+                    let choices: Vec<u8> = (0..=guesses.len() as u8).collect();
+                    execution.path.push_load(&choices);
+                }
+
+                let choice = execution.path.branch_load();
+
+                if choice > 0 {
+                    let value = guesses[choice - 1];
+                    let state = self.state.get_mut(&mut execution.objects);
+
+                    state.loaded_locations.track(location, &execution.threads);
+                    state.track_load(&execution.threads);
+
+                    let thread = execution.threads.active_id().as_usize();
+                    let causality = execution.threads.active().causality;
+
+                    let guess = Guess {
+                        thread,
+                        atomic,
+                        value,
+                        causality,
+                        clock: causality.get(thread),
+                        known: state.known_stores(&execution.threads),
+                        forgotten: (state.cnt as usize).saturating_sub(state.history) as u16,
+                        read_after: Vec::new(),
+                        fences: execution.seq_cst.fences_before(thread, &causality),
+                    };
+
+                    trace!(state = ?self.state, ?ordering, %location, ?guess, "Atomic::load guesses");
+
+                    let load_buffering = execution.load_buffering.as_mut().unwrap();
+                    load_buffering.pending.push(guess);
+                    load_buffering.guessed = true;
+
+                    execution.threads.active_mut().note_access(atomic);
+
+                    return T::from_u64(value);
+                }
+            }
+
+            let state = self.state.get_mut(&mut execution.objects);
+
+            // If necessary, generate the list of stores to permute through
+            if execution.path.is_traversed() {
                 execution.path.push_load(&seed[..n]);
             }
 
             // Get the store to return from this load.
             let index = execution.path.branch_load();
+
+            if execution.load_buffering.is_some() {
+                read_store(
+                    &mut execution.load_buffering,
+                    &execution.threads,
+                    atomic,
+                    state.stores[index].seq,
+                );
+            }
 
             trace!(state = ?self.state, ?ordering, %location, "Atomic::load");
 
@@ -745,6 +996,10 @@ impl<T: Numeric> Atomic<T> {
     /// Loads a value from the atomic cell without performing synchronization
     pub(crate) fn unsync_load(&self, location: Location) -> T {
         rt::execution(|execution| {
+            if execution.load_buffering.is_some() {
+                unsettled_access(execution, self.state.index());
+            }
+
             let state = self.state.get_mut(&mut execution.objects);
 
             state
@@ -789,6 +1044,10 @@ impl<T: Numeric> Atomic<T> {
                 None,
             );
             state.commit(&mut execution.seq_cst);
+
+            if execution.load_buffering.is_some() {
+                stored(execution, self.state, atomic);
+            }
 
             execution.threads.active_mut().note_access(atomic);
         })
@@ -836,6 +1095,15 @@ impl<T: Numeric> Atomic<T> {
             // Get the store to use for the read portion of the rmw operation.
             let index = execution.path.branch_load();
 
+            if execution.load_buffering.is_some() {
+                read_store(
+                    &mut execution.load_buffering,
+                    &execution.threads,
+                    atomic,
+                    state.stores[index].seq,
+                );
+            }
+
             trace!(state = ?self.state, ?success, ?failure, %location, "Atomic::rmw");
 
             // Whether to fail spuriously is a choice loom explores both ways.
@@ -847,6 +1115,8 @@ impl<T: Numeric> Atomic<T> {
                     move |num| error(T::from_u64(num)),
                 )
             });
+
+            let stores = state.cnt;
 
             let result = state.rmw(
                 &mut execution.threads,
@@ -860,6 +1130,12 @@ impl<T: Numeric> Atomic<T> {
                 spurious,
             );
 
+            if execution.load_buffering.is_some()
+                && self.state.get(&execution.objects).cnt != stores
+            {
+                stored(execution, self.state, atomic);
+            }
+
             execution.threads.active_mut().note_access(atomic);
 
             result.map(T::from_u64)
@@ -871,6 +1147,10 @@ impl<T: Numeric> Atomic<T> {
     /// `with_mut` must happen-after all stores to the cell.
     pub(crate) fn with_mut<R>(&mut self, location: Location, f: impl FnOnce(&mut T) -> R) -> R {
         let value = super::execution(|execution| {
+            if execution.load_buffering.is_some() {
+                unsettled_access(execution, self.state.index());
+            }
+
             let state = self.state.get_mut(&mut execution.objects);
 
             state
@@ -920,6 +1200,10 @@ impl<T: Numeric> Atomic<T> {
     fn begin(&self, execution: &mut Execution) -> usize {
         let atomic = self.state.index();
         let thread = execution.threads.active_id().as_usize();
+
+        if execution.load_buffering.is_some() {
+            unsettled_access(execution, atomic);
+        }
         let clock = execution.threads.active().causality.get(thread);
 
         execution.threads.active_mut().settle_other();
@@ -1237,6 +1521,99 @@ impl State {
 
     /// The stores the current thread already knows of, which are ordered
     /// before the store in slot `index` once the thread loads that.
+    /// The slot of the store numbered `seq`, if it is still kept.
+    fn slot_of(&self, seq: u16) -> Option<usize> {
+        self.stores.iter().position(|store| store.seq == seq)
+    }
+
+    /// The stores the current thread knows of, by their number among the
+    /// stores of the atomic: ones it has seen, or that happen before it. A
+    /// store it loads comes after them.
+    fn known_stores(&self, threads: &thread::Set) -> Vec<u16> {
+        self.stores
+            .iter()
+            .filter(|store| {
+                store.is_seen_by_current(threads)
+                    || store.happens_before < threads.active().causality
+            })
+            .map(|store| store.seq)
+            .collect()
+    }
+
+    /// Lets the load `guess` read the store in `slot`, if that is consistent
+    /// with the modification order and the order of `SeqCst` operations.
+    /// Returns `false`, changing nothing, if it is not.
+    fn settle(
+        &mut self,
+        seq_cst: &mut SeqCst,
+        slot: usize,
+        guess: &Guess,
+        after: StoreSet,
+    ) -> bool {
+        // A store that happens after the load, or one that a thread read
+        // after it came to know of the load, would have to come after the
+        // store the load read (a load is not ordered before what it reads).
+        // The store is the newest one, though, and nothing is placed before
+        // stores that exist: such a store rules this one out. So does a
+        // store that has been forgotten since the load, as nothing can be
+        // told of it.
+        if self.cnt as usize > self.history
+            && self.cnt as usize - self.history > guess.forgotten as usize
+        {
+            return false;
+        }
+
+        for (i, store) in self.stores.iter().enumerate() {
+            if i == slot {
+                continue;
+            }
+
+            if store.happens_before.get(guess.thread) >= guess.clock
+                || guess.read_after.contains(&store.seq)
+            {
+                return false;
+            }
+        }
+
+        // The stores the loading thread knew of come before the store it
+        // read.
+        let mut preds: StoreSet = after & !(1 << slot);
+
+        for (i, store) in self.stores.iter().enumerate() {
+            if i != slot && guess.known.contains(&store.seq) {
+                preds |= 1 << i;
+            }
+        }
+
+        let before = self.mo_before_with(slot, preds);
+
+        if (0..self.stores.len()).any(|i| before[i] & (1 << i) != 0) {
+            return false;
+        }
+
+        if !seq_cst.is_empty() {
+            let fences = &guess.fences;
+            let nodes = self.nodes(Some((slot, &|nodes: &mut StoreNodes| {
+                nodes.load_fences_before.union_with(fences);
+            })));
+            let edges = Self::seq_cst_edges(&before, &nodes);
+
+            if !seq_cst.admits(None, &edges) {
+                return false;
+            }
+        }
+
+        let store = &mut self.stores[slot];
+        store.mo_preds |= preds;
+        store.sc.load_fences_before.union_with(&guess.fences);
+        store.first_seen.see_at(guess.thread, guess.clock);
+
+        self.mo_cache.clear();
+        self.commit(seq_cst);
+
+        true
+    }
+
     fn coherence_preds(&self, threads: &thread::Set, index: usize, before: &MoOrder) -> StoreSet {
         let cnt = cmp::min(self.cnt as usize, self.history);
         let mut preds = 0;
@@ -2305,6 +2682,11 @@ struct Position {
 impl FirstSeen {
     fn new() -> FirstSeen {
         FirstSeen([u16::MAX; MAX_THREADS])
+    }
+
+    /// Records that `thread` saw the value at its clock `version`.
+    fn see_at(&mut self, thread: usize, version: u16) {
+        self.0[thread] = cmp::min(self.0[thread], version);
     }
 
     fn touch(&mut self, threads: &thread::Set) {

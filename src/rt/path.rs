@@ -651,6 +651,12 @@ impl Path {
     /// something else, and with several workers a tree would have to be
     /// shared between the one that explores it and the ones that add to
     /// it: both keep to the older way.
+    /// Returns `true` unless exploration has been turned off (see
+    /// `loom::stop_exploring`).
+    pub(super) fn is_exploring(&self) -> bool {
+        self.exploring
+    }
+
     pub(super) fn optimal(&self) -> bool {
         self.wakeup_trees
             && self.sleep_sets

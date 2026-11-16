@@ -103,11 +103,31 @@ pub fn outcomes(program: &str) -> BTreeSet<String> {
     outcomes_within(program, None).0
 }
 
+/// Like `outcomes`, with load buffering explored (see
+/// `Builder::load_buffering`): what RC11 without its no-thin-air axiom
+/// allows.
+#[allow(dead_code)]
+pub fn outcomes_with_load_buffering(program: &str) -> BTreeSet<String> {
+    explore(program, None, true).0
+}
+
 /// Like `outcomes`, but gives up after `budget`. Returns the outcomes found
 /// and whether the exploration ran to completion.
 pub fn outcomes_within(
     program: &str,
     budget: Option<std::time::Duration>,
+) -> (BTreeSet<String>, bool) {
+    // (`LOOM_LITMUS_LOAD_BUFFERING` explores what RC11 without its
+    // no-thin-air axiom allows, see `Builder::load_buffering`.)
+    let load_buffering = std::env::var_os("LOOM_LITMUS_LOAD_BUFFERING").is_some();
+
+    explore(program, budget, load_buffering)
+}
+
+fn explore(
+    program: &str,
+    budget: Option<std::time::Duration>,
+    load_buffering: bool,
 ) -> (BTreeSet<String>, bool) {
     let threads = parse(program);
     let seen = std::sync::Arc::new(Mutex::new(BTreeSet::new()));
@@ -125,6 +145,7 @@ pub fn outcomes_within(
             .map(|bound| bound.parse().expect("invalid LOOM_LITMUS_PREEMPTIONS"));
         // (`LOOM_LITMUS_EXHAUSTIVE` gives what such a search has to find.)
         builder.exhaustive = std::env::var_os("LOOM_LITMUS_EXHAUSTIVE").is_some();
+        builder.load_buffering = load_buffering;
         builder.max_branches = 10_000;
         builder.max_duration = budget;
         // The time limit is only looked at every `checkpoint_interval` executions.
@@ -196,7 +217,11 @@ pub fn outcomes_within(
                 vars[2].load(Relaxed)
             ));
 
-            seen.lock().unwrap().insert(outcome);
+            // An execution in which a load's guess has not come true is
+            // dropped, and what it saw does not count.
+            if loom::model::is_settled() {
+                seen.lock().unwrap().insert(outcome);
+            }
         });
     }
 

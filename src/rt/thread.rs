@@ -15,6 +15,10 @@ pub(crate) struct Thread {
     /// True if the thread is in a critical section
     pub critical: bool,
 
+    /// True while the thread runs its body inside `speculation::run_thread`,
+    /// which catches what an execution that is being dropped unwinds with.
+    pub(crate) in_body: bool,
+
     /// The operation the thread is about to take
     pub(super) operation: Option<Operation>,
 
@@ -134,6 +138,7 @@ impl Thread {
             span: tracing::info_span!(parent: parent_span.id(), "thread", id = id.id),
             state: State::Runnable,
             critical: false,
+            in_body: false,
             operation: None,
             blocked_in_park: false,
             park_token: false,

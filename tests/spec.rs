@@ -5,16 +5,20 @@
 
 /// https://en.cppreference.com/w/cpp/atomic/memory_order#Relaxed_ordering
 ///
-/// This test is ignored because loom cannot fully model `Ordering::Relaxed`.
+/// Both loads can read 42: each reads the other thread's store, which comes
+/// after the other load. That is load buffering, which loom only explores
+/// with `Builder::load_buffering`.
 #[test]
-#[should_panic]
-#[ignore]
+#[should_panic(expected = "This case is possible with Relaxed")]
 fn relaxed() {
     use loom::sync::atomic::AtomicUsize;
     use loom::thread;
     use std::sync::atomic::Ordering::Relaxed;
 
-    loom::model(|| {
+    let mut builder = loom::model::Builder::new();
+    builder.load_buffering = true;
+
+    builder.check(|| {
         let x1: &'static _ = Box::leak(Box::new(AtomicUsize::new(0)));
         let x2 = x1;
         let y1: &'static _ = Box::leak(Box::new(AtomicUsize::new(0)));

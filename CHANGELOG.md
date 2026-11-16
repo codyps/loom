@@ -86,6 +86,33 @@ and release, and on the lowest allowed direct dependency versions.
    oldest are not returned. Keeping more makes operations on an atomic with
    that many stores slower (by half with 12 stores and all of them kept),
    which is why it is a setting and not a new default.
+ - Load buffering, as an option (`model::Builder::load_buffering`,
+   `LOOM_LOAD_BUFFERING=1`; part of upstream issue 6): a `Relaxed` load may
+   return a store that comes after it, which the C++ standard allows and
+   RC11, loom's model, does not. Loom guesses the value and checks the guess
+   when stores are made. The model is explored twice, first the usual way,
+   noting the values each atomic is given, then with loads that may also
+   guess one of those values. A guess comes true with a store of the value
+   by another thread that does not happen after the load, where reading it
+   keeps the modification order and the order of `SeqCst` operations
+   consistent; an execution in which a guess does not come true is dropped,
+   and a panic while one is open is only reported once it has.
+   `model::is_settled` tells a model whether the current execution's
+   guesses have come true, for what it records outside of loom.
+
+   Checked against herd with RC11 minus its no-thin-air axiom, on the 1,953
+   programs of the corpus in which load buffering can be seen
+   (`tests/litmus_rc11/reference_lb.txt`, checked by the test suite): no
+   outcome that it forbids, every outcome RC11 allows, and 873 of the 1,118
+   that only load buffering allows. On the rest of the corpus the mode gives
+   RC11's outcomes, apart from 86 larger programs where it adds some; herd
+   finishes 46 of them and forbids none of those. The outcomes it does not
+   find are left out on purpose: only plain
+   `Relaxed` loads guess, and until a guess comes true, the loading thread
+   may not access that atomic again nor execute an acquire or `SeqCst`
+   fence. Two loads copying 0 back and forth never produce anything else:
+   values only come from executions without guesses. The tests
+   `load_buffering` and `relaxed`, ignored until now, use it.
  - `model::Builder::workers` and `LOOM_WORKERS`: explore the executions of a
    model on several threads, see "Performance" below.
  - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
@@ -522,7 +549,8 @@ Already resolved by the merged pull requests:
 
 Not addressed:
 
- - Load buffering is not modeled (part of upstream issue 6).
+ - Load buffering is explored only with `Builder::load_buffering`, and only
+   in part (part of upstream issue 6, see "Added").
  - Requests that cannot be met by a mock that carries tracking state:
    `repr(transparent)` atomics and cells (51, 317), `const fn new` (170),
    `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
@@ -553,9 +581,15 @@ Not addressed:
  - The `block_on` waker test documents the `will_wake` contract but cannot
    fail on the old code in practice: the old vtable was only duplicated under
    particular inlining.
- - The ignored tests `load_buffering` and `relaxed` are still ignored and
-   still fail: both need load buffering, which is not modeled. Of the others
-   that were ignored, `test_seq_cst` passes with the `SeqCst` fix, and
+ - Load buffering (`Builder::load_buffering`) finds some of what it allows:
+   only plain `Relaxed` loads guess a later store, and an execution is
+   dropped if the loading thread accesses the atomic again, or executes an
+   acquire or `SeqCst` fence, before the store is made. It explores the
+   model twice, is not used with several workers, a checkpoint or
+   `check_with_input`, and cannot undo what a dropped execution did outside
+   of loom (see `model::is_settled`). Of the tests that were ignored,
+   `load_buffering` and `relaxed` use it, `test_seq_cst` passes with the
+   `SeqCst` fix, and
    `compare_and_swap_reads_old_values` expected an outcome that no execution
    has (a read-modify-write that reads the initial value cannot come after
    the store it raced with); it now checks the outcomes there are.

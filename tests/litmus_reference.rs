@@ -32,6 +32,13 @@ const REFERENCE: &str = include_str!("litmus_rc11/reference.txt");
 /// locks, and ones it would take hours for.
 const REFERENCE_GENMC: &str = include_str!("litmus_rc11/reference_genmc.txt");
 
+/// What RC11 without its no-thin-air axiom allows, as computed by herd, for
+/// the programs of `reference.txt` in which load buffering can be seen: two
+/// threads that load and then store, one of the loads `Relaxed`. Checked
+/// with `Builder::load_buffering`, which finds part of it; the outcomes it
+/// does not find are listed as known gaps.
+const REFERENCE_LB: &str = include_str!("litmus_rc11/reference_lb.txt");
+
 /// The programs are split over a few tests to run in parallel.
 const PARTS: usize = 8;
 
@@ -39,7 +46,7 @@ const PARTS: usize = 8;
 /// one in this many. An optimized one checks every program.
 const DEBUG_SAMPLE: usize = 8;
 
-fn check(reference: &str, part: usize) {
+fn check(reference: &str, part: usize, outcomes: fn(&str) -> BTreeSet<String>) {
     let mut failures = Vec::new();
 
     let sample = if cfg!(debug_assertions) {
@@ -57,7 +64,7 @@ fn check(reference: &str, part: usize) {
             .next()
             .map_or(BTreeSet::new(), |gaps| gaps.split(' ').collect());
 
-        let found = litmus_rc11::outcomes(program);
+        let found = outcomes(program);
         let found: BTreeSet<&str> = found.iter().map(String::as_str).collect();
 
         let forbidden: Vec<_> = found.difference(&allowed).collect();
@@ -90,31 +97,39 @@ fn check(reference: &str, part: usize) {
 }
 
 macro_rules! parts {
-    ($($name:ident: $reference:expr, $part:expr,)*) => {
+    ($($name:ident: $reference:expr, $part:expr, $outcomes:expr,)*) => {
         $(
             #[test]
             fn $name() {
-                check($reference, $part);
+                check($reference, $part, $outcomes);
             }
         )*
     };
 }
 
 parts! {
-    reference_part_0: REFERENCE, 0,
-    reference_part_1: REFERENCE, 1,
-    reference_part_2: REFERENCE, 2,
-    reference_part_3: REFERENCE, 3,
-    reference_part_4: REFERENCE, 4,
-    reference_part_5: REFERENCE, 5,
-    reference_part_6: REFERENCE, 6,
-    reference_part_7: REFERENCE, 7,
-    genmc_part_0: REFERENCE_GENMC, 0,
-    genmc_part_1: REFERENCE_GENMC, 1,
-    genmc_part_2: REFERENCE_GENMC, 2,
-    genmc_part_3: REFERENCE_GENMC, 3,
-    genmc_part_4: REFERENCE_GENMC, 4,
-    genmc_part_5: REFERENCE_GENMC, 5,
-    genmc_part_6: REFERENCE_GENMC, 6,
-    genmc_part_7: REFERENCE_GENMC, 7,
+    reference_part_0: REFERENCE, 0, litmus_rc11::outcomes,
+    reference_part_1: REFERENCE, 1, litmus_rc11::outcomes,
+    reference_part_2: REFERENCE, 2, litmus_rc11::outcomes,
+    reference_part_3: REFERENCE, 3, litmus_rc11::outcomes,
+    reference_part_4: REFERENCE, 4, litmus_rc11::outcomes,
+    reference_part_5: REFERENCE, 5, litmus_rc11::outcomes,
+    reference_part_6: REFERENCE, 6, litmus_rc11::outcomes,
+    reference_part_7: REFERENCE, 7, litmus_rc11::outcomes,
+    genmc_part_0: REFERENCE_GENMC, 0, litmus_rc11::outcomes,
+    genmc_part_1: REFERENCE_GENMC, 1, litmus_rc11::outcomes,
+    genmc_part_2: REFERENCE_GENMC, 2, litmus_rc11::outcomes,
+    genmc_part_3: REFERENCE_GENMC, 3, litmus_rc11::outcomes,
+    genmc_part_4: REFERENCE_GENMC, 4, litmus_rc11::outcomes,
+    genmc_part_5: REFERENCE_GENMC, 5, litmus_rc11::outcomes,
+    genmc_part_6: REFERENCE_GENMC, 6, litmus_rc11::outcomes,
+    genmc_part_7: REFERENCE_GENMC, 7, litmus_rc11::outcomes,
+    load_buffering_part_0: REFERENCE_LB, 0, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_1: REFERENCE_LB, 1, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_2: REFERENCE_LB, 2, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_3: REFERENCE_LB, 3, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_4: REFERENCE_LB, 4, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_5: REFERENCE_LB, 5, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_6: REFERENCE_LB, 6, litmus_rc11::outcomes_with_load_buffering,
+    load_buffering_part_7: REFERENCE_LB, 7, litmus_rc11::outcomes_with_load_buffering,
 }

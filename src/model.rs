@@ -1,5 +1,6 @@
 //! Model concurrent programs.
 
+use crate::rt::speculation::{self, LoadBuffering, Pass};
 use crate::rt::{self, Execution, Scheduler};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -175,6 +176,45 @@ pub struct Builder {
     /// variable to `0` turns it off.
     pub spurious_wakeups: bool,
 
+    /// Let a `Relaxed` load return a store that comes after it: "load
+    /// buffering", which the C++ standard allows, and hardware such as Arm
+    /// does, but loom's model of memory (RC11) does not. In
+    ///
+    /// ```text
+    /// thread 1: let a = x.load(Relaxed); y.store(1, Relaxed);
+    /// thread 2: let b = y.load(Relaxed); x.store(b, Relaxed);
+    /// ```
+    ///
+    /// `a` can be 1: thread 1's load reads thread 2's store, which copies
+    /// the value thread 1 stores after its load.
+    ///
+    /// Loom runs an execution one step after the other, so it guesses such
+    /// a value and checks the guess when the store is made. The model is
+    /// explored twice: the usual way, noting the values each atomic is
+    /// given, and then with `Relaxed` loads that may also return one of
+    /// those values, from a store to come. Executions in which the guess
+    /// does not come true are dropped; a panic while a guess is still open
+    /// is only reported once it has. This takes longer than twice as long,
+    /// and finds some of what load buffering allows, not all of it:
+    ///
+    /// - Only plain `Relaxed` loads guess, and only values that an atomic
+    ///   is given in an execution without guesses.
+    /// - Until its guess comes true, the loading thread may not access that
+    ///   atomic again, nor execute an acquire or `SeqCst` fence; an
+    ///   execution in which it does is dropped.
+    ///
+    /// What the model does outside of loom is not undone for an execution
+    /// that is dropped. A model that records values in a `std` collection
+    /// has to check [`is_settled`] first.
+    ///
+    /// Not used with several [`workers`](Builder::workers), a
+    /// [checkpoint file](Builder::checkpoint_file), or
+    /// [`check_with_input`](Builder::check_with_input).
+    ///
+    /// Defaults to `false`. Setting the `LOOM_LOAD_BUFFERING` environment
+    /// variable to `1` turns it on.
+    pub load_buffering: bool,
+
     /// Try every thread at every point where the preemption bound allows
     /// it, instead of only the ones that loom can tell make a difference.
     ///
@@ -236,6 +276,8 @@ impl Builder {
 
         let spurious_wakeups = env::var("LOOM_SPURIOUS_WAKEUPS").map_or(true, |v| v != "0");
 
+        let load_buffering = env::var("LOOM_LOAD_BUFFERING").map_or(false, |v| v == "1");
+
         let workers = env::var("LOOM_WORKERS")
             .map(|v| v.parse().expect("invalid value for `LOOM_WORKERS`"))
             .unwrap_or(1);
@@ -282,6 +324,7 @@ impl Builder {
             sleep_sets,
             wakeup_trees,
             spurious_wakeups,
+            load_buffering,
             exhaustive: false,
             workers,
         }
@@ -385,7 +428,7 @@ impl Builder {
     where
         F: Fn() + Sync + Send + 'static,
     {
-        if self.workers > 1 && self.checkpoint_file.is_none() {
+        if self.workers > 1 && self.checkpoint_file.is_none() && !self.load_buffering {
             return self.check_parallel(f);
         }
 
@@ -395,12 +438,19 @@ impl Builder {
         let mut execution = self.new_execution();
         let mut scheduler = Scheduler::new(self.max_threads);
 
+        if self.load_buffering {
+            execution.load_buffering = Some(Box::new(LoadBuffering::new()));
+        }
+
         // Identifies the model a checkpoint belongs to.
         let model = std::any::type_name::<F>();
 
+        // A checkpoint records where the search is, not which of the two
+        // passes of load buffering it is in.
         let checkpoint_file = self
             .checkpoint_file
             .as_ref()
+            .filter(|_| !self.load_buffering)
             .map(|path| checkpoint::file_for(path, model));
 
         if let Some(ref path) = checkpoint_file {
@@ -454,8 +504,28 @@ impl Builder {
             // execution, as the `Execution` will capture the current span when
             // it's reset.
             _span = tracing::info_span!(parent: None, "iter", message = i).entered();
-            if let Some(next) = execution.step() {
+            // What is known of load buffering carries over to the next
+            // execution, or to the second pass.
+            let load_buffering = execution.load_buffering.take();
+
+            if let Some(mut next) = execution.step() {
+                next.load_buffering = load_buffering.map(|mut load_buffering| {
+                    load_buffering.reset();
+                    load_buffering
+                });
                 execution = next;
+            } else if let Some(mut load_buffering) =
+                load_buffering.filter(|load_buffering| load_buffering.pass == Pass::Collect)
+            {
+                // Explore again, guessing values for loads from the ones
+                // noted (see `rt::speculation`).
+                info!(parent: None, "Exploring load buffering after {} iterations", i - 1);
+
+                load_buffering.pass = Pass::Guess;
+                load_buffering.reset();
+
+                execution = self.new_execution();
+                execution.load_buffering = Some(load_buffering);
             } else {
                 info!(parent: None, "Completed in {} iterations", i - 1);
                 return;
@@ -634,14 +704,41 @@ fn run_execution<F>(
         let panic_guard = PanicGuard;
 
         // execute the closure, note that `f()` may panic!
-        f();
+        speculation::run_thread(f);
 
         // if `f()` didn't panic, then we terminate the
         // main thread by dropping the guard ourselves.
         drop(panic_guard);
     });
 
+    if let Some(load_buffering) = &mut execution.load_buffering {
+        match load_buffering.outcome() {
+            // The execution does not exist: a guess did not come true.
+            None => return,
+            Some(Some(failure)) => std::panic::resume_unwind(failure),
+            Some(None) => {}
+        }
+    }
+
     execution.check_for_leaks();
+}
+
+/// Returns `false` while a load of the current execution has returned a
+/// value that no store has given it yet, which only happens with
+/// [`Builder::load_buffering`]. An execution that ends that way does not
+/// exist, and is dropped. A model that records what it sees outside of loom,
+/// in a `std` collection, say, has to leave out what it sees then.
+///
+/// Must be called from within a model.
+pub fn is_settled() -> bool {
+    rt::execution(|execution| {
+        execution
+            .load_buffering
+            .as_ref()
+            .map_or(true, |load_buffering| {
+                load_buffering.pending.is_empty() && !load_buffering.discarding
+            })
+    })
 }
 
 /// Run all concurrent permutations of the provided closure.
