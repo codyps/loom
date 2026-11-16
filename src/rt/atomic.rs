@@ -233,12 +233,10 @@ struct Store {
     /// Manages causality transfers between threads
     sync: Synchronize,
 
-    /// Tracks when each thread first saw value, or one of the stores this
-    /// one stands for (see `State::forget_slot`).
+    /// Tracks when each thread first saw value. A thread that saw one of
+    /// the stores this one stands for (see `State::forget_slot`) counts as
+    /// having seen this one, see `Store::is_seen_by_current`.
     first_seen: FirstSeen,
-
-    /// When each thread first saw this store itself.
-    own_seen: FirstSeen,
 
     /// The stores this one stands for, oldest first: who saw each of them,
     /// and the fences that a fence after a load of it has to come after.
@@ -457,6 +455,27 @@ fn product(from: &NodeSet, to: &NodeSet, edges: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// The `SeqCst` nodes of the stores of an atomic, by slot, with those of one
+/// store changed: as they would be after an operation that is being
+/// considered. The others are borrowed.
+struct Nodes<'a> {
+    stores: &'a [Store],
+    changed: Option<(usize, StoreNodes)>,
+}
+
+impl Nodes<'_> {
+    fn len(&self) -> usize {
+        self.stores.len()
+    }
+
+    fn get(&self, slot: usize) -> &StoreNodes {
+        match &self.changed {
+            Some((changed, nodes)) if *changed == slot => nodes,
+            _ => &self.stores[slot].sc,
+        }
+    }
+}
+
 /// A set of the stores of an atomic, by slot: one bit each.
 type StoreSet = u16;
 
@@ -612,7 +631,7 @@ fn fence_acq(execution: &mut Execution) {
     for state in execution.objects.iter_mut::<State>() {
         // Iterate all the stores
         for store in state.stores_mut() {
-            if !store.first_seen.is_seen_by_current(&execution.threads) {
+            if !store.is_seen_by_current(&execution.threads) {
                 continue;
             }
 
@@ -961,7 +980,7 @@ impl State {
             last_load_access: Default::default(),
             last_non_load_access: None,
             spuriously_failed: 0,
-            stores: (0..history).map(|_| Store::default()).collect(),
+            stores: Vec::with_capacity(history),
             mo_cache: MoCache::default(),
             cnt: 0,
         };
@@ -1013,7 +1032,6 @@ impl State {
         let store = &mut self.stores[index];
 
         store.first_seen.touch(threads);
-        store.own_seen.touch(threads);
         store.sync.sync_load(threads, ordering);
 
         let value = store.value;
@@ -1059,9 +1077,9 @@ impl State {
         let mut modification_order = happens_before;
 
         // Apply coherence rules
-        for i in 0..self.history {
+        for i in 0..self.stores.len() {
             // READ-WRITE coherence
-            if self.stores[i].first_seen.is_seen_by_current(threads) {
+            if self.stores[i].is_seen_by_current(threads) {
                 let mo = self.stores[i].modification_order;
                 modification_order.join(&mo);
             }
@@ -1076,13 +1094,13 @@ impl State {
         let mut first_seen = FirstSeen::new();
         first_seen.touch(threads);
 
-        // Track the store
-        self.stores[index] = Store {
+        // Track the store, in a slot of its own while there are fewer than
+        // `history`.
+        let store = Store {
             value,
             happens_before,
             modification_order,
             sync,
-            own_seen: first_seen.clone(),
             first_seen,
             stood_for_loads: Vec::new(),
             mo_preds: 0,
@@ -1094,6 +1112,12 @@ impl State {
             seq: self.cnt,
             stands_for: Vec::new(),
         };
+
+        if index == self.stores.len() {
+            self.stores.push(store);
+        } else {
+            self.stores[index] = store;
+        }
 
         self.note_store(threads, seq_cst, atomic, index, is_seq_cst(ordering), node);
     }
@@ -1224,7 +1248,7 @@ impl State {
             }
 
             // READ-READ coherence
-            let seen = self.stores[i].first_seen.is_seen_by_current(threads);
+            let seen = self.stores[i].is_seen_by_current(threads);
 
             // WRITE-READ coherence
             let happens_before = self.stores[i].happens_before < threads.active().causality;
@@ -1334,7 +1358,7 @@ impl State {
                 store.sc.stood_for.insert(node);
             }
 
-            if store.own_seen.is_seen_by_current(threads) {
+            if store.first_seen.is_seen_by_current(threads) {
                 store.sc.load_fences_after.insert(node);
             } else if let Some(stood_for) = store
                 .stood_for_loads
@@ -1361,13 +1385,15 @@ impl State {
 
     /// The edges of the order of `SeqCst` operations that follow from the
     /// modification order `before` and the given per-store nodes.
-    fn seq_cst_edges(before: &MoOrder, nodes: &[StoreNodes]) -> Vec<(usize, usize)> {
+    fn seq_cst_edges(before: &MoOrder, nodes: &Nodes<'_>) -> Vec<(usize, usize)> {
         let mut edges = Vec::new();
 
-        for (later, later_nodes) in nodes.iter().enumerate() {
+        for later in 0..nodes.len() {
+            let later_nodes = nodes.get(later);
+
             for earlier in slots(before[later]) {
                 if earlier < nodes.len() {
-                    StoreNodes::edges(&nodes[earlier], later_nodes, &mut edges);
+                    StoreNodes::edges(nodes.get(earlier), later_nodes, &mut edges);
                 }
             }
 
@@ -1385,13 +1411,17 @@ impl State {
         edges
     }
 
-    fn store_nodes(&self) -> Vec<StoreNodes> {
-        let cnt = cmp::min(self.cnt as usize, self.history);
-
-        self.stores[..cnt]
-            .iter()
-            .map(|store| store.sc.clone())
-            .collect()
+    /// The `SeqCst` nodes of the stores, with those of the store in `slot`
+    /// as `changed` makes them, if there is one.
+    fn nodes(&self, changed: Option<(usize, &dyn Fn(&mut StoreNodes))>) -> Nodes<'_> {
+        Nodes {
+            stores: &self.stores,
+            changed: changed.map(|(slot, change)| {
+                let mut nodes = self.stores[slot].sc.clone();
+                change(&mut nodes);
+                (slot, nodes)
+            }),
+        }
     }
 
     /// Makes the order of `SeqCst` operations reflect the current state of
@@ -1403,7 +1433,7 @@ impl State {
 
         let before = self.mo_before();
 
-        for (from, to) in Self::seq_cst_edges(&before, &self.store_nodes()) {
+        for (from, to) in Self::seq_cst_edges(&before, &self.nodes(None)) {
             let added = seq_cst.add_edge(from, to);
 
             // Loads only return stores for which this works out, and nothing
@@ -1460,13 +1490,13 @@ impl State {
         let fences = seq_cst.fences_before(thread, &causality);
 
         // The load ...
-        let mut nodes = self.store_nodes();
+        let nodes = self.nodes(Some((index, &|nodes: &mut StoreNodes| {
+            nodes.load_fences_before.union_with(&fences);
 
-        nodes[index].load_fences_before.union_with(&fences);
-
-        if is_seq_cst {
-            nodes[index].loads.insert(seq_cst.len());
-        }
+            if is_seq_cst {
+                nodes.loads.insert(seq_cst.len());
+            }
+        })));
 
         let preds = self.coherence_preds(threads, index, mo_before);
         let before = self.mo_before_with(index, preds);
@@ -1499,16 +1529,16 @@ impl State {
         written.forgotten = self.forgotten.clone();
 
         if let Some(reused) = reused {
-            written.forgotten.add(&nodes[reused]);
+            written.forgotten.add(nodes.get(reused));
         }
 
         written.forgotten.edges(&written, &mut edges);
 
         for slot in (0..cnt).filter(|&slot| Some(slot) != reused) {
             if slot == index || before[index] & (1 << slot) != 0 {
-                StoreNodes::edges(&nodes[slot], &written, &mut edges);
+                StoreNodes::edges(nodes.get(slot), &written, &mut edges);
             } else if before[slot] & (1 << index) != 0 {
-                StoreNodes::edges(&written, &nodes[slot], &mut edges);
+                StoreNodes::edges(&written, nodes.get(slot), &mut edges);
             }
         }
 
@@ -1547,15 +1577,14 @@ impl State {
         let elsewhere = threads.active().elsewhere(atomic);
         let candidate = Self::candidate(threads, atomic, &causality, &elsewhere);
 
-        let mut nodes = self.store_nodes();
+        let fences = seq_cst.fences_before(thread, &causality);
+        let nodes = self.nodes(Some((index, &|nodes: &mut StoreNodes| {
+            nodes.load_fences_before.union_with(&fences);
 
-        nodes[index]
-            .load_fences_before
-            .union_with(&seq_cst.fences_before(thread, &causality));
-
-        if is_seq_cst {
-            nodes[index].loads.insert(seq_cst.len());
-        }
+            if is_seq_cst {
+                nodes.loads.insert(seq_cst.len());
+            }
+        })));
 
         let preds = self.coherence_preds(threads, index, mo_before);
         let before = self.mo_before_with(index, preds);
@@ -1592,7 +1621,7 @@ impl State {
         // one's place in the order, counts as seen by the threads that have
         // seen this one, and as this one in the order of `SeqCst`
         // operations.
-        let follower = (0..self.history)
+        let follower = (0..self.stores.len())
             .find(|&other| other != slot && self.stores[other].rmw_of == Some(slot as u8));
 
         if let Some(follower) = follower {
@@ -1608,7 +1637,7 @@ impl State {
             // that are kept, and remembered for the ones to come.
             let mut edges = Vec::new();
 
-            for other in (0..self.history).filter(|&other| other != slot) {
+            for other in (0..self.stores.len()).filter(|&other| other != slot) {
                 StoreNodes::edges(&self.stores[slot].sc, &self.stores[other].sc, &mut edges);
             }
 
@@ -1624,12 +1653,12 @@ impl State {
 
             // The stores that are kept come after it as well, and so does
             // what is yet to count as them: a fence after one of them, say.
-            for other in (0..self.history).filter(|&other| other != slot) {
+            for other in (0..self.stores.len()).filter(|&other| other != slot) {
                 self.stores[other].sc.forgotten.add(&forgotten);
             }
         }
 
-        for store in &mut self.stores[..self.history] {
+        for store in &mut self.stores {
             store.mo_preds &= mask;
 
             if store.rmw_of == Some(slot as u8) {
@@ -1661,7 +1690,6 @@ impl State {
         self.apply_load_coherence(threads, index);
 
         self.stores[index].first_seen.touch(threads);
-        self.stores[index].own_seen.touch(threads);
 
         let prev = self.stores[index].value;
 
@@ -1960,12 +1988,12 @@ impl State {
                 }
 
                 if before[j] & (1 << i) != 0 {
-                    if store_j.first_seen.is_seen_by_current(threads) {
+                    if store_j.is_seen_by_current(threads) {
                         // Store `j` is newer, so don't store the current one.
                         continue 'outer;
                     }
 
-                    if store_i.first_seen.is_seen_before_yield(threads) {
+                    if store_i.is_seen_before_yield(threads) {
                         // Saw this load before the previous yield. In order to
                         // advance the model, don't return it again.
                         continue 'outer;
@@ -2045,12 +2073,12 @@ impl State {
                 }
 
                 if before[j] & (1 << i) != 0 {
-                    if store_j.first_seen.is_seen_by_current(threads) {
+                    if store_j.is_seen_by_current(threads) {
                         // Store `j` is newer, and known to the thread.
                         continue 'outer;
                     }
 
-                    if store_i.first_seen.is_seen_before_yield(threads) {
+                    if store_i.is_seen_before_yield(threads) {
                         // Saw this store before the previous yield. In order
                         // to advance the model, don't return it again.
                         continue 'outer;
@@ -2198,26 +2226,27 @@ fn slots(set: StoreSet) -> impl Iterator<Item = usize> {
 
 // ===== impl Store =====
 
-impl Default for Store {
-    fn default() -> Store {
-        Store {
-            value: 0,
-            happens_before: VersionVec::new(),
-            modification_order: VersionVec::new(),
-            sync: Synchronize::new(),
-            first_seen: FirstSeen::new(),
-            own_seen: FirstSeen::new(),
-            stood_for_loads: Vec::new(),
-            mo_preds: 0,
-            sc: StoreNodes::default(),
-            rmw_of: None,
-            seq: 0,
-            stands_for: Vec::new(),
-        }
-    }
-}
-
 impl Store {
+    /// Returns `true` if the current thread's causality includes a thread
+    /// having seen this store, or one of the stores it stands for.
+    fn is_seen_by_current(&self, threads: &thread::Set) -> bool {
+        self.first_seen.is_seen_by_current(threads)
+            || self
+                .stood_for_loads
+                .iter()
+                .any(|stood_for| stood_for.seen.is_seen_by_current(threads))
+    }
+
+    /// Returns `true` if the current thread saw this store, or one of the
+    /// stores it stands for, before it last yielded.
+    fn is_seen_before_yield(&self, threads: &thread::Set) -> bool {
+        self.first_seen.is_seen_before_yield(threads)
+            || self
+                .stood_for_loads
+                .iter()
+                .any(|stood_for| stood_for.seen.is_seen_before_yield(threads))
+    }
+
     /// Where the store is in the modification order as far as its version
     /// goes, the threads that have seen it, and what counts as the store in
     /// the order of `SeqCst` operations.
@@ -2230,13 +2259,12 @@ impl Store {
 
         let mut stood_for_loads = self.stood_for_loads.clone();
         stood_for_loads.push(StoodForLoads {
-            seen: self.own_seen.clone(),
+            seen: self.first_seen.clone(),
             fences,
         });
 
         Position {
             modification_order: self.modification_order,
-            first_seen: self.first_seen.clone(),
             sc: self.sc.clone(),
             stands_for,
             stood_for_loads,
@@ -2247,7 +2275,6 @@ impl Store {
     /// is being forgotten.
     fn take_position(&mut self, position: Position) {
         self.modification_order = position.modification_order;
-        self.first_seen.merge(&position.first_seen);
         self.sc.absorb(&position.sc);
         self.stands_for.extend(position.stands_for);
 
@@ -2262,7 +2289,6 @@ impl Store {
 /// What a store hands to the one that stands for it once it is forgotten.
 struct Position {
     modification_order: VersionVec,
-    first_seen: FirstSeen,
     sc: StoreNodes,
 
     /// What the threads that made the store, and the ones it stood for
@@ -2279,13 +2305,6 @@ struct Position {
 impl FirstSeen {
     fn new() -> FirstSeen {
         FirstSeen([u16::MAX; MAX_THREADS])
-    }
-
-    /// Adds what `other` has been seen by.
-    fn merge(&mut self, other: &FirstSeen) {
-        for (seen, other) in self.0.iter_mut().zip(&other.0) {
-            *seen = cmp::min(*seen, *other);
-        }
     }
 
     fn touch(&mut self, threads: &thread::Set) {
@@ -2323,4 +2342,21 @@ impl FirstSeen {
 
 fn is_seq_cst(order: Ordering) -> bool {
     order == Ordering::SeqCst
+}
+
+#[cfg(test)]
+mod tmp_sizes {
+    #[test]
+    fn sizes() {
+        eprintln!(
+            "SIZES Store={} StoreNodes={} NodeSet={} FirstSeen={} VersionVec={} Forgotten={} State={}",
+            std::mem::size_of::<super::Store>(),
+            std::mem::size_of::<super::StoreNodes>(),
+            std::mem::size_of::<super::NodeSet>(),
+            std::mem::size_of::<super::FirstSeen>(),
+            std::mem::size_of::<super::VersionVec>(),
+            std::mem::size_of::<super::Forgotten>(),
+            std::mem::size_of::<super::State>(),
+        );
+    }
 }

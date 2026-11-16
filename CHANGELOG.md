@@ -387,7 +387,11 @@ Counts below are without a preemption bound.
    for empty bits, and the modification order is computed once per change
    instead of once per question. An execution of four threads doing three
    `fetch_add` each goes from 47 to 19 microseconds (372,939 executions:
-   17.7 s to 7.3 s).
+   17.7 s to 7.3 s). Later, a check of whether a load or read-modify-write
+   is consistent with that order stopped copying the `SeqCst` nodes of
+   every store of the atomic, and an atomic stopped setting up room for
+   every store it may keep before it has any: the litmus corpus runs about
+   5% fewer instructions.
 
 ### Documented
 
