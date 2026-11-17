@@ -644,6 +644,14 @@ impl Builder {
             crate::MAX_THREADS
         );
 
+        // Checked here, outside of the model: in the model, the panic would
+        // need room on a thread's small stack to capture a backtrace.
+        assert!(
+            (1..=crate::rt::MAX_ATOMIC_HISTORY).contains(&self.atomic_history),
+            "the number of stores kept per atomic has to be between 1 and {}",
+            crate::rt::MAX_ATOMIC_HISTORY
+        );
+
         let mut execution = Execution::new(
             self.max_threads,
             self.max_branches,
