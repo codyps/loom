@@ -113,9 +113,9 @@ pub(super) struct State {
     /// access to the cell.
     is_mutating: bool,
 
-    /// Last time each thread loaded from the atomic since the last store or
-    /// rmw operation. Together with `last_non_load_access`, this tracks the
-    /// dependent accesses for the DPOR algorithm.
+    /// Last time each thread loaded from the atomic since the last rmw
+    /// operation. Together with `last_store_access` and `last_rmw_access`,
+    /// this tracks the dependent accesses for the DPOR algorithm.
     ///
     /// Loads are independent of each other, so the most recent one says
     /// nothing about the ones before it: a store races with the last load of
@@ -125,10 +125,20 @@ pub(super) struct State {
     /// is then never explored.
     last_load_access: [Option<Access>; MAX_THREADS],
 
-    /// Last time the atomic was accessed for a store or rmw operation. Every
-    /// access before it is ordered before it, so nothing older needs to be
+    /// Last time each thread stored to the atomic, other than with an rmw
+    /// operation, since the last rmw operation.
+    ///
+    /// Stores are independent of each other, like loads: the order of two
+    /// stores that are not ordered by happens-before is not decided by the
+    /// order in which they are executed, but later, by what loads see. So a
+    /// load races with the last store of every thread, as a store does with
+    /// the last load of every thread.
+    last_store_access: [Option<Access>; MAX_THREADS],
+
+    /// Last time the atomic was accessed for an rmw operation. Every access
+    /// before it is ordered before it, so nothing older needs to be
     /// remembered.
-    last_non_load_access: Option<Access>,
+    last_rmw_access: Option<Access>,
 
     /// The threads (as a bit set) for which a weak compare-exchange on this
     /// atomic has failed spuriously.
@@ -209,6 +219,11 @@ impl Action {
 
     pub(super) fn is_load(self) -> bool {
         matches!(self, Action::Load | Action::LoadSeqCst)
+    }
+
+    /// Returns `true` for a store that is not part of a read-modify-write.
+    pub(super) fn is_store(self) -> bool {
+        matches!(self, Action::Store | Action::StoreSeqCst)
     }
 
     /// Returns `true` if the access takes part in the `SeqCst` order.
@@ -1268,7 +1283,8 @@ impl State {
             unsync_mut_locations: LocationSet::new(),
             is_mutating: false,
             last_load_access: Default::default(),
-            last_non_load_access: None,
+            last_store_access: Default::default(),
+            last_rmw_access: None,
             spuriously_failed: 0,
             stores: Vec::with_capacity(history),
             mo_cache: MoCache::default(),
@@ -2565,22 +2581,31 @@ impl State {
     /// Returns the previous accesses that an access of kind `action` is
     /// dependent with.
     pub(super) fn dependent_accesses(&self, action: Action) -> impl Iterator<Item = &Access> {
-        // Everything is dependent with the last store / rmw. Only stores and
-        // rmws are dependent with loads.
+        // Everything is dependent with the last rmw. Loads are dependent with
+        // stores and the other way around, but loads are not dependent with
+        // each other, nor stores with each other.
         //
-        // That goes for `SeqCst` loads as well. Which stores two of them can
-        // return is restricted by the order of `SeqCst` operations, but that
-        // order is not the order in which loom executes them, so executing
-        // them the other way around allows nothing new.
+        // That goes for `SeqCst` accesses as well. Which stores two loads can
+        // return is restricted by the order of `SeqCst` operations, and so is
+        // the order of two stores, but that order is not the order in which
+        // loom executes them, so executing them the other way around allows
+        // nothing new.
         let loads = if action.is_load() {
             &[][..]
         } else {
             &self.last_load_access[..]
         };
 
-        self.last_non_load_access
+        let stores = if action.is_store() {
+            &[][..]
+        } else {
+            &self.last_store_access[..]
+        };
+
+        self.last_rmw_access
             .iter()
             .chain(loads.iter().flatten())
+            .chain(stores.iter().flatten())
     }
 
     /// Records an access by `thread`.
@@ -2593,11 +2618,14 @@ impl State {
     ) {
         if action.is_load() {
             Access::set_or_create(&mut self.last_load_access[thread], path_id, version);
+        } else if action.is_store() {
+            Access::set_or_create(&mut self.last_store_access[thread], path_id, version);
         } else {
-            // Stores / RMWs. These are ordered after all earlier loads,
+            // RMWs. These are ordered after all earlier loads and stores,
             // which therefore no longer need to be tracked.
-            Access::set_or_create(&mut self.last_non_load_access, path_id, version);
+            Access::set_or_create(&mut self.last_rmw_access, path_id, version);
             self.last_load_access = Default::default();
+            self.last_store_access = Default::default();
         }
     }
 }

@@ -430,6 +430,14 @@ Counts below are without a preemption bound.
    every store of the atomic, and an atomic stopped setting up room for
    every store it may keep before it has any: the litmus corpus runs about
    5% fewer instructions.
+ - Stores to one atomic, other than read-modify-writes, are independent of
+   each other. Which of two stores comes first in the atomic is not decided
+   by the order in which they are executed, but by happens-before and,
+   later, by what loads see: executing them the other way around allows
+   nothing new. A load is still dependent with every thread's last store,
+   and a store with every thread's last load. Three threads storing to one
+   atomic that nothing reads take one execution instead of six; the litmus
+   corpus gives the same outcomes in a little less time.
 
 ### Documented
 

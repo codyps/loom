@@ -142,8 +142,10 @@ fn operations_after_join_are_ordered() {
     assert_eq!(count, 1);
 }
 
-/// Three stores to one atomic can be ordered six ways. The search may repeat
-/// itself a little on the way, but not by much.
+/// Three stores to one atomic, which nothing reads: the order in which they
+/// are executed does not decide their order in the atomic (loads do, later),
+/// so one execution is enough. See `final_value_of_shared_stores` for what
+/// a load after them can return.
 #[test]
 fn stores_to_a_shared_atomic() {
     let count = executions(|| {
@@ -161,7 +163,35 @@ fn stores_to_a_shared_atomic() {
         }
     });
 
-    assert!((6..=8).contains(&count), "{}", count);
+    assert_eq!(count, 1);
+}
+
+/// Each of three unrelated stores can be the last one, whichever order they
+/// are executed in.
+#[test]
+fn final_value_of_shared_stores() {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let recorded = seen.clone();
+
+    loom::model(move || {
+        let x = std::sync::Arc::new(AtomicUsize::new(9));
+
+        let handles: Vec<_> = (0..3)
+            .map(|i| {
+                let x = x.clone();
+                thread::spawn(move || x.store(i, SeqCst))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        recorded.lock().unwrap().insert(x.load(SeqCst));
+    });
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen, [0, 1, 2].into());
 }
 
 /// Three threads taking a lock twice each: 6! / (2! 2! 2!) = 90 orders.
@@ -265,7 +295,7 @@ fn stores_through_shared_arc_handles() {
         }
     });
 
-    assert!((6..=8).contains(&count), "{}", count);
+    assert_eq!(count, 1);
 }
 
 /// With a preemption bound there is less to conclude from what has been

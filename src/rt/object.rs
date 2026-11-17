@@ -407,8 +407,9 @@ impl Store {
                 let (a, b): (rt::atomic::Action, rt::atomic::Action) =
                     (a.action.into(), b.action.into());
 
-                // Loads do not affect each other.
-                !(a.is_load() && b.is_load())
+                // Loads do not affect each other, and neither do stores (see
+                // `rt::atomic::State::dependent_accesses`).
+                !(a.is_load() && b.is_load()) && !(a.is_store() && b.is_store())
             }
             Entry::Arc(entry) => entry.dependent(a.action.into(), b.action.into()),
             Entry::Channel(entry) => entry.dependent(a.action.into(), b.action.into()),
