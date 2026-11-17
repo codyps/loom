@@ -438,6 +438,19 @@ Counts below are without a preemption bound.
    and a store with every thread's last load. Three threads storing to one
    atomic that nothing reads take one execution instead of six; the litmus
    corpus gives the same outcomes in a little less time.
+ - `SeqCst` fences are dependent with each other, and no longer with every
+   `SeqCst` load, store and read-modify-write of every atomic. What a fence
+   means for those follows from happens-before and the modification order,
+   not from when they are executed: with the fence first, the access is
+   checked against what the fence adds to the order of `SeqCst`
+   operations; with the access first, the fence adds the same when it is
+   executed, and an access that contradicted it would close a cycle, which
+   cannot happen (and is checked in a debug build). The litmus corpus gives
+   the same outcomes, also checked with debug assertions on every program,
+   in about two thirds of the time. A model with a fence in every read
+   section, such as an RCU, gains the most: one of `local-rcu`'s loom
+   tests went from over 15 million executions to 391,663, others from
+   143,881 to 7,932 and from 112,011 to 7,099.
 
 ### Documented
 

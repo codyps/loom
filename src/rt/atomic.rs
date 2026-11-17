@@ -225,14 +225,6 @@ impl Action {
     pub(super) fn is_store(self) -> bool {
         matches!(self, Action::Store | Action::StoreSeqCst)
     }
-
-    /// Returns `true` if the access takes part in the `SeqCst` order.
-    pub(super) fn is_seq_cst(self) -> bool {
-        matches!(
-            self,
-            Action::LoadSeqCst | Action::StoreSeqCst | Action::RmwSeqCst
-        )
-    }
 }
 
 #[derive(Debug)]
@@ -558,13 +550,17 @@ struct FirstSeen([u16; MAX_THREADS]);
 #[derive(Debug)]
 pub(super) struct SeqCstFences {
     /// The last `SeqCst` fence.
+    ///
+    /// Fences are dependent with each other: a fence knows of everything the
+    /// fences before it did. They are not dependent with `SeqCst` loads,
+    /// stores and rmws. What a fence means for those (`SeqCst` order edges,
+    /// see `State::note_fence`) follows from happens-before and the
+    /// modification order, not from when the two are executed: with the
+    /// fence first, the access is checked against what the fence adds; with
+    /// the access first, the fence adds the same once it is executed, and an
+    /// access that contradicted it would close a cycle, which `commit` rules
+    /// out. Either order allows the same.
     last_access: Option<Access>,
-
-    /// The last `SeqCst` load, store or rmw of each thread, on any atomic.
-    /// A fence is ordered with respect to those as well: it sees the `SeqCst`
-    /// stores before it, and what its thread knows constrains the `SeqCst`
-    /// loads and stores after it.
-    last_sc_access: [Option<Access>; MAX_THREADS],
 }
 
 impl SeqCstFences {
@@ -572,44 +568,21 @@ impl SeqCstFences {
     /// the first operation that takes part in the `SeqCst` order.
     fn get(execution: &mut Execution) -> object::Ref<SeqCstFences> {
         execution.objects.seq_cst_fences().unwrap_or_else(|| {
-            let fences = execution.objects.insert(SeqCstFences {
-                last_access: None,
-                last_sc_access: Default::default(),
-            });
+            let fences = execution.objects.insert(SeqCstFences { last_access: None });
 
             execution.objects.set_seq_cst_fences(fences);
             fences
         })
     }
 
-    /// The previous accesses a fence is dependent with.
+    /// The previous accesses a fence is dependent with: the last fence.
     pub(super) fn dependent_accesses(&self) -> impl Iterator<Item = &Access> {
-        self.last_access
-            .iter()
-            .chain(self.last_sc_access.iter().flatten())
-    }
-
-    /// The last fence, which `SeqCst` accesses are dependent with.
-    pub(super) fn last_fence_access(&self) -> Option<&Access> {
-        self.last_access.as_ref()
+        self.last_access.iter()
     }
 
     /// Records a fence.
     pub(super) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
         Access::set_or_create(&mut self.last_access, path_id, version);
-
-        // The fence is ordered after all of these.
-        self.last_sc_access = Default::default();
-    }
-
-    /// Records a `SeqCst` access to some atomic.
-    pub(super) fn set_last_sc_access(
-        &mut self,
-        thread: usize,
-        path_id: usize,
-        version: &VersionVec,
-    ) {
-        Access::set_or_create(&mut self.last_sc_access[thread], path_id, version);
     }
 }
 
@@ -1234,11 +1207,6 @@ impl<T: Numeric> Atomic<T> {
     }
 
     fn branch(&self, action: Action, location: Location) {
-        if action.is_seq_cst() {
-            // The access is ordered with respect to `SeqCst` fences.
-            rt::execution(SeqCstFences::get);
-        }
-
         let r = self.state;
         r.branch_action(action, location);
         assert!(

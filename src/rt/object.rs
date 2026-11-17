@@ -299,13 +299,6 @@ impl Store {
         self.seq_cst_fences = Some(fences.index);
     }
 
-    fn seq_cst_fences_entry(&self) -> Option<&rt::atomic::SeqCstFences> {
-        match self.entries.get(self.seq_cst_fences?) {
-            Some(Entry::SeqCstFences(fences)) => Some(fences),
-            _ => None,
-        }
-    }
-
     /// Calls `f` with every previous access that `operation` is dependent
     /// with and that could still be unordered with respect to it.
     ///
@@ -326,17 +319,6 @@ impl Store {
         let last = match &self.entries[operation.obj.index] {
             Entry::Atomic(entry) => {
                 let action: rt::atomic::Action = operation.action.into();
-
-                // A `SeqCst` access is also ordered with `SeqCst` fences.
-                if action.is_seq_cst() {
-                    let fence = self
-                        .seq_cst_fences_entry()
-                        .and_then(|fences| fences.last_fence_access());
-
-                    if let Some(access) = fence {
-                        f(access);
-                    }
-                }
 
                 entry.dependent_accesses(action).for_each(f);
                 return;
@@ -395,9 +377,6 @@ impl Store {
                 // Waiting on a condition variable releases and reacquires a
                 // mutex.
                 (Entry::Condvar(_), Entry::Mutex(_)) | (Entry::Mutex(_), Entry::Condvar(_)) => true,
-                // A `SeqCst` fence concerns every atomic.
-                (Entry::SeqCstFences(_), Entry::Atomic(_))
-                | (Entry::Atomic(_), Entry::SeqCstFences(_)) => true,
                 _ => false,
             };
         }
@@ -449,19 +428,6 @@ impl Store {
         path_id: usize,
         dpor_vv: &VersionVec,
     ) {
-        if let Entry::Atomic(_) = &self.entries[operation.obj.index] {
-            let action: rt::atomic::Action = operation.action.into();
-
-            if action.is_seq_cst() {
-                if let Some(Entry::SeqCstFences(fences)) = self
-                    .seq_cst_fences
-                    .and_then(|index| self.entries.get_mut(index))
-                {
-                    fences.set_last_sc_access(thread, path_id, dpor_vv);
-                }
-            }
-        }
-
         match &mut self.entries[operation.obj.index] {
             Entry::Arc(entry) => {
                 entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
