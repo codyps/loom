@@ -94,10 +94,6 @@ pub(crate) struct Set {
     /// `None` signifies that no thread is runnable.
     active: Option<usize>,
 
-    /// Sequential consistency causality. All sequentially consistent operations
-    /// synchronize with this causality.
-    pub seq_cst_causality: VersionVec,
-
     /// `tracing` span used as the parent for new thread spans.
     iteration_span: tracing::Span,
 }
@@ -297,7 +293,6 @@ impl Set {
             execution_id,
             threads,
             active: Some(0),
-            seq_cst_causality: VersionVec::new(),
             iteration_span,
         }
     }
@@ -450,14 +445,6 @@ impl Set {
     /// `rt::atomic`; locks need no more than acquire / release.
     pub(crate) fn seq_cst(&mut self) {}
 
-    pub(crate) fn seq_cst_fence(&mut self) {
-        self.threads[self.active.unwrap()]
-            .causality
-            .join(&self.seq_cst_causality);
-        self.seq_cst_causality
-            .join(&self.threads[self.active.unwrap()].causality);
-    }
-
     pub(crate) fn clear(&mut self, execution_id: execution::Id) {
         self.iteration_span = tracing::Span::current();
         self.threads.clear();
@@ -466,7 +453,6 @@ impl Set {
 
         self.execution_id = execution_id;
         self.active = Some(0);
-        self.seq_cst_causality = VersionVec::new();
     }
 
     pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (Id, &Thread)> + '_ {

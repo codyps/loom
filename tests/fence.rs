@@ -363,3 +363,59 @@ fn fences_around_forgotten_stores() {
 
     assert_eq!(swap_results(7, model), (0..=7).collect());
 }
+
+/// Two `SeqCst` fences linked only through `Relaxed` accesses do not order
+/// what comes before the first one before what comes after the second one.
+/// Here a third thread relays a flag from the writer to the reader, so the
+/// reader's fence always runs after the writer's; still, nothing makes the
+/// write happen before the read, and the two race. Loom used to make every
+/// fence know of everything before the fences executed before it, and so
+/// never reported this race.
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn seq_cst_fences_do_not_synchronize_by_themselves() {
+    use loom::sync::atomic::AtomicUsize;
+
+    struct Shared {
+        data: UnsafeCell<usize>,
+        x: AtomicUsize,
+        y: AtomicUsize,
+    }
+
+    // Accesses to `data` are what loom checks here.
+    unsafe impl Sync for Shared {}
+
+    loom::model(|| {
+        let shared = Arc::new(Shared {
+            data: UnsafeCell::new(0),
+            x: AtomicUsize::new(0),
+            y: AtomicUsize::new(0),
+        });
+
+        let writer = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                shared.data.with_mut(|ptr| unsafe { *ptr = 1 });
+                fence(SeqCst);
+                shared.x.store(1, Relaxed);
+            })
+        };
+
+        let relay = {
+            let shared = shared.clone();
+            thread::spawn(move || {
+                if shared.x.load(Relaxed) == 1 {
+                    shared.y.store(1, Relaxed);
+                }
+            })
+        };
+
+        if shared.y.load(Relaxed) == 1 {
+            fence(SeqCst);
+            shared.data.with(|ptr| unsafe { *ptr });
+        }
+
+        writer.join().unwrap();
+        relay.join().unwrap();
+    });
+}

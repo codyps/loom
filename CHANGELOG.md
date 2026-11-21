@@ -142,6 +142,17 @@ and release, and on the lowest allowed direct dependency versions.
 
 ### Fixed
 
+ - `SeqCst` fences made what came before one fence happen before what came
+   after any fence executed later, in loom's order of execution. C++ does
+   not: two `SeqCst` fences are ordered in the order of `SeqCst`
+   operations, which restricts what loads around them can return, and is
+   not happens-before. A data race between threads whose fences were
+   linked only through `Relaxed` accesses (a third thread relaying a flag,
+   say) was never reported, in any execution. The order of `SeqCst`
+   operations already restricts loads as C++ requires, so the fence no
+   longer passes on causality; it stays an acquire and release fence. The
+   litmus corpus gives the same outcomes, with debug assertions on every
+   program, and a test covers the race (upstream loom has the same issue).
  - `SeqCst` fences and stores that are not kept anymore: an internal error
    ("SeqCst order is cyclic") in a debug build, as soon as an atomic had
    one store more than loom keeps and `SeqCst` fences were involved: a

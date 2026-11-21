@@ -656,10 +656,17 @@ fn fence_acqrel(execution: &mut Execution) {
 }
 
 fn fence_seqcst(execution: &mut Execution) {
+    // A `SeqCst` fence is an acquire and a release fence ...
     fence_acqrel(execution);
-    execution.threads.seq_cst_fence();
 
-    // The fence takes its place in the order of `SeqCst` operations.
+    // ... and takes its place in the order of `SeqCst` operations, which is
+    // what restricts the loads around it. It does not make what comes
+    // before one fence happen before what comes after another: two fences
+    // that happen to be executed one after the other are ordered in the
+    // order of `SeqCst` operations, at most, and that order is not
+    // happens-before. (Loom used to join every fence's causality into the
+    // next one's, which hid data races between threads whose fences were
+    // linked by nothing but `Relaxed` accesses.)
     let thread = execution.threads.active_id().as_usize();
     let causality = execution.threads.active().causality;
     let elsewhere = execution.threads.active().elsewhere(NO_LOCATION);
