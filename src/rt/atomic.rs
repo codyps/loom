@@ -540,49 +540,34 @@ impl MoCache {
 #[derive(Debug, Clone)]
 struct FirstSeen([u16; MAX_THREADS]);
 
-/// The order of `SeqCst` fences.
+/// What `SeqCst` fences are, to the scheduler: a point before each one at
+/// which another thread may run. There is one per execution, created by the
+/// first `SeqCst` fence.
 ///
-/// `SeqCst` fences are totally ordered, and that order is observable: a fence
-/// sees what the fences before it published, and not what the ones after it
-/// did. This object exists so that fences are operations the scheduler knows
-/// to be dependent on one another, and explores in both orders. There is one
-/// per execution, created by the first `SeqCst` fence.
+/// Fences are not dependent with anything, each other included. What a
+/// fence means (edges of the order of `SeqCst` operations, see
+/// `State::note_fence` and `SeqCst::predecessors`) follows from
+/// happens-before and the modification order, not from when it is executed
+/// relative to other fences and `SeqCst` accesses: executed the other way
+/// around, the later of two operations is checked against what the earlier
+/// one adds, and with the order as it was, the earlier one is checked once
+/// the later one adds it; a choice that contradicted it would close a
+/// cycle, which `commit` rules out. Either order allows the same. (A fence
+/// used to make every later fence know of everything before it, and the
+/// order of fences mattered then.)
 #[derive(Debug)]
-pub(super) struct SeqCstFences {
-    /// The last `SeqCst` fence.
-    ///
-    /// Fences are dependent with each other: a fence knows of everything the
-    /// fences before it did. They are not dependent with `SeqCst` loads,
-    /// stores and rmws. What a fence means for those (`SeqCst` order edges,
-    /// see `State::note_fence`) follows from happens-before and the
-    /// modification order, not from when the two are executed: with the
-    /// fence first, the access is checked against what the fence adds; with
-    /// the access first, the fence adds the same once it is executed, and an
-    /// access that contradicted it would close a cycle, which `commit` rules
-    /// out. Either order allows the same.
-    last_access: Option<Access>,
-}
+pub(super) struct SeqCstFences;
 
 impl SeqCstFences {
     /// Returns the object for the current execution, creating it if this is
-    /// the first operation that takes part in the `SeqCst` order.
+    /// the first `SeqCst` fence.
     fn get(execution: &mut Execution) -> object::Ref<SeqCstFences> {
         execution.objects.seq_cst_fences().unwrap_or_else(|| {
-            let fences = execution.objects.insert(SeqCstFences { last_access: None });
+            let fences = execution.objects.insert(SeqCstFences);
 
             execution.objects.set_seq_cst_fences(fences);
             fences
         })
-    }
-
-    /// The previous accesses a fence is dependent with: the last fence.
-    pub(super) fn dependent_accesses(&self) -> impl Iterator<Item = &Access> {
-        self.last_access.iter()
-    }
-
-    /// Records a fence.
-    pub(super) fn set_last_access(&mut self, path_id: usize, version: &VersionVec) {
-        Access::set_or_create(&mut self.last_access, path_id, version);
     }
 }
 

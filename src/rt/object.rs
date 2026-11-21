@@ -323,10 +323,9 @@ impl Store {
                 entry.dependent_accesses(action).for_each(f);
                 return;
             }
-            Entry::SeqCstFences(entry) => {
-                entry.dependent_accesses().for_each(f);
-                return;
-            }
+            // Fences are not dependent with anything, see
+            // `rt::atomic::SeqCstFences`.
+            Entry::SeqCstFences(_) => return,
             Entry::Mutex(entry) => {
                 entry
                     .dependent_accesses(operation.action, racing && !bounded)
@@ -393,6 +392,7 @@ impl Store {
             Entry::Arc(entry) => entry.dependent(a.action.into(), b.action.into()),
             Entry::Channel(entry) => entry.dependent(a.action.into(), b.action.into()),
             Entry::RwLock(entry) => entry.dependent(a.action, b.action),
+            Entry::SeqCstFences(_) => false,
             _ => true,
         }
     }
@@ -438,7 +438,7 @@ impl Store {
             Entry::Mutex(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Condvar(entry) => entry.set_last_access(path_id, dpor_vv),
             Entry::Notify(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
-            Entry::SeqCstFences(entry) => entry.set_last_access(path_id, dpor_vv),
+            Entry::SeqCstFences(_) => {}
             Entry::RwLock(entry) => entry.set_last_access(operation.action, path_id, dpor_vv),
             Entry::Channel(entry) => {
                 entry.set_last_access(operation.action.into(), thread, path_id, dpor_vv)
