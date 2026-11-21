@@ -85,6 +85,37 @@ jobs:
       - name: Test --features lock_api
         run: cargo test --features lock_api
 
+  # An optimized build checks every program of the litmus corpus, where an
+  # unoptimized one checks one in eight.
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Test --release --all-features
+        run: cargo test --release --all-features
+      - name: Test --release --all-features, with several workers
+        run: cargo test --release --all-features
+        env:
+          LOOM_WORKERS: 4
+
+  # The same with debug assertions, which hold loom's checks of its own
+  # state (the order of `SeqCst` operations being free of cycles, say).
+  release-debug-assertions:
+    name: release with debug assertions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Test --release --all-features
+        run: cargo test --release --all-features
+        env:
+          RUSTFLAGS: -Dwarnings -C debug-assertions
+          LOOM_LITMUS_SAMPLE: 1
+
   # check docs
   docs:
     name: build docs

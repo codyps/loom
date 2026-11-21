@@ -43,16 +43,18 @@ const REFERENCE_LB: &str = include_str!("litmus_rc11/reference_lb.txt");
 const PARTS: usize = 8;
 
 /// An unoptimized build takes minutes for all of the programs, and checks
-/// one in this many. An optimized one checks every program.
+/// one in this many. An optimized one checks every program. A build with
+/// debug assertions counts as unoptimized here; `LOOM_LITMUS_SAMPLE=1` makes
+/// an optimized build with debug assertions, which is fast, check them all.
 const DEBUG_SAMPLE: usize = 8;
 
 fn check(reference: &str, part: usize, outcomes: fn(&str) -> BTreeSet<String>) {
     let mut failures = Vec::new();
 
-    let sample = if cfg!(debug_assertions) {
-        DEBUG_SAMPLE
-    } else {
-        1
+    let sample = match std::env::var("LOOM_LITMUS_SAMPLE") {
+        Ok(sample) => sample.parse().expect("invalid LOOM_LITMUS_SAMPLE"),
+        Err(_) if cfg!(debug_assertions) => DEBUG_SAMPLE,
+        Err(_) => 1,
     };
 
     for line in reference.lines().skip(part).step_by(PARTS).step_by(sample) {
