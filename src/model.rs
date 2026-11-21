@@ -380,6 +380,102 @@ impl Builder {
         self.with_logging(|| self.check_with_input_inner(input, f))
     }
 
+    /// Run executions of the model whose scheduling, atomic read and spurious
+    /// wakeup choices are made at random, instead of exploring them all.
+    ///
+    /// This is for models that are too large to explore, even with a
+    /// [preemption bound](Builder::preemption_bound): it finds nothing for
+    /// certain, and what it does find is a real failure. Every choice with
+    /// several outcomes picks one of them with the same probability, so
+    /// executions with many thread switches are as likely as ones with few;
+    /// a preemption bound, which is respected, shifts that.
+    ///
+    /// Runs until `max_permutations` executions or `max_duration` is
+    /// reached, whichever comes first, and 10,000 executions if neither is
+    /// set. The same `seed` gives the same executions, in the same order.
+    ///
+    /// When an execution fails, a line on standard error names the seed of
+    /// that execution, and [`Builder::replay_random`] runs it again by
+    /// itself.
+    ///
+    /// Respects the settings [`Builder::check_with_input`] does. The model
+    /// has to be deterministic apart from loom's operations.
+    pub fn check_random<F>(&self, seed: u64, f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        self.with_logging(|| self.check_random_inner(seed, f))
+    }
+
+    /// Run the single execution with the seed that a failing
+    /// [`Builder::check_random`] reported. Replay across loom versions, or
+    /// with other settings, is not guaranteed.
+    pub fn replay_random<F>(&self, execution_seed: u64, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.with_logging(|| {
+            let _span = tracing::info_span!("iter", message = 1).entered();
+            let mut execution = self.new_execution();
+            execution.path.set_random(execution_seed);
+
+            let mut scheduler = Scheduler::new(self.max_threads);
+            run_execution(&mut execution, &mut scheduler, self.stack_size, f);
+        })
+    }
+
+    fn check_random_inner<F>(&self, seed: u64, f: F)
+    where
+        F: Fn() + Sync + Send + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+        let max_permutations = match (self.max_permutations, self.max_duration) {
+            (Some(max), _) => max,
+            (None, Some(_)) => usize::MAX,
+            (None, None) => 10_000,
+        };
+
+        let f = Arc::new(f);
+        let mut state = seed;
+        let start = Instant::now();
+        let mut scheduler = Scheduler::new(self.max_threads);
+
+        for i in 1..=max_permutations {
+            if let Some(max_duration) = self.max_duration {
+                if i > 1 && start.elapsed() >= max_duration {
+                    break;
+                }
+            }
+
+            let execution_seed = rt::next_random(&mut state);
+
+            let _span = tracing::info_span!("iter", message = i).entered();
+            let mut execution = self.new_execution();
+            execution.path.set_random(execution_seed);
+
+            let f = f.clone();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                run_execution(&mut execution, &mut scheduler, self.stack_size, move || f());
+            }));
+
+            if let Err(panic) = result {
+                eprintln!(
+                    "loom: random execution {} failed; replay it with \
+                     `Builder::replay_random({:#x}, ..)`",
+                    i, execution_seed
+                );
+
+                // The coroutines of the failed execution are unwound when
+                // the scheduler is dropped, which must not happen while
+                // this thread is panicking.
+                drop(execution);
+                drop(scheduler);
+                resume_unwind(panic);
+            }
+        }
+    }
+
     fn check_with_input_inner<F>(&self, input: &[u8], f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -853,5 +949,55 @@ mod checkpoint {
 
     pub(crate) fn store_execution_path(_path: &crate::rt::Path, _fs_path: &Path, _model: &str) {
         panic!("not compiled with `checkpoint` feature")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Builder;
+    use crate::rt;
+    use crate::sync::atomic::AtomicUsize;
+    use crate::thread;
+
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{Arc, Mutex};
+
+    /// What two racing threads load, in one execution.
+    fn model(seen: &Arc<Mutex<Vec<(usize, usize)>>>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let other = {
+            let counter = counter.clone();
+            thread::spawn(move || counter.fetch_add(1, SeqCst))
+        };
+
+        let mine = counter.fetch_add(2, SeqCst);
+        let theirs = other.join().unwrap();
+
+        seen.lock().unwrap().push((mine, theirs));
+    }
+
+    /// The seed that `check_random` reports for an execution is the one
+    /// `replay_random` runs the same execution with.
+    #[test]
+    fn replay_random_runs_the_reported_execution() {
+        let mut builder = Builder::new();
+        builder.max_permutations = Some(20);
+
+        for seed in 0..10u64 {
+            let random = Arc::new(Mutex::new(Vec::new()));
+            let seen = random.clone();
+            builder.check_random(seed, move || model(&seen));
+
+            let replayed = Arc::new(Mutex::new(Vec::new()));
+            let mut state = seed;
+
+            for _ in 0..20 {
+                let seen = replayed.clone();
+                builder.replay_random(rt::next_random(&mut state), move || model(&seen));
+            }
+
+            assert_eq!(*random.lock().unwrap(), *replayed.lock().unwrap());
+        }
     }
 }

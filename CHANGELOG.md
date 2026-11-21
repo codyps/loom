@@ -113,6 +113,16 @@ and release, and on the lowest allowed direct dependency versions.
    fence. Two loads copying 0 back and forth never produce anything else:
    values only come from executions without guesses. The tests
    `load_buffering` and `relaxed`, ignored until now, use it.
+ - `model::Builder::check_random`: run executions chosen at random, for a
+   model that is too large to explore (upstream issue 11). Every
+   scheduling, atomic read and spurious wakeup choice picks one of its
+   outcomes with the same probability, from a seed; it runs until
+   `max_permutations` or `max_duration` is reached, 10,000 executions if
+   neither is set. A failing execution is reported with a seed of its own,
+   which `Builder::replay_random` runs again by itself. It proves nothing,
+   and what it finds is real: on `local-rcu`, whose largest loom test does
+   not finish, it runs some 30,000 executions a second, and finds each of
+   the two bugs that the test suite's history has within five executions.
  - `model::Builder::workers` and `LOOM_WORKERS`: explore the executions of a
    model on several threads, see "Performance" below.
  - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
@@ -589,9 +599,9 @@ Not addressed:
    `repr(transparent)` atomics and cells (51, 317), `const fn new` (170),
    `as_ptr` / `raw_get` / `data_ptr` (298, 276, 234).
  - Design questions and feature requests left alone: catching thread panics
-   (417, documented instead), `MaybeUninit` (299), random exploration (11),
-   dropping the `generator` dependency (388), and the reports that depend
-   on external code that could not be run here (301, 362, 398).
+   (417, documented instead), `MaybeUninit` (299), dropping the `generator`
+   dependency (388), and the reports that depend on external code that
+   could not be run here (301, 362, 398).
 
 ### Not merged
 

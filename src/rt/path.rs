@@ -8,12 +8,44 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// An execution path
+/// What selects the choices of a single execution.
+#[derive(Debug)]
+enum Input {
+    /// One byte per choice; the first outcome once they run out.
+    Bytes(std::vec::IntoIter<u8>),
+
+    /// The state of a random number generator.
+    Random(u64),
+}
+
+impl Input {
+    /// Picks one of `count` outcomes.
+    fn choice(&mut self, count: usize) -> usize {
+        match self {
+            Input::Bytes(bytes) => bytes.next().unwrap_or(0) as usize % count,
+            Input::Random(state) => (next_random(state) >> 32) as usize % count,
+        }
+    }
+}
+
+/// A step of the SplitMix64 generator: fast, and good enough to pick
+/// schedules with. Any seed will do, zero included.
+pub(crate) fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "checkpoint", derive(Serialize, Deserialize))]
 pub(crate) struct Path {
-    /// Present only when bytes select a single execution instead of exploration.
+    /// Present only when bytes, or a random number generator, select a
+    /// single execution instead of exploration.
     #[cfg_attr(feature = "checkpoint", serde(skip))]
-    input: Option<std::vec::IntoIter<u8>>,
+    input: Option<Input>,
 
     preemption_bound: Option<u8>,
 
@@ -470,14 +502,19 @@ impl Path {
     }
 
     pub(crate) fn set_input(&mut self, input: &[u8]) {
-        self.input = Some(Vec::from(input).into_iter());
+        self.input = Some(Input::Bytes(Vec::from(input).into_iter()));
+    }
+
+    /// Makes every choice of the execution at random, from `seed`.
+    pub(crate) fn set_random(&mut self, seed: u64) {
+        self.input = Some(Input::Random(seed));
     }
 
     fn input_choice(&mut self, count: usize) -> usize {
         if count <= 1 || !self.exploring {
             return 0;
         }
-        self.input.as_mut().unwrap().next().unwrap_or(0) as usize % count
+        self.input.as_mut().unwrap().choice(count)
     }
 
     pub(crate) fn explore_state(&mut self) {
