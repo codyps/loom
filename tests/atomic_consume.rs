@@ -309,3 +309,17 @@ fn dependent_store_is_the_threads_own() {
         drop(unsafe { Box::from_raw(node) });
     });
 }
+
+/// The pointer may be anything, such as a marker at the end of the address
+/// space, that nothing is accessed through.
+#[test]
+fn pointer_at_the_end_of_the_address_space() {
+    loom::model(|| {
+        let marker = usize::MAX as *mut [u8; 64];
+        let head = AtomicPtr::new(marker);
+
+        assert_eq!(head.load_consume(), marker);
+        // The second load finds what the first one left.
+        assert_eq!(head.load_consume(), marker);
+    });
+}

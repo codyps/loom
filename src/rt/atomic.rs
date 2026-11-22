@@ -1286,7 +1286,7 @@ impl State {
             forgotten: Forgotten::default(),
             read_by_rmw: None,
             created_location: location,
-            created_at: threads.active().causality,
+            created_at: *threads.active().known(),
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
             unsync_loaded_at: VersionVec::new(),

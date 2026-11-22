@@ -158,7 +158,7 @@ impl Drop for Cell {
 
 impl State {
     fn new(threads: &thread::Set, location: Location) -> State {
-        let version = threads.active().causality;
+        let version = *threads.active().known();
 
         State {
             created_location: location,

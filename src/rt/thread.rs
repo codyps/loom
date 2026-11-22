@@ -219,8 +219,11 @@ impl Thread {
         // Memory that overlaps an earlier pointee is that pointee again, or
         // was allocated after it was freed: the earlier load says nothing
         // about it anymore.
+        //
+        // The ends saturate: the pointer may be any value, not only one to
+        // memory that exists.
         self.consumed
-            .retain(|c| c.addr >= addr.saturating_add(len) || addr >= c.addr + c.len);
+            .retain(|c| c.addr >= addr.saturating_add(len) || addr >= c.addr.saturating_add(c.len));
         self.consumed.push(Consumed { addr, len, clock });
     }
 
