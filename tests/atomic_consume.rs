@@ -323,3 +323,35 @@ fn pointer_at_the_end_of_the_address_space() {
         assert_eq!(head.load_consume(), marker);
     });
 }
+
+/// An unsynchronized load is a load: it does not order what follows either.
+#[test]
+#[should_panic(expected = "Concurrent read and write accesses")]
+fn dependent_unsync_load_does_not_order_what_follows() {
+    loom::model(|| {
+        let head = Arc::new(AtomicPtr::new(ptr::null_mut::<Node>()));
+        let other = Arc::new(UnsafeCell::new(0));
+        let node = Node::new();
+
+        let th = {
+            let head = head.clone();
+            let other = other.clone();
+            thread::spawn(move || {
+                let node = head.load_consume();
+                if !node.is_null() {
+                    // The writer is done with the node: this is no race.
+                    assert_eq!(unsafe { (*node).atomic.unsync_load() }, 1);
+                    // Not got to through the pointer.
+                    other.with(|v| unsafe { *v });
+                }
+            })
+        };
+
+        other.with_mut(|v| unsafe { *v = 1 });
+        unsafe { (*node).atomic.store(1, Relaxed) };
+        head.store(node, Release);
+
+        th.join().unwrap();
+        drop(unsafe { Box::from_raw(node) });
+    });
+}

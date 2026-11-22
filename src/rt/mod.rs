@@ -186,17 +186,33 @@ where
     F: FnOnce(&mut Execution) -> R,
 {
     execution(|execution| {
-        execution.threads.active_causality_inc();
-        trace!("synchronize");
+        settle_dependent(execution, |execution| {
+            execution.threads.active_causality_inc();
+            trace!("synchronize");
 
-        let ret = f(execution);
-
-        // What the operation knew of only by a dependency from a consume
-        // load, the thread does not know of after it.
-        execution.threads.active_mut().settle_dependent();
-
-        ret
+            f(execution)
+        })
     })
+}
+
+/// Runs an operation of the current thread that may depend on a consume
+/// load (see `Thread::depend`). What the operation knew of only by that
+/// dependency, the thread does not know of after it.
+///
+/// An operation that panics does not get to the end of this. The thread may
+/// go on all the same, to drop what it has if nothing else, so what such an
+/// operation left behind is settled first.
+fn settle_dependent<F, R>(execution: &mut Execution, f: F) -> R
+where
+    F: FnOnce(&mut Execution) -> R,
+{
+    execution.threads.active_mut().settle_dependent();
+
+    let ret = f(execution);
+
+    execution.threads.active_mut().settle_dependent();
+
+    ret
 }
 
 /// Yield the thread.

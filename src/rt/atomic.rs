@@ -1016,23 +1016,26 @@ impl<T: Numeric> Atomic<T> {
             if execution.load_buffering.is_some() {
                 unsettled_access(execution, self.state.index());
             }
-            // The value is in the hands of the thread from here on.
-            self.depend(execution, true);
 
-            let state = self.state.get_mut(&mut execution.objects);
+            rt::settle_dependent(execution, |execution| {
+                // A load, like any other that is not `SeqCst`.
+                self.depend(execution, false);
 
-            state
-                .unsync_loaded_locations
-                .track(location, &execution.threads);
+                let state = self.state.get_mut(&mut execution.objects);
 
-            // An unsync load counts as a "read" access
-            state.track_unsync_load(&execution.threads);
+                state
+                    .unsync_loaded_locations
+                    .track(location, &execution.threads);
 
-            trace!(state = ?self.state, %location, "Atomic::unsync_load");
+                // An unsync load counts as a "read" access
+                state.track_unsync_load(&execution.threads);
 
-            // Return the value
-            let index = state.last;
-            T::from_u64(state.stores[index].value)
+                trace!(state = ?self.state, %location, "Atomic::unsync_load");
+
+                // Return the value
+                let index = state.last;
+                T::from_u64(state.stores[index].value)
+            })
         })
     }
 
@@ -1169,7 +1172,7 @@ impl<T: Numeric> Atomic<T> {
             if execution.load_buffering.is_some() {
                 unsettled_access(execution, self.state.index());
             }
-            // The value is in the hands of the thread from here on.
+            // A mutation leaves behind what it came after, as a store does.
             self.depend(execution, true);
 
             let state = self.state.get_mut(&mut execution.objects);
@@ -2274,7 +2277,8 @@ impl State {
                 .fire();
         }
 
-        self.unsync_loaded_at.join(current);
+        // As for `loaded_at`, see `track_load`.
+        self.unsync_loaded_at.join(threads.active().known());
     }
 
     /// Track an atomic store
