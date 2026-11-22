@@ -29,6 +29,11 @@ where
     }
 
     #[track_caller]
+    pub(crate) fn load_consume(&self, pointee: usize) -> T {
+        self.state.load_consume(location!(), pointee)
+    }
+
+    #[track_caller]
     pub(crate) fn store(&self, value: T, order: Ordering) {
         self.state.store(location!(), value, order)
     }

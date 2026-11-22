@@ -12,6 +12,9 @@ pub(super) struct State {
     /// Where the cell was created
     created_location: Location,
 
+    /// What its creator knew of when it was created.
+    created_at: VersionVec,
+
     /// Number of threads currently reading the cell
     is_reading: usize,
 
@@ -34,11 +37,21 @@ pub(super) struct State {
 #[derive(Debug)]
 pub(crate) struct Reading {
     state: object::Ref<State>,
+
+    /// What the access comes after by a dependency from a consume load, if
+    /// the cell was got to through the pointer that was loaded: all of it,
+    /// from start to end, and nothing else the thread does.
+    dependency: Option<VersionVec>,
 }
 
 #[derive(Debug)]
 pub(crate) struct Writing {
     state: object::Ref<State>,
+
+    /// What the access comes after by a dependency from a consume load, if
+    /// the cell was got to through the pointer that was loaded: all of it,
+    /// from start to end, and nothing else the thread does.
+    dependency: Option<VersionVec>,
 }
 
 impl Cell {
@@ -55,31 +68,51 @@ impl Cell {
     pub(crate) fn start_read(&self, location: Location) -> Reading {
         // Enter the read closure
         rt::synchronize(|execution| {
+            // `self` is inside the `UnsafeCell` of the program under test:
+            // an access through a pointer from a consume load comes after
+            // the store that the load read.
             let state = self.state.get_mut(&mut execution.objects);
+            let dependency = execution
+                .threads
+                .active()
+                .dependency(self as *const Self as usize, &state.created_at);
 
             assert!(!state.is_writing, "currently writing to cell");
 
             state.is_reading += 1;
             state.read_locations.track(location, &execution.threads);
-            state.track_read(&execution.threads);
+            state.track_read(&execution.threads, &dependency);
 
-            Reading { state: self.state }
+            Reading {
+                state: self.state,
+                dependency,
+            }
         })
     }
 
     pub(crate) fn start_write(&self, location: Location) -> Writing {
         // Enter the write closure
         rt::synchronize(|execution| {
+            // `self` is inside the `UnsafeCell` of the program under test:
+            // an access through a pointer from a consume load comes after
+            // the store that the load read.
             let state = self.state.get_mut(&mut execution.objects);
+            let dependency = execution
+                .threads
+                .active()
+                .dependency(self as *const Self as usize, &state.created_at);
 
             assert!(state.is_reading == 0, "currently reading from cell");
             assert!(!state.is_writing, "currently writing to cell");
 
             state.is_writing = true;
             state.write_locations.track(location, &execution.threads);
-            state.track_write(&execution.threads);
+            state.track_write(&execution.threads, &dependency);
 
-            Writing { state: self.state }
+            Writing {
+                state: self.state,
+                dependency,
+            }
         })
     }
 }
@@ -125,10 +158,11 @@ impl Drop for Cell {
 
 impl State {
     fn new(threads: &thread::Set, location: Location) -> State {
-        let version = threads.active().causality;
+        let version = *threads.active().known();
 
         State {
             created_location: location,
+            created_at: version,
             is_reading: 0,
             is_writing: false,
             read_access: version,
@@ -138,13 +172,29 @@ impl State {
         }
     }
 
+    /// What an access by a thread that knows of `current` comes after.
+    fn after(current: &VersionVec, dependency: &Option<VersionVec>) -> VersionVec {
+        let mut after = *current;
+
+        if let Some(dependency) = dependency {
+            after.join(dependency);
+        }
+
+        after
+    }
+
     /// Perform a read access
-    fn track_read(&mut self, threads: &thread::Set) {
+    ///
+    /// `dependency`: what the access comes after besides what the thread
+    /// knows of, see `Reading`. That is not part of what later accesses
+    /// have to come after.
+    fn track_read(&mut self, threads: &thread::Set, dependency: &Option<VersionVec>) {
         let current = &threads.active().causality;
+        let after = Self::after(current, dependency);
 
         // Check that there is no concurrent mutable access, i.e., the last
         // mutable access must happen-before this immutable access.
-        if let Some(writer) = current.ahead(&self.write_access) {
+        if let Some(writer) = after.ahead(&self.write_access) {
             location::panic("Causality violation: Concurrent read and write accesses.")
                 .location("created", self.created_location)
                 .thread("read", threads.active_id(), self.read_locations[threads])
@@ -155,12 +205,14 @@ impl State {
         self.read_access.join(current);
     }
 
-    fn track_write(&mut self, threads: &thread::Set) {
+    /// Perform a write access. `dependency`: see `track_read`.
+    fn track_write(&mut self, threads: &thread::Set, dependency: &Option<VersionVec>) {
         let current = &threads.active().causality;
+        let after = Self::after(current, dependency);
 
         // Check that there is no concurrent mutable access, i.e., the last
         // mutable access must happen-before this mutable access.
-        if let Some(other) = current.ahead(&self.write_access) {
+        if let Some(other) = after.ahead(&self.write_access) {
             location::panic("Causality violation: Concurrent write accesses to `UnsafeCell`.")
                 .location("created", self.created_location)
                 .thread("write one", other, self.write_locations[other])
@@ -174,7 +226,7 @@ impl State {
 
         // Check that there are no concurrent immutable accesses, i.e., every
         // immutable access must happen-before this mutable access.
-        if let Some(reader) = current.ahead(&self.read_access) {
+        if let Some(reader) = after.ahead(&self.read_access) {
             location::panic(
                 "Causality violation: Concurrent read and write accesses to `UnsafeCell`.",
             )
@@ -205,7 +257,7 @@ impl Drop for Reading {
                 // history, after anything the thread published while the
                 // access was open (see `Writing::drop`).
                 execution.threads.active_causality_inc();
-                state.track_read(&execution.threads);
+                state.track_read(&execution.threads, &self.dependency);
             }
         })
     }
@@ -232,7 +284,7 @@ impl Drop for Writing {
                 // would appear to have observed the whole access, when in
                 // fact the access was still open.
                 execution.threads.active_causality_inc();
-                state.track_write(&execution.threads);
+                state.track_write(&execution.threads, &self.dependency);
             }
         })
     }

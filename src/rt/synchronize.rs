@@ -60,7 +60,7 @@ impl Synchronize {
     }
 
     fn sync_acq(&mut self, threads: &mut thread::Set) {
-        threads.active_mut().causality.join(&self.happens_before);
+        threads.active_mut().acquire(&self.happens_before);
     }
 
     fn sync_rel(&mut self, threads: &thread::Set) {

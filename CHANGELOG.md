@@ -123,6 +123,18 @@ and release, and on the lowest allowed direct dependency versions.
    and what it finds is real: on `local-rcu`, whose largest loom test does
    not finish, it runs some 30,000 executions a second, and finds each of
    the two bugs that the test suite's history has within five executions.
+ - `AtomicPtr::load_consume`: a load with what C++ calls
+   `memory_order_consume`, which `std` does not have and code gets as
+   `crossbeam_utils::atomic::AtomicConsume` does (a `Relaxed` load on Arm,
+   `Acquire` elsewhere). The load is a `Relaxed` one. What comes after the
+   store it read is each access the thread makes to a loom atomic or
+   `UnsafeCell` that it got to by the pointer, and not the thread: what it
+   does next is not ordered (a store through the pointer is the exception).
+   So code that relies on more than its dependent accesses being ordered
+   fails, which it does not when the load is modeled as `Acquire`. What
+   depends on the load is a guess, by address and by when an object was
+   created, that can be wrong both ways. See the documentation of the
+   method.
  - `model::Builder::workers` and `LOOM_WORKERS`: explore the executions of a
    model on several threads, see "Performance" below.
  - `model::Builder::stack_size` and `LOOM_STACK_SIZE`: default stack size for
