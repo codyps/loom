@@ -75,10 +75,42 @@ pub(crate) struct Thread {
     /// has become unable to.
     pub(super) yield_waits: crate::rt::ThreadSet,
 
+    /// The memory the thread was handed by its consume loads, see
+    /// [`Thread::consume`].
+    consumed: Vec<Consumed>,
+
+    /// Set while the thread makes an access that carries a dependency from
+    /// a consume load, and that orders nothing but itself after the store
+    /// that was loaded, see [`Thread::depend`].
+    dependent: Option<Dependent>,
+
     locals: LocalMap,
 
     /// `tracing` span used to associate diagnostics with the current thread.
     span: tracing::Span,
+}
+
+/// What a consume load returned a pointer to: `len` bytes at `addr`, and
+/// what the store that the load read releases. An access by the thread to
+/// an object in there carries a dependency from the load, and so comes
+/// after all of `clock`.
+/// An access that carries a dependency from a consume load.
+#[derive(Debug)]
+struct Dependent {
+    /// What the thread knows of apart from the dependency: what it knew of
+    /// before the access, and what the access itself has acquired since.
+    /// `causality` is back to this when the access is over.
+    known: VersionVec,
+
+    /// What the access comes after by the dependency.
+    clock: VersionVec,
+}
+
+#[derive(Debug)]
+struct Consumed {
+    addr: usize,
+    len: usize,
+    clock: VersionVec,
 }
 
 #[derive(Debug)]
@@ -150,6 +182,8 @@ impl Thread {
             other_pending: false,
             yielded: false,
             last_step: None,
+            consumed: Vec::new(),
+            dependent: None,
             locals: HashMap::new(),
         }
     }
@@ -164,6 +198,120 @@ impl Thread {
             }
             Some(_) => self.last_view,
             None => VersionVec::new(),
+        }
+    }
+
+    /// A consume load by the thread returned a pointer to `len` bytes at
+    /// `addr`, from a store that releases `clock`.
+    ///
+    /// The load orders nothing by itself. Only what the thread then does
+    /// with the pointer comes after the store, see [`Thread::dependency`].
+    pub(crate) fn consume(&mut self, addr: usize, len: usize, mut clock: VersionVec) {
+        // A zero-sized pointee still has an address to be found at.
+        let len = len.max(1);
+
+        // The atomic was itself got to through a consumed pointer: what is
+        // done with the pointer that was loaded depends on that one too.
+        if let Some(dependent) = &self.dependent {
+            clock.join(&dependent.clock);
+        }
+
+        // Memory that overlaps an earlier pointee is that pointee again, or
+        // was allocated after it was freed: the earlier load says nothing
+        // about it anymore.
+        self.consumed
+            .retain(|c| c.addr >= addr.saturating_add(len) || addr >= c.addr + c.len);
+        self.consumed.push(Consumed { addr, len, clock });
+    }
+
+    /// The thread is about to access the loom object at `addr`, which was
+    /// created at `created`. If the thread got to it through a pointer from
+    /// one of its consume loads, the access carries a dependency from the
+    /// load, and comes after what the store that was loaded releases: that
+    /// is returned, unless the thread knows of all of it anyway.
+    ///
+    /// Whether it did is not known, values are not followed. It is taken to
+    /// have done so if the object is:
+    ///
+    /// - in the memory the pointer points to, or
+    /// - not known to the thread, having been created after everything the
+    ///   thread knows of, but before the store. Some pointer led the thread
+    ///   to the object, and it did not get that one by synchronizing. This
+    ///   is how an object is found that is behind a second pointer, such as
+    ///   a `Box` in the pointee.
+    pub(crate) fn dependency(&self, addr: usize, created: &VersionVec) -> Option<VersionVec> {
+        let mut after = self.causality;
+
+        for c in &self.consumed {
+            let inside = addr >= c.addr && addr - c.addr < c.len;
+            // The first load that explains how the thread found the object
+            // is the one it is taken to have found it by.
+            let found_by = || after.ahead(created).is_some() && c.clock.ahead(created).is_none();
+
+            if inside || found_by() {
+                after.join(&c.clock);
+            }
+        }
+
+        if after == self.causality {
+            None
+        } else {
+            Some(after)
+        }
+    }
+
+    /// The thread starts an atomic operation on the object at `addr`, see
+    /// [`Thread::dependency`]. If the operation carries a dependency, the
+    /// thread comes after what that orders it after.
+    ///
+    /// Only the operation itself comes after it, and not what the thread
+    /// does next without the pointer: unless `lasting`, the thread forgets
+    /// about it when the operation is over, in [`Thread::settle_dependent`].
+    /// It keeps what the operation acquires by itself.
+    ///
+    /// A `lasting` dependency is more than a consume load provides. It is
+    /// for operations that leave something behind that the thread comes
+    /// after from then on, and that says what the operation knew of: a
+    /// store, or a place in the order of `SeqCst` operations.
+    pub(crate) fn depend(&mut self, addr: usize, created: &VersionVec, lasting: bool) {
+        debug_assert!(self.dependent.is_none());
+
+        if let Some(after) = self.dependency(addr, created) {
+            if !lasting {
+                self.dependent = Some(Dependent {
+                    known: self.causality,
+                    clock: after,
+                });
+            }
+
+            self.causality = after;
+        }
+    }
+
+    /// The operation that [`Thread::depend`] was called for is over.
+    pub(crate) fn settle_dependent(&mut self) {
+        if let Some(dependent) = self.dependent.take() {
+            self.causality = dependent.known;
+        }
+    }
+
+    /// The thread acquires `clock`, for good.
+    pub(crate) fn acquire(&mut self, clock: &VersionVec) {
+        self.causality.join(clock);
+
+        if let Some(dependent) = &mut self.dependent {
+            dependent.known.join(clock);
+        }
+    }
+
+    /// What the thread knows of, and goes on knowing of: `causality`, less
+    /// what an access knows of only by a dependency from a consume load.
+    /// This is what to record of an access that later ones are checked
+    /// against.
+    pub(crate) fn known(&self) -> &VersionVec {
+        match &self.dependent {
+            Some(dependent) => &dependent.known,
+            None => &self.causality,
         }
     }
 
@@ -194,7 +342,7 @@ impl Thread {
             self.last_location = Some(location);
         }
 
-        self.last_view = self.causality;
+        self.last_view = *self.known();
     }
 
     pub(crate) fn is_runnable(&self) -> bool {
@@ -389,7 +537,13 @@ impl Set {
 
     pub(crate) fn active_causality_inc(&mut self) {
         let id = self.active_id();
-        self.active_mut().causality.inc(id);
+        let active = self.active_mut();
+
+        active.causality.inc(id);
+
+        if let Some(dependent) = &mut active.dependent {
+            dependent.known.inc(id);
+        }
     }
 
     pub(crate) fn active_atomic_version(&self) -> u16 {

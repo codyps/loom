@@ -81,6 +81,9 @@ pub(super) struct State {
     /// Where the atomic was created
     created_location: Location,
 
+    /// What its creator knew of when it was created.
+    created_at: VersionVec,
+
     /// Transitive closure of all atomic loads from the cell.
     loaded_at: VersionVec,
 
@@ -867,10 +870,24 @@ impl<T: Numeric> Atomic<T> {
 
     /// Loads a value from the atomic cell.
     pub(crate) fn load(&self, location: Location, ordering: Ordering) -> T {
+        self.load_from(location, ordering, None)
+    }
+
+    /// Loads a pointer to `pointee` bytes from the atomic cell, with what
+    /// C++ calls `memory_order_consume`: the load itself is ordered like a
+    /// `Relaxed` one, and only the thread's accesses to what the pointer
+    /// points to come after the store that is read, see `Thread::depend`.
+    pub(crate) fn load_consume(&self, location: Location, pointee: usize) -> T {
+        self.load_from(location, Ordering::Relaxed, Some(pointee))
+    }
+
+    fn load_from(&self, location: Location, ordering: Ordering, consume: Option<usize>) -> T {
         self.branch(Action::load(ordering), location);
 
         super::synchronize(|execution| {
-            let atomic = self.begin(execution);
+            // A load leaves nothing behind that says what it knew of, unless
+            // it has a place in the order of `SeqCst` operations.
+            let atomic = self.begin(execution, is_seq_cst(ordering));
             let state = self.state.get_mut(&mut execution.objects);
 
             // The load may return a store yet to be made, see
@@ -895,7 +912,9 @@ impl<T: Numeric> Atomic<T> {
                 );
             }
 
-            let guesses = if guessing {
+            // A consume load does not guess: a pointer that is yet to be
+            // stored has nothing behind it to depend on.
+            let guesses = if guessing && consume.is_none() {
                 guesses(execution, self.state, atomic, &seed[..n], ordering)
             } else {
                 Vec::new()
@@ -973,6 +992,18 @@ impl<T: Numeric> Atomic<T> {
                 ordering,
             );
 
+            if let Some(pointee) = consume {
+                // A null pointer points to nothing.
+                if value != 0 {
+                    let clock = *state.stores[index].sync.happens_before();
+
+                    execution
+                        .threads
+                        .active_mut()
+                        .consume(value as usize, pointee, clock);
+                }
+            }
+
             execution.threads.active_mut().note_access(atomic);
 
             T::from_u64(value)
@@ -985,6 +1016,8 @@ impl<T: Numeric> Atomic<T> {
             if execution.load_buffering.is_some() {
                 unsettled_access(execution, self.state.index());
             }
+            // The value is in the hands of the thread from here on.
+            self.depend(execution, true);
 
             let state = self.state.get_mut(&mut execution.objects);
 
@@ -1008,7 +1041,7 @@ impl<T: Numeric> Atomic<T> {
         self.branch(Action::store(ordering), location);
 
         super::synchronize(|execution| {
-            let atomic = self.begin(execution);
+            let atomic = self.begin(execution, true);
             let state = self.state.get_mut(&mut execution.objects);
 
             state.stored_locations.track(location, &execution.threads);
@@ -1059,7 +1092,7 @@ impl<T: Numeric> Atomic<T> {
         self.branch(Action::rmw(success, failure), location);
 
         super::synchronize(|execution| {
-            let atomic = self.begin(execution);
+            let atomic = self.begin(execution, true);
             let state = self.state.get_mut(&mut execution.objects);
 
             // If necessary, generate the list of stores to permute through
@@ -1136,6 +1169,8 @@ impl<T: Numeric> Atomic<T> {
             if execution.load_buffering.is_some() {
                 unsettled_access(execution, self.state.index());
             }
+            // The value is in the hands of the thread from here on.
+            self.depend(execution, true);
 
             let state = self.state.get_mut(&mut execution.objects);
 
@@ -1183,19 +1218,37 @@ impl<T: Numeric> Atomic<T> {
 
     /// Start of an atomic operation by the current thread. Returns what
     /// identifies this atomic as a location.
-    fn begin(&self, execution: &mut Execution) -> usize {
+    ///
+    /// `lasting`: see `Thread::depend`.
+    fn begin(&self, execution: &mut Execution, lasting: bool) -> usize {
         let atomic = self.state.index();
         let thread = execution.threads.active_id().as_usize();
 
         if execution.load_buffering.is_some() {
             unsettled_access(execution, atomic);
         }
+        self.depend(execution, lasting);
         let clock = execution.threads.active().causality.get(thread);
 
         execution.threads.active_mut().settle_other();
         execution.seq_cst.observe(thread, atomic, clock);
 
         atomic
+    }
+
+    /// The current thread accesses this atomic. If it got to it through a
+    /// pointer from a consume load, the access comes after the store that
+    /// the load read.
+    ///
+    /// `self` is where the atomic is for the program under test: it is the
+    /// only field of the mock atomic types.
+    fn depend(&self, execution: &mut Execution, lasting: bool) {
+        let created = self.state.get(&execution.objects).created_at;
+
+        execution
+            .threads
+            .active_mut()
+            .depend(self as *const Self as usize, &created, lasting);
     }
 
     fn branch(&self, action: Action, location: Location) {
@@ -1233,6 +1286,7 @@ impl State {
             forgotten: Forgotten::default(),
             read_by_rmw: None,
             created_location: location,
+            created_at: threads.active().causality,
             loaded_at: VersionVec::new(),
             loaded_locations: LocationSet::new(),
             unsync_loaded_at: VersionVec::new(),
@@ -2185,7 +2239,9 @@ impl State {
                 .fire();
         }
 
-        self.loaded_at.join(current);
+        // What comes after this load has to come after the thread, not
+        // after what the load only depends on.
+        self.loaded_at.join(threads.active().known());
     }
 
     /// Track an unsynchronized load

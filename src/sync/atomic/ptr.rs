@@ -53,6 +53,62 @@ impl<T> AtomicPtr<T> {
         self.0.load(order)
     }
 
+    /// Loads a value from the pointer, with what C++ calls
+    /// `memory_order_consume`: only what is done *with the pointer* comes
+    /// after the store that is read. This is what reading an RCU-protected
+    /// pointer needs, and all it needs.
+    ///
+    /// `std` has no such ordering, and no such method. Code gets it the way
+    /// `crossbeam_utils::atomic::AtomicConsume` does: a `Relaxed` load where
+    /// the processor keeps dependent accesses in order by itself (Arm), an
+    /// `Acquire` load elsewhere. This method stands in for that under loom.
+    ///
+    /// # What loom checks
+    ///
+    /// The load itself is a `Relaxed` one: it may return any store that a
+    /// `Relaxed` load may, and the thread does not come to know anything
+    /// by it. So code that needs more than a consume load provides, and
+    /// would get it from the `Acquire` load that a compiler makes of one,
+    /// fails under loom.
+    ///
+    /// What depends on the load is a guess, as loom does not follow values.
+    /// An access to a loom atomic or `UnsafeCell` is taken to carry a
+    /// dependency from the load if the object
+    ///
+    /// - lies in the `size_of::<T>()` bytes the pointer points to, or
+    /// - was created before the store that was read, and after everything
+    ///   the thread knows of: the thread must have got to it by a pointer
+    ///   that it did not synchronize for. This finds what is behind a second
+    ///   pointer, such as a `Box` or an `Arc` in `T`.
+    ///
+    /// Such an access comes after the store, and what the thread does next
+    /// does not: a read of an `UnsafeCell` or a load that is not `SeqCst`
+    /// leaves the thread knowing what it knew before, and what the load
+    /// acquired by itself. A store, a read-modify-write and a `SeqCst` load
+    /// are the exception. They leave something behind that says what they
+    /// came after, so the thread comes after the consumed store from then
+    /// on, as after an `Acquire` load of it, which is more than the
+    /// ordering provides.
+    ///
+    /// The guess is wrong both ways. An object that is not in `T`, that the
+    /// thread already knew of, and that was written to before the store is
+    /// not taken to depend on the load when it is reached through it, and
+    /// loom may report a race or a stale value there that cannot happen. An
+    /// object that the thread got to by a `Relaxed` load of some other
+    /// pointer, which is a bug, is taken to depend on the consume load if
+    /// it was created before the store. Nor does loom know when the memory
+    /// is freed: an object that is later allocated at the same address is
+    /// taken for a part of `T` until the thread consumes another pointer to
+    /// that memory.
+    ///
+    /// A load that returns a value yet to be stored (see
+    /// [`Builder::load_buffering`](crate::model::Builder::load_buffering))
+    /// is not explored for a consume load.
+    #[track_caller]
+    pub fn load_consume(&self) -> *mut T {
+        self.0.load_consume(std::mem::size_of::<T>())
+    }
+
     /// Stores a value into the pointer.
     #[track_caller]
     pub fn store(&self, val: *mut T, order: Ordering) {

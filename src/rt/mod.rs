@@ -188,7 +188,14 @@ where
     execution(|execution| {
         execution.threads.active_causality_inc();
         trace!("synchronize");
-        f(execution)
+
+        let ret = f(execution);
+
+        // What the operation knew of only by a dependency from a consume
+        // load, the thread does not know of after it.
+        execution.threads.active_mut().settle_dependent();
+
+        ret
     })
 }
 
