@@ -362,7 +362,7 @@ impl Forgotten {
 
     /// The edges that follow from the forgotten stores being ordered before
     /// `later`.
-    fn edges(&self, later: &StoreNodes, edges: &mut Vec<(usize, usize)>) {
+    fn edges(&self, later: &StoreNodes, edges: &mut Edges) {
         product(&self.sources, &later.own_targets(), edges);
         product(&self.fences, &later.load_fences_after, edges);
     }
@@ -435,7 +435,7 @@ impl StoreNodes {
 
     /// The edges of the `SeqCst` order that follow from `earlier` being
     /// ordered before `later` in the modification order.
-    fn edges(earlier: &StoreNodes, later: &StoreNodes, edges: &mut Vec<(usize, usize)>) {
+    fn edges(earlier: &StoreNodes, later: &StoreNodes, edges: &mut Edges) {
         product(&earlier.sources(), &later.targets(), edges);
 
         // Fences are also ordered through loads of the later store.
@@ -447,21 +447,20 @@ impl StoreNodes {
     }
 }
 
-fn product(from: &NodeSet, to: &NodeSet, edges: &mut Vec<(usize, usize)>) {
+/// Edges of the `SeqCst` order: one from each node of the first set to each
+/// node of the second. They are kept as the sets they come from, since most
+/// of them are in the order already when they are asked for again, which
+/// `SeqCst` finds out a set at a time.
+type Edges = Vec<(NodeSet, NodeSet)>;
+
+fn product(from: &NodeSet, to: &NodeSet, edges: &mut Edges) {
     if from.is_empty() || to.is_empty() {
         return;
     }
 
-    for from in from.iter() {
-        for to in to.iter() {
-            // An operation is not ordered with respect to itself: a
-            // read-modify-write is both a load of one store and the next
-            // store.
-            if from != to {
-                edges.push((from, to));
-            }
-        }
-    }
+    // An operation is not ordered with respect to itself, see
+    // `SeqCst::add_edges`.
+    edges.push((from.clone(), to.clone()));
 }
 
 /// The `SeqCst` nodes of the stores of an atomic, by slot, with those of one
@@ -1744,7 +1743,7 @@ impl State {
 
     /// The edges of the order of `SeqCst` operations that follow from the
     /// modification order `before` and the given per-store nodes.
-    fn seq_cst_edges(before: &MoOrder, nodes: &Nodes<'_>) -> Vec<(usize, usize)> {
+    fn seq_cst_edges(before: &MoOrder, nodes: &Nodes<'_>) -> Edges {
         let mut edges = Vec::new();
 
         for later in 0..nodes.len() {
@@ -1793,7 +1792,7 @@ impl State {
         let before = self.mo_before();
 
         for (from, to) in Self::seq_cst_edges(&before, &self.nodes(None)) {
-            let added = seq_cst.add_edge(from, to);
+            let added = seq_cst.add_edges(&from, &to);
 
             // Loads only return stores for which this works out, and nothing
             // else settles the order of two existing stores.
@@ -2003,7 +2002,7 @@ impl State {
             for (from, to) in edges {
                 // A store for which this does not work out was in fact the
                 // earlier one. Nothing is going to say otherwise anymore.
-                let _ = seq_cst.add_edge(from, to);
+                let _ = seq_cst.add_edges(&from, &to);
             }
 
             let forgotten = self.stores[slot].sc.clone();
@@ -2121,7 +2120,7 @@ impl State {
                     StoreNodes::edges(&position.sc, &self.stores[written].sc, &mut edges);
 
                     for (from, to) in edges {
-                        let added = seq_cst.add_edge(from, to);
+                        let added = seq_cst.add_edges(&from, &to);
 
                         debug_assert!(added, "[loom internal bug] SeqCst order is cyclic");
                     }
