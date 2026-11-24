@@ -88,6 +88,32 @@ impl NodeSet {
         }
     }
 
+    /// Returns `true` if every node of `other` is in this set, not counting
+    /// `except`.
+    pub(crate) fn contains_all(&self, other: &NodeSet, except: usize) -> bool {
+        let has_all = |i: usize, other: u64| {
+            let own = match i {
+                0 => self.first,
+                _ => self.rest.get(i - 1).copied().unwrap_or(0),
+            };
+
+            let mut missing = other & !own;
+
+            if except / 64 == i {
+                missing &= !(1 << (except % 64));
+            }
+
+            missing == 0
+        };
+
+        has_all(0, other.first)
+            && other
+                .rest
+                .iter()
+                .enumerate()
+                .all(|(i, &word)| has_all(i + 1, word))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.first == 0 && self.rest.iter().all(|word| *word == 0)
     }
@@ -308,16 +334,33 @@ impl SeqCst {
         add_edge(&mut self.after, from, to)
     }
 
+    /// Requires every node of `from` to come before every node of `to`,
+    /// other than itself: a read-modify-write is both a load of one store
+    /// and the next store, and is not ordered with respect to itself.
+    ///
+    /// Returns `false` if one of the nodes of `to` already has to come
+    /// before one of `from`. Those two are left as they were, and the others
+    /// are ordered all the same.
+    pub(crate) fn add_edges(&mut self, from: &NodeSet, to: &NodeSet) -> bool {
+        add_edges(&mut self.after, from, to)
+    }
+
     /// Returns `true` if all of `edges` can be added together, along with a
     /// new node for `candidate` if there is one. The id of that node is
     /// `self.len()`, and `edges` may refer to it.
     pub(crate) fn admits(
         &self,
         candidate: Option<&Candidate<'_>>,
-        edges: &[(usize, usize)],
+        edges: &[(NodeSet, NodeSet)],
     ) -> bool {
-        if edges.is_empty() {
-            // A new node on its own only gets edges leading to it.
+        // A new node on its own only gets edges leading to it. Without one,
+        // edges that are all there already need no second look, which is
+        // what nearly every call comes to.
+        if candidate.is_none()
+            && edges
+                .iter()
+                .all(|(from, to)| has_edges(&self.after, from, to))
+        {
             return true;
         }
 
@@ -336,8 +379,34 @@ impl SeqCst {
 
         edges
             .iter()
-            .all(|&(from, to)| add_edge(&mut after, from, to))
+            .all(|(from, to)| add_edges(&mut after, from, to))
     }
+}
+
+/// Returns `true` if every edge of `add_edges(after, from, to)` is there.
+fn has_edges(after: &[NodeSet], from: &NodeSet, to: &NodeSet) -> bool {
+    from.iter().all(|node| after[node].contains_all(to, node))
+}
+
+/// See `SeqCst::add_edges`.
+fn add_edges(after: &mut [NodeSet], from: &NodeSet, to: &NodeSet) -> bool {
+    let mut added = true;
+
+    for from in from.iter() {
+        // Nearly always the case: the edges of an atomic are asked for
+        // again whenever it is accessed.
+        if after[from].contains_all(to, from) {
+            continue;
+        }
+
+        for to in to.iter() {
+            if from != to {
+                added &= add_edge(after, from, to);
+            }
+        }
+    }
+
+    added
 }
 
 fn add_edge(after: &mut [NodeSet], from: usize, to: usize) -> bool {
@@ -437,8 +506,15 @@ mod tests {
         assert_eq!(order.len(), 3);
 
         // Each edge is fine on its own, but not all three.
-        assert!(order.admits(None, &[(0, 1), (1, 2)]));
-        assert!(!order.admits(None, &[(0, 1), (1, 2), (2, 0)]));
+        let edge = |from, to| {
+            let mut edge = (NodeSet::default(), NodeSet::default());
+            edge.0.insert(from);
+            edge.1.insert(to);
+            edge
+        };
+
+        assert!(order.admits(None, &[edge(0, 1), edge(1, 2)]));
+        assert!(!order.admits(None, &[edge(0, 1), edge(1, 2), edge(2, 0)]));
 
         // Checking does not add anything.
         assert!(order.add_edge(2, 0));
